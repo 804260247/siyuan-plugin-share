@@ -1,5 +1,45 @@
 # 更新日志
 
+> 📌 **本仓库 [804260247/siyuan-plugin-share](https://github.com/804260247/siyuan-plugin-share) 是原项目 [b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share) 的增强分支（fork）。**
+> `0.5.5` 及更早的条目均来自上游原作者，未作修改；以 **`Fork-`** 开头的条目为本仓库新增。
+> 上游最后一次提交为 2026/7/12（v0.5.5），截至 2026/10/15 已约 3 个月无新提交。
+
+---
+
+## Fork-0.5.6 2026/10/15（未发布 · 尚未合并进 main）
+
+> 本节由 fork 维护者 [804260247](https://github.com/804260247) 添加。以下改动位于功能分支上，**尚未合并进 main**；
+> 对应的上游 PR [#72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72)、[#73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73) 自 2026/8 起一直处于 open 状态，未被合并。
+> 因上游未合并，版本号暂记为 `0.5.6`，实际是否随上游版本号推进待定。
+
+### 🗂️ 分享页右侧栏：目录 / 最近更新（分支 `feat/share-column-layout`，7 次提交，2026/8/13 ~ 8/21）
+
+- [x] 分享页新增右侧**目录栏**与「**最近更新**」栏，支持栏位拖拽与折叠
+- [x] 优化分享页栏位交互细节与提示位置
+- [x] 「最近更新」日期改用笔记**真实修改时间**（front matter `lastmod`），不再使用上传时间
+- [x] 分享页时区统一为 `Asia/Shanghai`
+- [x] 「最近更新」新增数量下拉（5 / 10 / 20 / 50），面板头部改为上下两行
+- [x] 修复全局 `width:100%` 导致下拉框过长的问题（下拉改回与标题同行，利用右侧留白）
+- [x] 新增 `.gitattributes`，将 `Dockerfile` 与备份脚本行尾固定为 **LF**，修复 Windows 检出后容器无法启动的问题
+
+### 📢 笔记级公告（分支 `feat/share-announcement`，5 次提交，2026/8/13 ~ 8/19）
+
+- [x] 新增**笔记级公告提示**：支持思源笔记内渲染、公告弹窗、插件端同步
+- [x] 笔记本分享基址直接展示公告内容；无公告时保留占位并补齐右侧栏
+- [x] 补充 i18n 中英文案（`i18n/zh_CN.json`、`i18n/en_US.json`）
+
+### 📁 涉及文件
+
+- 插件端：`index.js`、`index.css`、`i18n/zh_CN.json`、`i18n/en_US.json`
+- 服务端：`php-site/index.php`、`php-site/assets/app.js`、`php-site/assets/style.css`
+- 其他：`.gitattributes`（新增）
+
+### ⚠️ 已知边界
+
+- 两项特性均**未合并进 main**，main 分支内容与上游 v0.5.5 完全一致。
+- `plugin.json` 的 `url` 字段仍指向上游仓库，**未改动**（避免影响思源集市对插件的识别与更新），如需切换维护源请另行确认后再改。
+
+
 ## 0.5.5 2026/7/12
 
 - [x] [Chen017](https://github.com/Chen017) 修复部分包含嵌套美元符号的数学公式显示异常问题 [PR 69](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/69)

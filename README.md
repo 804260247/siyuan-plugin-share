@@ -4,7 +4,18 @@
 It supports **access passwords, expiration time, and visitor limits**, and provides an **access statistics overview**, making it suitable for knowledge sharing, collaboration, and temporary public publishing.
 
 🌍 Documentation Languages:  
-[中文 README](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/README_zh_CN.md) ｜ [English README](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/README.md)
+[中文 README](https://github.com/804260247/siyuan-plugin-share/blob/main/README_zh_CN.md) ｜ [English README](https://github.com/804260247/siyuan-plugin-share/blob/main/README.md)
+
+> ### 🔀 About This Repository (Fork / Enhanced Branch)
+>
+> **[804260247/siyuan-plugin-share](https://github.com/804260247/siyuan-plugin-share)** is an **enhanced fork** of the original project **[b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share)** by "取舍", maintained by [804260247](https://github.com/804260247).
+>
+> - The original project's last commit was **2026/7/12 (v0.5.5)**; as of 2026/10/15 it has been roughly **3 months without a new commit**, with 6 open issues unaddressed.
+> - This repository continues maintenance and currently adds two features, both on feature branches and **not yet merged into main**:
+>   - **Share page right sidebar: table of contents / recent updates** — branch `feat/share-column-layout`, upstream [PR #72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72) (open)
+>   - **Note-level announcement banner** — branch `feat/share-announcement`, upstream [PR #73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73) (open)
+> - See **[CHANGELOG.md](https://github.com/804260247/siyuan-plugin-share/blob/main/CHANGELOG.md)** for this repository's release notes.
+> - Feature docs, deployment guides and server setup guides are inherited from the original project; copyright, donations and Stars belong to the original author.
 
 📝 Documentation:
 
@@ -156,6 +167,9 @@ Using notebook sharing as an example. Single document or document with subdocume
 If you find this project helpful, feel free to support the author ❤️  
 Your support motivates me to **continuously maintain and improve** this tool.
 
+> ⬆️ The Star badge and donation QR codes below point to the **original project and original author**, not to the fork maintainer.
+> If you like, you can also give [this repository](https://github.com/804260247/siyuan-plugin-share) a ⭐ to support ongoing maintenance.
+
 <div align="center">
     <a href="https://github.com/b8l8u8e8/siyuan-plugin-share">
         <img src="https://img.shields.io/github/stars/b8l8u8e8/siyuan-plugin-share?style=for-the-badge&color=ffd700&label=Give%20a%20Star" alt="Github Star">
@@ -184,17 +198,20 @@ Your support motivates me to **continuously maintain and improve** this tool.
 
 ## 🛠️ Other Information
 
-- 🐞 Issue Reporting:  
-  [GitHub Issues](https://github.com/b8l8u8e8/siyuan-plugin-share/issues)
+- 🔀 Original project (upstream):
+  [b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share)
+
+- 🐞 Issue Reporting (this repository):  
+  [GitHub Issues](https://github.com/804260247/siyuan-plugin-share/issues)
 
 - 📄 License:  
-  [MIT License](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/LICENSE)
+  [MIT License](https://github.com/804260247/siyuan-plugin-share/blob/main/LICENSE)
 
 - 🧾 Changelog:  
-  [CHANGELOG.md](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/CHANGELOG.md)
+  [CHANGELOG.md](https://github.com/804260247/siyuan-plugin-share/blob/main/CHANGELOG.md)
 
 - 🏅 Contributors:  
-  [Contributors List](https://github.com/b8l8u8e8/siyuan-plugin-share/graphs/contributors)
+  [Contributors List](https://github.com/804260247/siyuan-plugin-share/graphs/contributors)
 
 - 💖 Sponsors:  
-  [Sponsor List](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/sponsor-list.md)
+  [Sponsor List](https://github.com/804260247/siyuan-plugin-share/blob/main/sponsor-list.md)

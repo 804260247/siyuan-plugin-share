@@ -4,7 +4,18 @@
 它支持 **访问密码、到期时间、访客数量限制**，并提供 **访问统计概览**，适合知识分享、协作与临时公开展示等场景。
 
 🌍 文档语言：  
-[中文 README](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/README_zh_CN.md) ｜ [English README](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/README.md)
+[中文 README](https://github.com/804260247/siyuan-plugin-share/blob/main/README_zh_CN.md) ｜ [English README](https://github.com/804260247/siyuan-plugin-share/blob/main/README.md)
+
+> ### 🔀 本仓库说明（Fork / 增强分支）
+>
+> 本仓库 **[804260247/siyuan-plugin-share](https://github.com/804260247/siyuan-plugin-share)** 是原项目 **[b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share)**（作者「取舍」）的 **增强分支（fork）**，由 [804260247](https://github.com/804260247) 维护。
+>
+> - 原项目最后一次提交为 **2026/7/12（v0.5.5）**，截至 2026/10/15 已约 **3 个月无新提交**，另有 6 个 open issue 未处理。
+> - 本仓库承接后续维护，目前新增两项特性，位于功能分支上、**尚未合并进 main**：
+>   - **分享页右侧目录 / 最近更新栏** —— 分支 `feat/share-column-layout`，上游 [PR #72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72)（open）
+>   - **笔记级公告提示** —— 分支 `feat/share-announcement`，上游 [PR #73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73)（open）
+> - 本仓库的更新记录见 **[CHANGELOG.md](https://github.com/804260247/siyuan-plugin-share/blob/main/CHANGELOG.md)**。
+> - 功能说明、部署教程、服务端搭建等内容沿用原项目文档；版权、赞赏与 Star 均归原作者所有。
 
 📝 使用文档：
 
@@ -148,6 +159,9 @@
 如果你觉得这个项目对你有帮助，欢迎支持作者 ❤️  
 你的支持将激励我 **持续维护与优化**，打造更好用的工具。
 
+> ⬆️ 下方 Star 徽章与赞赏码均指向 **原项目与原作者**，与 fork 维护者无关。
+> 如果你愿意，也可以给[本仓库](https://github.com/804260247/siyuan-plugin-share)点个 ⭐ 支持后续维护。
+
 <div align="center">
     <a href="https://github.com/b8l8u8e8/siyuan-plugin-share">
         <img src="https://img.shields.io/github/stars/b8l8u8e8/siyuan-plugin-share?style=for-the-badge&color=ffd700&label=%E7%BB%99%E4%B8%AAStar%E5%90%A7" alt="Github Star">
@@ -176,19 +190,22 @@
 
 ## 🛠️ 其他信息
 
-- 🐞 问题反馈：  
-  [GitHub Issues](https://github.com/b8l8u8e8/siyuan-plugin-share/issues)
+- 🔀 原项目（上游）：
+  [b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share)
+
+- 🐞 问题反馈（本仓库）：  
+  [GitHub Issues](https://github.com/804260247/siyuan-plugin-share/issues)
 
 - 📄 开源协议：  
-  [MIT License](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/LICENSE)
+  [MIT License](https://github.com/804260247/siyuan-plugin-share/blob/main/LICENSE)
 
 - 🧾 更新日志：  
-  [CHANGELOG.md](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/CHANGELOG.md)
+  [CHANGELOG.md](https://github.com/804260247/siyuan-plugin-share/blob/main/CHANGELOG.md)
   
 - 🏅 贡献列表：  
 
-  [Contributors List](https://github.com/b8l8u8e8/siyuan-plugin-share/graphs/contributors)
+  [Contributors List](https://github.com/804260247/siyuan-plugin-share/graphs/contributors)
   
 - 💖 赞助列表：  
-[Sponsor List](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/sponsor-list.md)
+[Sponsor List](https://github.com/804260247/siyuan-plugin-share/blob/main/sponsor-list.md)
 
