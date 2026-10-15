@@ -1784,7 +1784,7 @@
         `</div>` +
         `</div>` +
         `</div>` +
-        `<footer class="share-footer">\u7531 <a href="https://github.com/b8l8u8e8/siyuan-plugin-share" target="_blank" rel="noopener noreferrer">b8l8u8e8</a> \u63d0\u4F9B\u652F\u6301</footer>` +
+        `<footer class="share-footer">\u7531 <a href="https://github.com/804260247/siyuan-plugin-share" target="_blank" rel="noopener noreferrer">804260247</a> \u63d0\u4F9B\u652F\u6301</footer>` +
         `<button class="share-side-trigger" type="button" data-share-drawer-open aria-label="\u6253\u5F00\u4FA7\u8FB9\u680F"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 6h16v2H4zM4 11h16v2H4zM4 16h16v2H4z"/></svg><span>\u5BFC\u822A</span></button>` +
         `<div class="share-side-backdrop" data-share-drawer-close></div>` +
         `<button class="scroll-top" type="button" data-scroll-top data-tip="\u56DE\u5230\u9876\u90E8" aria-label="\u56DE\u5230\u9876\u90E8"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2c-2.76 0-5 2.24-5 5v2.5L4 13l4.5 1L12 22l3.5-8L20 13l-3-3.5V7c0-2.76-2.24-5-5-5zm0 3a2 2 0 0 1 2 2v1.5l-2 2-2-2V7a2 2 0 0 1 2-2z"/></svg></button>` +

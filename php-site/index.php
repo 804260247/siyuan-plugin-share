@@ -1320,7 +1320,7 @@ function render_page(string $title, string $content, ?array $user = null, string
             echo $options['announcement'];
         }
         echo $content;
-        echo "<footer class='share-footer'>由 <a href='https://github.com/b8l8u8e8/siyuan-plugin-share' target='_blank' rel='noopener noreferrer'>b8l8u8e8</a> 提供支持</footer>";
+        echo "<footer class='share-footer'>由 <a href='https://github.com/804260247/siyuan-plugin-share' target='_blank' rel='noopener noreferrer'>804260247</a> 提供支持</footer>";
         echo "<button class='share-side-trigger' type='button' data-share-drawer-open aria-label='打开侧边栏'><svg viewBox='0 0 24 24' aria-hidden='true'><path fill='currentColor' d='M4 6h16v2H4zM4 11h16v2H4zM4 16h16v2H4z'/></svg><span>导航</span></button>";
         echo "<div class='share-side-backdrop' data-share-drawer-close></div>";
         echo "<button class='scroll-top' type='button' data-scroll-top data-tip='回到顶部' aria-label='回到顶部'><svg viewBox='0 0 24 24' aria-hidden='true'><path fill='currentColor' d='M12 2c-2.76 0-5 2.24-5 5v2.5L4 13l4.5 1L12 22l3.5-8L20 13l-3-3.5V7c0-2.76-2.24-5-5-5zm0 3a2 2 0 0 1 2 2v1.5l-2 2-2-2V7a2 2 0 0 1 2-2z'/></svg></button>";
@@ -1390,7 +1390,7 @@ function render_page(string $title, string $content, ?array $user = null, string
         echo "<main class='app-content'>";
         echo $content;
         echo "</main>";
-        echo "<footer class='app-footer'>由 <a href='https://github.com/b8l8u8e8/siyuan-plugin-share' target='_blank' rel='noopener noreferrer'>b8l8u8e8</a> 提供支持</footer>";
+        echo "<footer class='app-footer'>由 <a href='https://github.com/804260247/siyuan-plugin-share' target='_blank' rel='noopener noreferrer'>804260247</a> 提供支持</footer>";
         echo "</div>";
         echo "</div>";
         echo "<div class='app-side-backdrop' data-app-drawer-close></div>";
