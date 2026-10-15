@@ -14,7 +14,7 @@ jobs:
       # 这里填写你的 Gitee 用户名
       dst_key: ${{ secrets.GITEE_PRIVATE_KEY }}
       dst_token: ${{ secrets.GITEE_TOKEN }}
-      gitee_user: jie8686  # 【注意】改成你的 Gitee 用户名
+      gitee_user: jie8686  # 【注意】需改成你自己的 Gitee 用户名（未设置密钥时本工作流会自动跳过）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
@@ -26,7 +26,7 @@ jobs:
         if: env.dst_key && env.dst_token
         with:
           # 必选：源端账户名（就是你的 GitHub 用户名）
-          src: github/b8l8u8e8 # 【注意】改成你的 GitHub 用户名
+          src: github/804260247 # 【注意】已改为本仓库所属的 GitHub 用户名
           # 必选：目的端账户名（就是你的 Gitee 用户名）
           dst: gitee/jie8686   # 【注意】改成你的 Gitee 用户名
           # 必选：SSH 私钥 (自动读取之前设置的 Secret)
