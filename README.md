@@ -10,10 +10,9 @@ It supports **access passwords, expiration time, and visitor limits**, and provi
 >
 > **[804260247/siyuan-plugin-share](https://github.com/804260247/siyuan-plugin-share)** is an **enhanced fork** of the original project **[b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share)** by "取舍", maintained by [804260247](https://github.com/804260247).
 >
-> - The original project's last commit was **2026/7/12 (v0.5.5)**; as of 2026/10/15 it has been roughly **3 months without a new commit**, with 6 open issues unaddressed.
-> - This repository continues maintenance and currently adds two features, both on feature branches and **not yet merged into main**:
->   - **Share page right sidebar: table of contents / recent updates** — branch `feat/share-column-layout`, upstream [PR #72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72) (open)
->   - **Note-level announcement banner** — branch `feat/share-announcement`, upstream [PR #73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73) (open)
+> - This repository continues maintenance and currently adds two features, **already merged into `main`** (originally submitted upstream as PR #72 / #73):
+>   - **Share page right sidebar: table of contents / recent updates** — branch `feat/share-column-layout`, upstream [PR #72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72)
+>   - **Note-level announcement banner** — branch `feat/share-announcement`, upstream [PR #73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73)
 > - See **[CHANGELOG.md](https://github.com/804260247/siyuan-plugin-share/blob/main/CHANGELOG.md)** for this repository's release notes.
 > - Feature docs, deployment guides and server setup guides are inherited from the original project; copyright, donations and Stars belong to the original author.
 

@@ -10,10 +10,9 @@
 >
 > 本仓库 **[804260247/siyuan-plugin-share](https://github.com/804260247/siyuan-plugin-share)** 是原项目 **[b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share)**（作者「取舍」）的 **增强分支（fork）**，由 [804260247](https://github.com/804260247) 维护。
 >
-> - 原项目最后一次提交为 **2026/7/12（v0.5.5）**，截至 2026/10/15 已约 **3 个月无新提交**，另有 6 个 open issue 未处理。
-> - 本仓库承接后续维护，目前新增两项特性，位于功能分支上、**尚未合并进 main**：
->   - **分享页右侧目录 / 最近更新栏** —— 分支 `feat/share-column-layout`，上游 [PR #72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72)（open）
->   - **笔记级公告提示** —— 分支 `feat/share-announcement`，上游 [PR #73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73)（open）
+> - 本仓库承接后续维护，目前新增两项特性，**已合并进 `main`**（原以上游 PR 形式提交）：
+>   - **分享页右侧目录 / 最近更新栏** —— 分支 `feat/share-column-layout`，上游 [PR #72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72)
+>   - **笔记级公告提示** —— 分支 `feat/share-announcement`，上游 [PR #73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73)
 > - 本仓库的更新记录见 **[CHANGELOG.md](https://github.com/804260247/siyuan-plugin-share/blob/main/CHANGELOG.md)**。
 > - 功能说明、部署教程、服务端搭建等内容沿用原项目文档；版权、赞赏与 Star 均归原作者所有。
 

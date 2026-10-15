@@ -2,15 +2,15 @@
 
 > 📌 **本仓库 [804260247/siyuan-plugin-share](https://github.com/804260247/siyuan-plugin-share) 是原项目 [b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share) 的增强分支（fork）。**
 > `0.5.5` 及更早的条目均来自上游原作者，未作修改；以 **`Fork-`** 开头的条目为本仓库新增。
-> 上游最后一次提交为 2026/7/12（v0.5.5），截至 2026/10/15 已约 3 个月无新提交。
 
 ---
 
-## Fork-0.5.6 2026/10/15（未发布 · 尚未合并进 main）
+## Fork-0.5.6 2026/10/15（未发布 · 已合并进 main）
 
-> 本节由 fork 维护者 [804260247](https://github.com/804260247) 添加。以下改动位于功能分支上，**尚未合并进 main**；
-> 对应的上游 PR [#72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72)、[#73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73) 自 2026/8 起一直处于 open 状态，未被合并。
+> 本节由 fork 维护者 [804260247](https://github.com/804260247) 添加。以下改动**已合并进本仓库 `main`**；
+> 对应的上游 PR [#72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72)、[#73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73) 自 2026/8 起一直处于 open 状态，未被上游合并。
 > 因上游未合并，版本号暂记为 `0.5.6`，实际是否随上游版本号推进待定。
+> 本仓库 `plugin.json` 的 `url` 已指向本仓库，`version` 记为 `0.5.6`；本仓库暂不上架思源集市，可手动安装。
 
 ### 🗂️ 分享页右侧栏：目录 / 最近更新（分支 `feat/share-column-layout`，7 次提交，2026/8/13 ~ 8/21）
 
@@ -36,8 +36,8 @@
 
 ### ⚠️ 已知边界
 
-- 两项特性均**未合并进 main**，main 分支内容与上游 v0.5.5 完全一致。
-- `plugin.json` 的 `url` 字段仍指向上游仓库，**未改动**（避免影响思源集市对插件的识别与更新），如需切换维护源请另行确认后再改。
+- 两项特性**已合并进 `main`**，`main` 现为「上游 v0.5.5 + 两项特性」。
+- `plugin.json` 的 `url` 已改为本仓库地址，`version` 记为 `0.5.6`；本仓库暂不上架思源集市，用户可手动安装。
 
 
 ## 0.5.5 2026/7/12

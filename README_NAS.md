@@ -142,7 +142,7 @@ docker-compose -f docker-compose.nas.yml restart
 
 ```bash
 # 1. 从仓库拉取源码。如果不使用 Git，也可以直接下载仓库的压缩包，解压后放到当前目录，效果是一样的。
-git clone https://github.com/b8l8u8e8/siyuan-plugin-share.git
+git clone https://github.com/804260247/siyuan-plugin-share.git
 
 # 2. 准备配置文件(必须复制)
 cd siyuan-plugin-share
