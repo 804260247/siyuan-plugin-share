@@ -31,6 +31,11 @@ WORKDIR /var/www/html
 # Copy app files with runtime owner
 COPY --chown=www-data:www-data php-site/ /var/www/html/
 
+# 静态资源可读性：宿主机 clone 若受 umask 027/077 影响，文件会变成 640/750，
+# 而 nginx worker 以 nginx 用户运行，读不到 assets/*，nginx 的 try_files 会回落到
+# index.php，导致 /assets/style.css、/assets/app.js 返回 HTML 404 页，页面只剩文字。
+RUN chmod -R a+rX /var/www/html
+
 # Configure PHP runtime limits
 RUN set -eux; \
     { \
