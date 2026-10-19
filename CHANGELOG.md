@@ -5,6 +5,52 @@
 
 ---
 
+## 未发布（待验证）：Cloudreve 网盘扩展
+
+> 本节的改动位于分支 `feat/netdisk-cloudreve`，以 PR 形式提交，尚未合并、尚未发布；验证通过后再确定版本号。
+> 移植自 `siyuan-share-netdisk:fix-final` 镜像（基线：上游 v0.5.5 `263921d5`），并保留本仓库 v0.5.6 的全部分叉改动。
+
+### 网盘接入与文件浏览
+
+- [x] 新增 Cloudreve v4 多连接配置，支持连接测试、默认目录、启用/停用
+- [x] 分享页新增「网盘」标签页，支持目录浏览、面包屑、文件缩略图与下载规则
+- [x] 下载/预览沿用分享门禁：分享密码、有效期、访问次数与网盘启用状态逐项校验
+
+### 在线预览
+
+- [x] 支持图片、PDF、文本；Office 文档通过 OnlyOffice/Collabora（WOPI）在线编辑/预览
+- [x] 新增 `assets/vendor/xlsx.full.min.js`，无 WOPI 时可直接预览表格
+- [x] WOPI token 使用 HMAC-SHA256 签名并校验过期时间
+
+### 全文索引与 OCR
+
+- [x] 新增 `netdisk_index`、`netdisk_index_jobs`、`netdisk_ocr_queue` 等 7 张表
+- [x] 支持 PDF/Office/纯文本抽取；扫描版 PDF 与图片走 OCR（PaddleOCR sidecar，未启用时回退本地 tesseract）
+- [x] 新增常驻 `php-site/nd-worker.php`，由 supervisord 托管，持续消费索引/OCR 队列并回收卡死任务
+- [x] 分享页搜索支持精确、模糊与全文召回；索引结果按当前分享 root 二次校验
+
+### 安全加固（移植时补充）
+
+- [x] `@share` 链接的 root 归属改为别名白名单校验，拒绝 `..`、反斜杠与任意 `@share` URI
+- [x] Cloudreve 密码、access_token、refresh_token 使用 AES-256-GCM 加密落库（`storage/.netdisk_secret`，0600），兼容存量明文自动迁移
+- [x] 管理端不再回显网盘密码，编辑时留空表示不修改
+- [x] 缩略图/内容响应增加 MIME 白名单、`X-Content-Type-Options: nosniff` 与 SVG 沙箱 CSP
+- [x] WOPI 回调校验 fileId；OCR 全部外部命令经 `escapeshellarg` 转义并设置超时
+
+### 部署
+
+- [x] Dockerfile 增加 `supervisor`、`poppler-utils`、`tesseract-ocr` 及中英文语言包；`memory_limit` 1G、`max_execution_time` 0
+- [x] 新增 `deploy/supervisord.conf`，统一托管 php-fpm、nginx、nd-worker
+- [x] docker-compose 增加 `ocr-data` 共享卷，供 OCR sidecar 与主容器交换图片
+- [x] 保留本仓库分叉：nginx worker `www-data`、页脚 `804260247`、`site_version` 0.5.6、PR #72/#73 的列布局与公告
+
+### 已知边界
+
+- `config.php` 仍需外部挂载，镜像/仓库不会自动生成
+- 单文档分享页保留本仓库既有布局，不显示网盘标签页
+- 升级或修改网盘 root 后，`@share` 索引命中可能短暂隐藏，待 worker 重建别名缓存后恢复
+- 尚未在真实 Docker/NAS 环境完成构建验证；合并前需执行 `docker compose up -d --build` 并按验收清单逐项确认
+
 ## v0.5.6 2026-10-19
 
 > 本节由 fork 维护者 [804260247](https://github.com/804260247) 添加。以下改动**已合并进本仓库 `main`**；
