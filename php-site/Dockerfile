@@ -46,30 +46,9 @@ RUN set -eux; \
     } > /usr/local/etc/php/conf.d/uploads.ini
 
 # Configure nginx
-RUN cat > /etc/nginx/nginx.conf <<'NGINXCONF'
-user nginx;
-worker_processes auto;
-error_log /var/log/nginx/error.log warn;
-pid /run/nginx/nginx.pid;
-
-events {
-    worker_connections 1024;
-}
-
-http {
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
-
-    sendfile on;
-    keepalive_timeout 65;
-    client_max_body_size 100m;
-    server_tokens off;
-
-    access_log /var/log/nginx/access.log;
-
-    include /etc/nginx/conf.d/*.conf;
-}
-NGINXCONF
+# user www-data：nginx worker 与 php-fpm 同 uid，宿主 clone 的 640/750 权限也不会挡住静态资源。
+# 该文件同时被 docker-compose 以只读方式挂载，改完重启容器即可生效，无需重建镜像。
+COPY deploy/nginx.conf /etc/nginx/nginx.conf
 
 RUN mkdir -p /etc/nginx/conf.d && cat > /etc/nginx/conf.d/default.conf <<'SERVERCONF'
 server {
