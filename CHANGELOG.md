@@ -1,15 +1,14 @@
 # 更新日志
 
 > 📌 **本仓库 [804260247/siyuan-plugin-share](https://github.com/804260247/siyuan-plugin-share) 是原项目 [b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share) 的增强分支（fork）。**
-> `0.5.5` 及更早的条目均来自上游原作者，未作修改；以 **`Fork-`** 开头的条目为本仓库新增。
+> `0.5.5` 及更早的条目均来自上游原作者，未作修改；自 `v0.5.6` 起由本仓库维护发布。
 
 ---
 
-## Fork-0.5.6 2026/10/15（未发布 · 已合并进 main）
+## v0.5.6 2026-10-19
 
 > 本节由 fork 维护者 [804260247](https://github.com/804260247) 添加。以下改动**已合并进本仓库 `main`**；
 > 对应的上游 PR [#72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72)、[#73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73) 自 2026/8 起一直处于 open 状态，未被上游合并。
-> 因上游未合并，版本号暂记为 `0.5.6`，实际是否随上游版本号推进待定。
 > 本仓库 `plugin.json` 的 `url` 已指向本仓库，`version` 记为 `0.5.6`；本仓库暂不上架思源集市，可手动安装。
 
 ### 🗂️ 分享页右侧栏：目录 / 最近更新（分支 `feat/share-column-layout`，7 次提交，2026/8/13 ~ 8/21）
@@ -36,8 +35,15 @@
 
 ### ⚠️ 已知边界
 
-- 两项特性**已合并进 `main`**，`main` 现为「上游 v0.5.5 + 两项特性」。
+- 两项特性**已合并进 `main`**，`main` 现为「上游 v0.5.5 + 两项特性 + 本仓库维护性更新」。
 - `plugin.json` 的 `url` 已改为本仓库地址，`version` 记为 `0.5.6`；本仓库暂不上架思源集市，用户可手动安装。
+
+### 🚀 本仓库维护性更新（2026/10）
+
+- [x] 默认 README 切换为中文，英文版移至 `README_EN.md`；两份 README 新增「安装方式」章节（未上架集市，ZIP 手动安装）— `09b925c`
+- [x] 分享页与站点页脚署名改为「由 804260247 提供支持」并指向本仓库 — `d635c45`
+- [x] 修复 Docker 部署下静态资源不可读导致分享页只有文字（目录权限 `a+rX`；nginx worker 改 `www-data` 并新增 `deploy/nginx.conf` 只读挂载）— `f5f663a`、`a17cd57`
+- [x] `plugin.json` 的 `url` 指向本仓库、`version` 0.5.6；`php-site/config.example.php` 的 `site_version` 同步 0.5.6；`sync-to-gitee` 源端改为本仓库 — `0590b93`、`c204f19`、`09b925c`
 
 
 ## 0.5.5 2026/7/12
