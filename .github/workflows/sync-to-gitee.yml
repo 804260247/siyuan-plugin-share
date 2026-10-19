@@ -1,12 +1,8 @@
 # 名字随便起
 name: Sync to Gitee
 
-# 触发条件：当代码推送到 main 分支时触发
-# 如果你的主分支叫 master，请把下面的 main 改成 master
+# 触发条件：仅手动触发（本仓库未配置 Gitee 密钥，避免推送时自动失败）
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 jobs:
   repo-sync:
