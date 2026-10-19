@@ -1,0 +1,230 @@
+# 🔗 Siyuan Share
+
+**Siyuan Share** is a **free and open-source** plugin for Siyuan Note that allows you to generate **accessible share links for notebooks, single documents, or documents with their subdocuments**.  
+It supports **access passwords, expiration time, and visitor limits**, and provides an **access statistics overview**, making it suitable for knowledge sharing, collaboration, and temporary public publishing.
+
+🌍 Documentation Languages:  
+[中文 README](https://github.com/804260247/siyuan-plugin-share/blob/main/README.md) ｜ [English README](https://github.com/804260247/siyuan-plugin-share/blob/main/README_EN.md)
+
+> ### 🔀 About This Repository (Fork / Enhanced Branch)
+>
+> **[804260247/siyuan-plugin-share](https://github.com/804260247/siyuan-plugin-share)** is an **enhanced fork** of the original project **[b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share)** by "取舍", maintained by [804260247](https://github.com/804260247).
+>
+> - This repository continues maintenance and currently adds two features, **already merged into `main`** (originally submitted upstream as PR #72 / #73):
+>   - **Share page right sidebar: table of contents / recent updates** — branch `feat/share-column-layout`, upstream [PR #72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72)
+>   - **Note-level announcement banner** — branch `feat/share-announcement`, upstream [PR #73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73)
+> - See **[CHANGELOG.md](https://github.com/804260247/siyuan-plugin-share/blob/main/CHANGELOG.md)** for this repository's release notes.
+> - Feature docs, deployment guides and server setup guides are inherited from the original project; copyright, donations and Stars belong to the original author.
+
+📝 Documentation:
+
+[Beginner-Friendly Tutorial Guide](https://share.b0x.top/s/8c34c022)
+
+---
+
+## 🚀 Plugin Advantages
+
+🌐 **Ready to Use, Flexible Deployment**
+
+The tool is **completely free and open-source**. You can start instantly via `share.b0x.top` or choose self-hosting (supports **Docker / NAS / BT-Panel / other panels**).
+
+🎯 **Flexible Sharing, Precise Control**
+
+Share a **single page, sub-documents, or an entire notebook**. You can **exclude specific documents** with one click to ensure private content stays private.
+
+⚡ **Efficient Sync, Built-in Analytics**
+
+Uses an **incremental update** algorithm (faster and saves data). Features built-in analytics, allowing you to track **visitor counts, locations, and other key insights** at a glance.
+
+**🔄 Auto-Update: Effortless & Worry-free** 
+
+Once enabled, it automatically detects document changes in the background and updates the shared page, eliminating the need for repeated manual updates. It also provides running status, queues, and history logs to ensure your shared content is always up to date.
+
+---
+
+## 📦 Installation
+
+This plugin is **not yet listed on the SiYuan official marketplace** and must be installed manually:
+
+1. On the GitHub repository page, click `Code → Download ZIP` to download the archive
+2. Unzip it to get the `siyuan-plugin-share-main` folder
+3. **Rename the folder to `siyuan-plugin-share`** (the `-main` suffix must be removed)
+4. Put the renamed folder into the `data/plugins/` directory of your SiYuan workspace
+5. Restart SiYuan, then enable the plugin in `Settings → Plugins`
+
+> 💡 Tip: The ZIP downloaded directly from GitHub contains a top-level folder. If you install via the marketplace's "Local Install / Import", unzip and rename the folder first, then re-compress it into a ZIP before importing.
+
+---
+
+## ✨ Usage Guide
+
+### 📌 Entry Point
+
+In the **Document Tree**, right-click on a **notebook or document** → open the **Plugin Menu** to access the following features:
+
+- 🆕 Create Share / Manage Share  
+- 🔄 Update Share  
+- 📋 Copy Share Link  
+- 🗑️ Delete Share  
+
+### 🗂️ Share Management
+
+Go to the **Plugin Settings page** to view the **list of all created shares** and manage them centrally.
+
+---
+
+## 🔐 Access Settings
+
+- **Access Password**  
+  Set a password for the share. Visitors must enter the correct password to view the content.
+
+- **Expiration Time**  
+  After the expiration time, the share will be marked as **expired** and cannot be accessed.  
+
+  > ⚠️ Cloud data will not be automatically deleted. You can manually clean it up to save storage space.
+
+- **Visitor Limit**  
+  Set the maximum number of visitors.  
+
+  - Once the limit is reached, new visitors cannot access the share  
+  - Visitors who have already accessed it can continue to visit  
+  - Multiple visits from the same browser are counted as **one visitor**
+
+- **Link Suffix**
+
+  Customize the suffix of the share link.
+
+---
+
+## ⚠️ Notes
+
+- **Content Update Mechanism**  
+
+  - If you **modify the document or notebook content**, please use **"Update Share"**  
+    → This keeps the original share link unchanged while synchronizing the latest content  
+  - If you only **modify access settings (password / expiration time / visitor limit / link suffix)**, please use **"Update Access Settings"**  
+    → No need to re-upload content, saving time and bandwidth
+
+- **Link Change Rules**  
+  If you **"Delete Share" and then "Create Share" again**,  
+  👉 The system will generate a **new share link**, and the old link will immediately become invalid.
+
+  👉 If needed, you can restore the previous link format by modifying the **link suffix** in the access settings.
+
+---
+
+## ⚙️ Plugin Configuration
+
+This plugin relies on a server-side website:  
+🌐 **[share.b0x.top](https://share.b0x.top)** (used for data storage and access)
+
+### 1️⃣ Setup Steps
+
+1. Register an account on the server website  
+
+2. Generate an **API Key** on the website  
+
+3. Enter the API Key into the plugin settings  
+
+4. After configuration, you can start sharing  
+
+   > Sharing essentially uploads the corresponding document or notebook to the server
+
+### 2️⃣ Server Information
+
+- **Public Service**  
+  The current `share.b0x.top` is a **public server provided by the author**,  
+  mainly intended for **feature experience and short-term use**.
+
+- **Data Cleanup Policy**  
+  Due to bandwidth and storage limitations,  
+  large documents or notebooks **may be cleaned up** periodically.
+
+- **Private Deployment Recommendation (Strongly Recommended)**  
+  If you need **long-term sharing**,  
+  please refer to 👉 **[Server Deployment Guide](https://ccnwc9xa9692.feishu.cn/wiki/MQCtwMtQaifPuak4zl3cIMCqnLx)**  
+  to deploy your own private server.
+
+---
+
+## 📖 Feature Demonstration (GIFs hosted on GitHub, may require proxy access)
+
+### ① Generate API Key and Enter It into the Plugin
+
+![Generate API Key](https://github.com/user-attachments/assets/8ad5e431-8a60-4e83-a594-ff1de28af68d)
+
+---
+
+### ② Share Document / Notebook
+
+Using notebook sharing as an example. Single document or document with subdocuments sharing is also supported.
+
+![Share Notebook](https://github.com/user-attachments/assets/62faf774-16e7-4b48-9dff-d738749ee4d5)
+
+---
+
+### ③ Open the Share Link to View Content
+
+![Open Share Link](https://github.com/user-attachments/assets/155ee85c-1a73-49e4-b03e-69b9a31f2727)
+
+---
+
+### ④ Access Statistics Overview
+
+![Access statistics](https://github.com/user-attachments/assets/b2690a03-6e97-4845-87be-1ab3e5406847)
+
+---
+
+## ☕ Support the Author
+
+If you find this project helpful, feel free to support the author ❤️  
+Your support motivates me to **continuously maintain and improve** this tool.
+
+> ⬆️ The Star badge and donation QR codes below point to the **original project and original author**, not to the fork maintainer.
+> If you like, you can also give [this repository](https://github.com/804260247/siyuan-plugin-share) a ⭐ to support ongoing maintenance.
+
+<div align="center">
+    <a href="https://github.com/b8l8u8e8/siyuan-plugin-share">
+        <img src="https://img.shields.io/github/stars/b8l8u8e8/siyuan-plugin-share?style=for-the-badge&color=ffd700&label=Give%20a%20Star" alt="Github Star">
+    </a>
+</div>
+
+<div align="center" style="margin-top: 40px;">
+    <div style="display: flex; justify-content: center; align-items: center; gap: 30px;">
+        <div style="text-align: center;">
+            <img src="https://github.com/user-attachments/assets/81d0a064-b760-4e97-9c9b-bf83f6cafc8a" 
+                 style="height: 280px; width: auto; border-radius: 10px; border: 2px solid #07c160;">
+            <br/>
+            <b style="color: #07c160; margin-top: 10px; display: block;">WeChat Pay</b>
+        </div>
+        <div style="text-align: center;">
+            <img src="https://github.com/user-attachments/assets/9e1988d0-4016-4b8d-9ea6-ce8ff714ee17" 
+                 style="height: 280px; width: auto; border-radius: 10px; border: 2px solid #1677ff;">
+            <br/>
+            <b style="color: #1677ff; margin-top: 10px; display: block;">Alipay</b>
+        </div>
+    </div>
+    <p style="margin-top: 20px;"><i>Your support is the greatest motivation for continuous iteration 🙏</i></p>
+</div>
+
+---
+
+## 🛠️ Other Information
+
+- 🔀 Original project (upstream):
+  [b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share)
+
+- 🐞 Issue Reporting (this repository):  
+  [GitHub Issues](https://github.com/804260247/siyuan-plugin-share/issues)
+
+- 📄 License:  
+  [MIT License](https://github.com/804260247/siyuan-plugin-share/blob/main/LICENSE)
+
+- 🧾 Changelog:  
+  [CHANGELOG.md](https://github.com/804260247/siyuan-plugin-share/blob/main/CHANGELOG.md)
+
+- 🏅 Contributors:  
+  [Contributors List](https://github.com/804260247/siyuan-plugin-share/graphs/contributors)
+
+- 💖 Sponsors:  
+  [Sponsor List](https://github.com/804260247/siyuan-plugin-share/blob/main/sponsor-list.md)

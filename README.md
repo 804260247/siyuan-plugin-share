@@ -1,177 +1,183 @@
-# 🔗 Siyuan Share
+# 🔗 思源分享（Siyuan Share）
 
-**Siyuan Share** is a **free and open-source** plugin for Siyuan Note that allows you to generate **accessible share links for notebooks, single documents, or documents with their subdocuments**.  
-It supports **access passwords, expiration time, and visitor limits**, and provides an **access statistics overview**, making it suitable for knowledge sharing, collaboration, and temporary public publishing.
+**思源分享（Siyuan Share）** 是一款 **免费、开源** 的思源笔记插件，用于将 **笔记本、单篇文档、文档及子文档生成可访问的分享链接**。  
+它支持 **访问密码、到期时间、访客数量限制**，并提供 **访问统计概览**，适合知识分享、协作与临时公开展示等场景。
 
-🌍 Documentation Languages:  
-[中文 README](https://github.com/804260247/siyuan-plugin-share/blob/main/README_zh_CN.md) ｜ [English README](https://github.com/804260247/siyuan-plugin-share/blob/main/README.md)
+🌍 文档语言：  
+[中文 README](https://github.com/804260247/siyuan-plugin-share/blob/main/README.md) ｜ [English README](https://github.com/804260247/siyuan-plugin-share/blob/main/README_EN.md)
 
-> ### 🔀 About This Repository (Fork / Enhanced Branch)
+> ### 🔀 本仓库说明（Fork / 增强分支）
 >
-> **[804260247/siyuan-plugin-share](https://github.com/804260247/siyuan-plugin-share)** is an **enhanced fork** of the original project **[b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share)** by "取舍", maintained by [804260247](https://github.com/804260247).
+> 本仓库 **[804260247/siyuan-plugin-share](https://github.com/804260247/siyuan-plugin-share)** 是原项目 **[b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share)**（作者「取舍」）的 **增强分支（fork）**，由 [804260247](https://github.com/804260247) 维护。
 >
-> - This repository continues maintenance and currently adds two features, **already merged into `main`** (originally submitted upstream as PR #72 / #73):
->   - **Share page right sidebar: table of contents / recent updates** — branch `feat/share-column-layout`, upstream [PR #72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72)
->   - **Note-level announcement banner** — branch `feat/share-announcement`, upstream [PR #73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73)
-> - See **[CHANGELOG.md](https://github.com/804260247/siyuan-plugin-share/blob/main/CHANGELOG.md)** for this repository's release notes.
-> - Feature docs, deployment guides and server setup guides are inherited from the original project; copyright, donations and Stars belong to the original author.
+> - 本仓库承接后续维护，目前新增两项特性，**已合并进 `main`**（原以上游 PR 形式提交）：
+>   - **分享页右侧目录 / 最近更新栏** —— 分支 `feat/share-column-layout`，上游 [PR #72](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/72)
+>   - **笔记级公告提示** —— 分支 `feat/share-announcement`，上游 [PR #73](https://github.com/b8l8u8e8/siyuan-plugin-share/pull/73)
+> - 本仓库的更新记录见 **[CHANGELOG.md](https://github.com/804260247/siyuan-plugin-share/blob/main/CHANGELOG.md)**。
+> - 功能说明、部署教程、服务端搭建等内容沿用原项目文档；版权、赞赏与 Star 均归原作者所有。
 
-📝 Documentation:
+📝 使用文档：
 
-[Beginner-Friendly Tutorial Guide](https://share.b0x.top/s/8c34c022)
-
----
-
-## 🚀 Plugin Advantages
-
-🌐 **Ready to Use, Flexible Deployment**
-
-The tool is **completely free and open-source**. You can start instantly via `share.b0x.top` or choose self-hosting (supports **Docker / NAS / BT-Panel / other panels**).
-
-🎯 **Flexible Sharing, Precise Control**
-
-Share a **single page, sub-documents, or an entire notebook**. You can **exclude specific documents** with one click to ensure private content stays private.
-
-⚡ **Efficient Sync, Built-in Analytics**
-
-Uses an **incremental update** algorithm (faster and saves data). Features built-in analytics, allowing you to track **visitor counts, locations, and other key insights** at a glance.
-
-**🔄 Auto-Update: Effortless & Worry-free** 
-
-Once enabled, it automatically detects document changes in the background and updates the shared page, eliminating the need for repeated manual updates. It also provides running status, queues, and history logs to ensure your shared content is always up to date.
+[保姆级教程使用文档](https://share.b0x.top/s/8c34c022)
 
 ---
 
-## ✨ Usage Guide
+## 🚀 插件优势
 
-### 📌 Entry Point
+🌐 **开箱即用，部署自由**    
 
-In the **Document Tree**, right-click on a **notebook or document** → open the **Plugin Menu** to access the following features:
+本体**完全开源免费**。支持 `share.b0x.top` 快速开始，亦可私有化部署（支持 **Docker / NAS / 宝塔面板 / 其他面板**）。 
 
-- 🆕 Create Share / Manage Share  
-- 🔄 Update Share  
-- 📋 Copy Share Link  
-- 🗑️ Delete Share  
+🎯 **灵活分享，精准受控**    
 
-### 🗂️ Share Management
+支持**单篇、子文档或全笔记本**分享。可**一键排除**特定文档，确保私密内容不被公开。 
 
-Go to the **Plugin Settings page** to view the **list of all created shares** and manage them centrally.
+⚡ **高效同步，内置统计**    
 
----
+采用**增量更新**算法（省流、极速）。自带分享访问统计功能，让你对分享内容的**访客人数、地理位置等数据**了如指掌。
 
-## 🔐 Access Settings
+🔄 **自动更新，省心省力**
 
-- **Access Password**  
-  Set a password for the share. Visitors must enter the correct password to view the content.
-
-- **Expiration Time**  
-  After the expiration time, the share will be marked as **expired** and cannot be accessed.  
-
-  > ⚠️ Cloud data will not be automatically deleted. You can manually clean it up to save storage space.
-
-- **Visitor Limit**  
-  Set the maximum number of visitors.  
-
-  - Once the limit is reached, new visitors cannot access the share  
-  - Visitors who have already accessed it can continue to visit  
-  - Multiple visits from the same browser are counted as **one visitor**
-
-- **Link Suffix**
-
-  Customize the suffix of the share link.
+开启后可在后台**自动检测文档变更并更新分享页**，无需反复手动点击更新；并提供**运行状态、队列与历史记录**，让分享内容始终保持最新。
 
 ---
 
-## ⚠️ Notes
+## 📦 安装方式
 
-- **Content Update Mechanism**  
+本插件**暂未上架思源官方集市**，需手动安装：
 
-  - If you **modify the document or notebook content**, please use **"Update Share"**  
-    → This keeps the original share link unchanged while synchronizing the latest content  
-  - If you only **modify access settings (password / expiration time / visitor limit / link suffix)**, please use **"Update Access Settings"**  
-    → No need to re-upload content, saving time and bandwidth
+1. 在 GitHub 仓库页面点击 `Code → Download ZIP` 下载压缩包
+2. 解压后得到 `siyuan-plugin-share-main` 文件夹
+3. 将该文件夹**重命名为 `siyuan-plugin-share`**（必须去掉 `-main` 后缀）
+4. 将重命名后的文件夹放入思源工作空间的 `data/plugins/` 目录
+5. 重启思源，在 `设置 → 插件` 中启用本插件
 
-- **Link Change Rules**  
-  If you **"Delete Share" and then "Create Share" again**,  
-  👉 The system will generate a **new share link**, and the old link will immediately become invalid.
-
-  👉 If needed, you can restore the previous link format by modifying the **link suffix** in the access settings.
+> 💡 提示：直接下载的 ZIP 包含一级目录。若通过集市「本地安装 / 导入」方式安装，需先解压并重命名文件夹，再重新压缩为 ZIP 后导入。
 
 ---
 
-## ⚙️ Plugin Configuration
+## ✨ 使用方法
 
-This plugin relies on a server-side website:  
-🌐 **[share.b0x.top](https://share.b0x.top)** (used for data storage and access)
+### 📌 操作入口
+在 **文档树** 中，对 **笔记本或文档** 右键点击 → 进入 **插件菜单**，可使用以下功能：
 
-### 1️⃣ Setup Steps
+- 🆕 创建分享 / 管理分享  
+- 🔄 更新分享  
+- 📋 复制分享链接  
+- 🗑️ 删除分享  
 
-1. Register an account on the server website  
-
-2. Generate an **API Key** on the website  
-
-3. Enter the API Key into the plugin settings  
-
-4. After configuration, you can start sharing  
-
-   > Sharing essentially uploads the corresponding document or notebook to the server
-
-### 2️⃣ Server Information
-
-- **Public Service**  
-  The current `share.b0x.top` is a **public server provided by the author**,  
-  mainly intended for **feature experience and short-term use**.
-
-- **Data Cleanup Policy**  
-  Due to bandwidth and storage limitations,  
-  large documents or notebooks **may be cleaned up** periodically.
-
-- **Private Deployment Recommendation (Strongly Recommended)**  
-  If you need **long-term sharing**,  
-  please refer to 👉 **[Server Deployment Guide](https://ccnwc9xa9692.feishu.cn/wiki/MQCtwMtQaifPuak4zl3cIMCqnLx)**  
-  to deploy your own private server.
+### 🗂️ 分享管理
+进入 **插件设置页面**，即可查看 **所有已创建的分享列表**，并进行统一管理与维护。
 
 ---
 
-## 📖 Feature Demonstration (GIFs hosted on GitHub, may require proxy access)
+## 🔐 访问设置说明
 
-### ① Generate API Key and Enter It into the Plugin
+- **访问密码**  
+  为分享设置访问密码，访客需输入正确密码才能查看内容。
 
-![Generate API Key](https://github.com/user-attachments/assets/8ad5e431-8a60-4e83-a594-ff1de28af68d)
+- **到期时间**  
+  超过到期时间后，分享将被标记为 **已过期**，无法访问。  
+  > ⚠️ 云端数据不会自动删除，可手动清理以节省空间。
+
+- **访客上限**  
+  设置最大访客数量。  
+  
+  - 超出上限后，新访客将无法访问  
+  - 已访问过的访客仍可继续访问  
+  - 同一浏览器多次访问仅计为 **1 位访客**
+  
+- **链接后缀**
+
+  自定义分享链接后缀。  
 
 ---
 
-### ② Share Document / Notebook
+## ⚠️ 注意事项
 
-Using notebook sharing as an example. Single document or document with subdocuments sharing is also supported.
-
-![Share Notebook](https://github.com/user-attachments/assets/62faf774-16e7-4b48-9dff-d738749ee4d5)
+- **内容更新机制**  
+  
+  - 若 **修改了文档或笔记本内容**，请使用 **「更新分享」**  
+    → 可保持原分享链接不变，同时同步最新内容  
+  - 若仅 **修改访问设置（密码 / 到期时间 / 访客上限 / 链接后缀）**，请使用 **「更新访问设置」**  
+    → 无需重新上传内容，节省时间与流量
+  
+- **链接变动规则**  
+  若执行 **「删除分享」后再「创建分享」**，  
+  👉 系统将生成 **新的分享链接**，旧链接将立即失效。
+  
+  👉 如有需要，也可通过 **修改访问设置中的链接后缀**，将链接恢复为之前的形式。
 
 ---
 
-### ③ Open the Share Link to View Content
+## ⚙️ 插件配置说明
 
-![Open Share Link](https://github.com/user-attachments/assets/155ee85c-1a73-49e4-b03e-69b9a31f2727)
+本插件依赖服务端网站：  
+🌐 **[share.b0x.top](https://share.b0x.top)**（用于数据存储与访问）
+
+### 1️⃣ 配置步骤
+
+1. 前往服务端网站注册账号  
+2. 在网站中生成 **API Key**  
+3. 将 API Key 填入插件设置中  
+4. 配置完成后，即可开始分享  
+   > 分享操作本质上是将对应文档 / 笔记本上传至服务端
+
+### 2️⃣ 服务端说明
+
+- **公共服务说明**  
+  当前的 `share.b0x.top` 为作者提供的 **公共服务端**，  
+  主要用于 **功能体验与短期使用**。
+
+- **数据清理策略**  
+  受限于服务器带宽与存储成本，  
+  可能会 **清理体积较大的文档或笔记本**。
+
+- **私有化部署建议（强烈推荐）**  
+  若你有 **长期分享的需求**，  
+  请参考 👉 **[服务端网站搭建教程](https://ccnwc9xa9692.feishu.cn/wiki/MQCtwMtQaifPuak4zl3cIMCqnLx)**  
+  自行部署私有服务端。
 
 ---
 
-### ④ Access Statistics Overview
+## 📖 功能演示（动图源自 GitHub，加载可能需“魔法”）
+
+### ① 生成 API Key 并填入插件
+
+![生成 API Key 并填入](https://github.com/user-attachments/assets/8ad5e431-8a60-4e83-a594-ff1de28af68d)
+
+---
+
+### ② 分享文档 / 笔记本
+仅以分享笔记本为例，分享单篇文档或文档及子文档也可以
+
+![分享笔记本](https://github.com/user-attachments/assets/62faf774-16e7-4b48-9dff-d738749ee4d5)
+
+---
+
+### ③ 打开分享链接查看内容
+
+![打开分享链接](https://github.com/user-attachments/assets/155ee85c-1a73-49e4-b03e-69b9a31f2727)
+
+---
+
+### ④ 访问统计概览
 
 ![Access statistics](https://github.com/user-attachments/assets/b2690a03-6e97-4845-87be-1ab3e5406847)
 
 ---
 
-## ☕ Support the Author
+## ☕ 支持作者
 
-If you find this project helpful, feel free to support the author ❤️  
-Your support motivates me to **continuously maintain and improve** this tool.
+如果你觉得这个项目对你有帮助，欢迎支持作者 ❤️  
+你的支持将激励我 **持续维护与优化**，打造更好用的工具。
 
-> ⬆️ The Star badge and donation QR codes below point to the **original project and original author**, not to the fork maintainer.
-> If you like, you can also give [this repository](https://github.com/804260247/siyuan-plugin-share) a ⭐ to support ongoing maintenance.
+> ⬆️ 下方 Star 徽章与赞赏码均指向 **原项目与原作者**，与 fork 维护者无关。
+> 如果你愿意，也可以给[本仓库](https://github.com/804260247/siyuan-plugin-share)点个 ⭐ 支持后续维护。
 
 <div align="center">
     <a href="https://github.com/b8l8u8e8/siyuan-plugin-share">
-        <img src="https://img.shields.io/github/stars/b8l8u8e8/siyuan-plugin-share?style=for-the-badge&color=ffd700&label=Give%20a%20Star" alt="Github Star">
+        <img src="https://img.shields.io/github/stars/b8l8u8e8/siyuan-plugin-share?style=for-the-badge&color=ffd700&label=%E7%BB%99%E4%B8%AAStar%E5%90%A7" alt="Github Star">
     </a>
 </div>
 
@@ -181,36 +187,38 @@ Your support motivates me to **continuously maintain and improve** this tool.
             <img src="https://github.com/user-attachments/assets/81d0a064-b760-4e97-9c9b-bf83f6cafc8a" 
                  style="height: 280px; width: auto; border-radius: 10px; border: 2px solid #07c160;">
             <br/>
-            <b style="color: #07c160; margin-top: 10px; display: block;">WeChat Pay</b>
+            <b style="color: #07c160; margin-top: 10px; display: block;">微信支付</b>
         </div>
         <div style="text-align: center;">
             <img src="https://github.com/user-attachments/assets/9e1988d0-4016-4b8d-9ea6-ce8ff714ee17" 
                  style="height: 280px; width: auto; border-radius: 10px; border: 2px solid #1677ff;">
             <br/>
-            <b style="color: #1677ff; margin-top: 10px; display: block;">Alipay</b>
+            <b style="color: #1677ff; margin-top: 10px; display: block;">支付宝</b>
         </div>
     </div>
-    <p style="margin-top: 20px;"><i>Your support is the greatest motivation for continuous iteration 🙏</i></p>
+    <p style="margin-top: 20px;"><i>你的支持，是我持续迭代的最大动力 🙏</i></p>
 </div>
 
 ---
 
-## 🛠️ Other Information
+## 🛠️ 其他信息
 
-- 🔀 Original project (upstream):
+- 🔀 原项目（上游）：
   [b8l8u8e8/siyuan-plugin-share](https://github.com/b8l8u8e8/siyuan-plugin-share)
 
-- 🐞 Issue Reporting (this repository):  
+- 🐞 问题反馈（本仓库）：  
   [GitHub Issues](https://github.com/804260247/siyuan-plugin-share/issues)
 
-- 📄 License:  
+- 📄 开源协议：  
   [MIT License](https://github.com/804260247/siyuan-plugin-share/blob/main/LICENSE)
 
-- 🧾 Changelog:  
+- 🧾 更新日志：  
   [CHANGELOG.md](https://github.com/804260247/siyuan-plugin-share/blob/main/CHANGELOG.md)
+  
+- 🏅 贡献列表：  
 
-- 🏅 Contributors:  
   [Contributors List](https://github.com/804260247/siyuan-plugin-share/graphs/contributors)
+  
+- 💖 赞助列表：  
+[Sponsor List](https://github.com/804260247/siyuan-plugin-share/blob/main/sponsor-list.md)
 
-- 💖 Sponsors:  
-  [Sponsor List](https://github.com/804260247/siyuan-plugin-share/blob/main/sponsor-list.md)

@@ -265,4 +265,4 @@ RUN docker-php-ext-install -j"$(nproc)" gd pdo pdo_sqlite zip opcache
 
 - [Docker 官方文档](https://docs.docker.com/)
 - [Docker Compose 文档](https://docs.docker.com/compose/)
-- [原项目 README](README_zh_CN.md)
+- [原项目 README](README.md)

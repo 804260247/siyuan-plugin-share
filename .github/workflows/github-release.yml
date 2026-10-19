@@ -128,7 +128,7 @@ jobs:
             CHANGELOG.md
             LICENSE
             README.md
-            README_zh_CN.md
+            README_EN.md
             icon.png
             index.css
             index.js
@@ -164,7 +164,7 @@ jobs:
             CHANGELOG.md \
             LICENSE \
             README.md \
-            README_zh_CN.md \
+            README_EN.md \
             icon.png \
             index.css \
             index.js \
