@@ -17,6 +17,8 @@ services:
       - ./php-site/config.php:/var/www/html/config.php:ro
       # nginx 主配置（只读挂载）：改完 `docker compose up -d` 即生效，无需重建镜像
       - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+      # OCR 临时图片共享卷（可选：与 ocr-sidecar 服务共用）
+      - ocr-data:/ocr
     environment:
       - TZ=Asia/Shanghai
     restart: unless-stopped
@@ -33,4 +35,6 @@ volumes:
   storage-data:
     driver: local
   uploads-data:
+    driver: local
+  ocr-data:
     driver: local

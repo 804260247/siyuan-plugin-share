@@ -5,6 +5,11 @@ RUN set -eux; \
     apk add --no-cache \
         curl \
         nginx \
+        supervisor \
+        poppler-utils \
+        tesseract-ocr \
+        tesseract-ocr-data-chi_sim \
+        tesseract-ocr-data-eng \
         freetype \
         libjpeg-turbo \
         libpng \
@@ -41,8 +46,8 @@ RUN set -eux; \
     { \
         echo "upload_max_filesize = 100M"; \
         echo "post_max_size = 100M"; \
-        echo "memory_limit = 256M"; \
-        echo "max_execution_time = 300"; \
+        echo "memory_limit = 1G"; \
+        echo "max_execution_time = 0"; \
     } > /usr/local/etc/php/conf.d/uploads.ini
 
 # Configure nginx
@@ -98,36 +103,19 @@ server {
 }
 SERVERCONF
 
+# Process supervisor: php-fpm + nginx + nd-worker（常驻索引/OCR Worker）
+COPY deploy/supervisord.conf /etc/supervisord.conf
+
 # Runtime entrypoint
 RUN cat > /usr/local/bin/docker-entrypoint.sh <<'ENTRYPOINT'
 #!/bin/sh
 set -eu
 
-mkdir -p /var/www/html/storage /var/www/html/uploads /run/nginx /var/lib/nginx/tmp /var/log/nginx
-chown -R www-data:www-data /var/www/html/storage /var/www/html/uploads
-chmod -R 775 /var/www/html/storage /var/www/html/uploads
+mkdir -p /var/www/html/storage /var/www/html/uploads /run/nginx /var/lib/nginx/tmp /var/log/nginx /var/log/supervisor /ocr
+chown -R www-data:www-data /var/www/html/storage /var/www/html/uploads /ocr
+chmod -R 775 /var/www/html/storage /var/www/html/uploads /ocr
 
-# Start both processes and keep their PIDs for signal forwarding.
-php-fpm --nodaemonize &
-FPM_PID=$!
-
-nginx -g 'daemon off;' &
-NGINX_PID=$!
-
-# Graceful shutdown handler for SIGTERM/SIGINT.
-_shutdown() {
-    kill -QUIT "$NGINX_PID" 2>/dev/null || true
-    kill -TERM "$FPM_PID" 2>/dev/null || true
-    wait "$NGINX_PID" "$FPM_PID" 2>/dev/null || true
-}
-trap '_shutdown; exit 0' TERM INT
-
-# Exit container if either process exits unexpectedly.
-while kill -0 "$NGINX_PID" 2>/dev/null && kill -0 "$FPM_PID" 2>/dev/null; do
-    sleep 5
-done
-_shutdown
-exit 1
+exec /usr/bin/supervisord -n -c /etc/supervisord.conf
 ENTRYPOINT
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

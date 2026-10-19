@@ -3235,6 +3235,269 @@ body.sps-resizing {
   padding: 0;
 }
 
+.kb-search-group {
+  padding: 8px 8px 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted, #8a93a8);
+  letter-spacing: 0.04em;
+}
+.kb-search-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 8px 6px;
+  border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.12));
+}
+.kb-search-tab {
+  appearance: none;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--muted, #8a93a8);
+  font-size: 0.8rem;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.kb-search-tab:hover {
+  background: var(--surface-muted, rgba(128, 128, 128, 0.1));
+}
+.kb-search-tab.is-active {
+  background: var(--surface-muted, rgba(128, 128, 128, 0.14));
+  color: var(--text, #e6e6e6);
+  border-color: var(--border, rgba(128, 128, 128, 0.2));
+}
+.kb-search-tab-count {
+  font-size: 0.68rem;
+  background: var(--surface-muted, rgba(128, 128, 128, 0.18));
+  border-radius: 8px;
+  padding: 0 6px;
+  line-height: 1.4;
+}
+.kb-search-panel {
+  min-width: 0;
+}
+.kb-search-panel[hidden] {
+  display: none;
+}
+.kb-search-ndnav {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 8px 8px 4px;
+  border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.12));
+}
+.kb-search-back {
+  background: none;
+  border: none;
+  color: var(--primary, #4a6ee0);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 4px;
+}
+.kb-search-crumb {
+  background: none;
+  border: none;
+  color: var(--primary, #4a6ee0);
+  cursor: pointer;
+  padding: 2px 4px;
+  font-size: 13px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kb-search-crumb-sep {
+  color: var(--muted, #8a93a8);
+  margin: 0 2px;
+  font-size: 13px;
+}
+.kb-search-diag {
+  margin: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--surface-muted, rgba(128, 128, 128, 0.08));
+  color: var(--muted, #8a93a8);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.netdisk-snippet {
+  flex: 0 1 40%;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted, #8a93a8);
+  font-size: 12px;
+}
+.kb-search-src {
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--surface-muted, rgba(128, 128, 128, 0.1));
+  color: var(--muted, #8a93a8);
+  white-space: nowrap;
+}
+.nd-progress-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 2px;
+}
+.nd-progress-label {
+  flex: 0 0 auto;
+  font-size: 0.7rem;
+  color: var(--muted, #8a93a8);
+  background: var(--surface-muted, rgba(128, 128, 128, 0.12));
+  padding: 1px 6px;
+  border-radius: 4px;
+  line-height: 1.4;
+}
+.nd-progress-text {
+  white-space: normal;
+  word-break: break-all;
+  overflow: visible;
+  min-width: 0;
+}
+.nd-progress {
+  margin-top: 4px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-muted, rgba(128, 128, 128, 0.12));
+  overflow: hidden;
+}
+.nd-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--primary, #5a7bff);
+  transition: width 0.4s ease;
+}
+.nd-progress-detail {
+  margin-top: 4px;
+  font-size: 0.72rem;
+  color: var(--muted, #8a93a8);
+  line-height: 1.4;
+  word-break: break-all;
+  overflow-wrap: break-word;
+  max-width: 100%;
+  white-space: normal;
+}
+[data-nd-reindex-status] .table th,
+[data-nd-reindex-status] .table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  word-break: break-all;
+  vertical-align: top;
+}
+/* 统计列：多行内容可换行，不被 ellipsis 截断（specificity 需高于 .table td 的 overflow:hidden） */
+[data-nd-reindex-status] .table td[data-nd-stats] {
+  overflow: hidden;
+  text-overflow: clip;
+  white-space: normal;
+  word-break: break-all;
+}
+/* 进度列：内容在 td 内换行完整显示（overflow hidden 防止溢出到统计列，white-space normal 允许换行） */
+[data-nd-reindex-status] .table td.nd-progress-cell {
+  overflow: hidden;
+  text-overflow: clip;
+  white-space: normal;
+  word-break: break-all;
+}
+/* 操作列：终止按钮不换行、不被截断 */
+[data-nd-reindex-status] .table td.nd-cancel-col {
+  overflow: visible;
+  white-space: nowrap;
+  text-overflow: clip;
+  vertical-align: middle;
+}
+[data-nd-reindex-status] .nd-cancel-btn {
+  padding: 6px 10px;
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+[data-nd-reindex-status] .nd-error-brief {
+  color: #dc2626;
+  font-weight: 600;
+}
+.nd-progress-hb {
+  margin-top: 2px;
+  font-size: 0.7rem;
+  color: var(--muted, #8a93a8);
+}
+.nd-progress-warn {
+  margin-top: 2px;
+  font-size: 0.72rem;
+  color: #d97706;
+  font-weight: 600;
+}
+.nd-progress-interrupted {
+  margin-top: 2px;
+  font-size: 0.74rem;
+  color: #dc2626;
+  font-weight: 700;
+}
+.nd-hit {
+  display: block;
+  padding: 8px;
+  border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.12));
+  cursor: pointer;
+}
+.nd-hit:hover {
+  background: var(--surface-muted, rgba(128,128,128,0.1));
+}
+.nd-hit:last-child {
+  border-bottom: none;
+}
+.nd-hit-line1 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.nd-hit-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+}
+.nd-hit-path {
+  font-size: 0.7rem;
+  color: var(--muted, #8a93a8);
+  line-height: 1.3;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nd-hit-snippet {
+  font-size: 0.76rem;
+  color: var(--muted, #8a93a8);
+  line-height: 1.5;
+  margin-top: 2px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* 展开的其它匹配片段：完整显示（不截 2 行）、片段间分隔线，避免视觉叠排 */
+.nd-snip-more .nd-hit-snippet {
+  display: block;
+  -webkit-line-clamp: unset;
+  overflow: visible;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border, #e3e7ee);
+}
+
 .kb-search-item {
   border-bottom: 1px solid var(--border);
 }
@@ -6981,4 +7244,476 @@ body.image-viewer-open {
   .error-page__scene::before { background: radial-gradient(circle, rgba(107,142,255,0.1) 0%, transparent 70%); }
   .error-page__comet { background: #c7d2fe; }
   .error-page__comet::after { background: linear-gradient(90deg, rgba(199,210,254,0.4), transparent); }
+}
+
+/* ============================================================
+ * Cloudreve 网盘（Netdisk）样式
+ * ============================================================ */
+body.layout-share .netdisk-body {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.netdisk-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.netdisk-toolbar .button {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px 6px;
+  min-height: 28px;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.25));
+  border-radius: 6px;
+  color: var(--text, #1e2538);
+  background: var(--surface, #fff);
+}
+.netdisk-toolbar .button:hover {
+  border-color: var(--primary, #4a6ee0);
+  color: var(--primary, #4a6ee0);
+}
+.netdisk-toolbar .button svg {
+  width: 18px;
+  height: 18px;
+}
+.netdisk-crumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  font-size: 13px;
+  min-width: 0;
+  overflow: hidden;
+}
+.netdisk-crumb {
+  background: none;
+  border: none;
+  color: var(--primary, #4a6ee0);
+  cursor: pointer;
+  padding: 2px 2px;
+  white-space: nowrap;
+}
+.netdisk-crumb-sep {
+  color: var(--muted, #8a93a8);
+  margin: 0 2px;
+}
+.netdisk-list {
+  overflow-y: auto;
+  flex: 1;
+}
+.netdisk-body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+.netdisk-list {
+  scrollbar-width: none;
+}
+.netdisk-body:hover .netdisk-list,
+.netdisk-body:focus-within .netdisk-list {
+  scrollbar-width: thin;
+}
+.netdisk-list::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+.netdisk-body:hover .netdisk-list::-webkit-scrollbar,
+.netdisk-body:focus-within .netdisk-list::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.netdisk-list::-webkit-scrollbar-thumb {
+  background: rgba(90, 123, 255, 0.35);
+  border-radius: 999px;
+}
+.netdisk-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+.netdisk-empty {
+  color: var(--muted, #8a93a8);
+  font-size: 13px;
+  padding: 16px 4px;
+  text-align: center;
+}
+.netdisk-files {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.netdisk-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.netdisk-row:hover {
+  background: var(--surface-muted, rgba(128,128,128,0.1));
+}
+.netdisk-row .netdisk-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.netdisk-download {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  color: var(--muted, #8a93a8);
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 0;
+}
+.netdisk-download:hover {
+  color: var(--primary, #4a6ee0);
+  background: var(--surface-muted, rgba(128,128,128,0.12));
+}
+.netdisk-download .netdisk-svg {
+  width: 18px;
+  height: 18px;
+}
+.netdisk-svg-wrap {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+}
+.netdisk-svg {
+  width: 18px;
+  height: 18px;
+}
+.netdisk-svg-folder { color: #e6a23c; }
+.netdisk-svg-folder circle,
+.netdisk-svg-folder path { stroke: #e6a23c; }
+.netdisk-svg-image { color: #13c2c2; }
+.netdisk-svg-image path, .netdisk-svg-image rect { stroke: #13c2c2; }
+.netdisk-svg-video { color: #f56c6c; }
+.netdisk-svg-video path, .netdisk-svg-video rect { stroke: #f56c6c; }
+.netdisk-svg-audio { color: #9b59b6; }
+.netdisk-svg-audio path, .netdisk-svg-audio circle { stroke: #9b59b6; }
+.netdisk-svg-pdf { color: #e74c3c; }
+.netdisk-svg-word { color: #3b6fe0; }
+.netdisk-svg-excel { color: #27ae60; }
+.netdisk-svg-ppt { color: #e67e22; }
+.netdisk-svg-txt { color: #7f8c8d; }
+.netdisk-svg-md { color: #34495e; }
+.netdisk-svg-archive { color: #95a5a6; }
+.netdisk-svg-code { color: #16a085; }
+.netdisk-svg-generic { color: #9aa7bd; }
+.netdisk-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.netdisk-size {
+  color: var(--muted, #8a93a8);
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+.netdisk-preview {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 60vh;
+}
+.netdisk-preview-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border, rgba(128,128,128,0.2));
+}
+.netdisk-preview-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.netdisk-preview-body {
+  flex: 1;
+  display: block;
+  min-height: 50vh;
+  padding: 12px;
+  overflow: auto;
+}
+.netdisk-preview-body:has(.netdisk-preview-media) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.netdisk-preview-media {
+  max-width: 100%;
+  max-height: 75vh;
+  object-fit: contain;
+}
+.netdisk-preview-empty {
+  color: var(--muted, #8a93a8);
+}
+.netdisk-preview-frame {
+  width: 100%;
+  height: 75vh;
+  border: none;
+  display: block;
+}
+.netdisk-preview-text {
+  width: 100%;
+  height: 70vh;
+  border: 1px solid var(--border, rgba(128,128,128,0.2));
+  border-radius: 6px;
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 13px;
+  background: var(--surface-muted, rgba(128,128,128,0.06));
+  color: inherit;
+  resize: none;
+  white-space: pre;
+  overflow: auto;
+}
+.netdisk-sheet-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.netdisk-sheet-tab {
+  padding: 2px 10px;
+  border-radius: 4px;
+  background: var(--surface-muted, rgba(128,128,128,0.12));
+  font-size: 12px;
+}
+.netdisk-sheet-scroll {
+  overflow: auto;
+  max-height: 70vh;
+  border: 1px solid var(--border, rgba(128,128,128,0.2));
+  border-radius: 6px;
+}
+.netdisk-sheet-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+.netdisk-sheet-table th,
+.netdisk-sheet-table td {
+  border: 1px solid var(--border, rgba(128,128,128,0.2));
+  padding: 4px 8px;
+  white-space: nowrap;
+  text-align: left;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.netdisk-sheet-table th {
+  background: var(--surface-muted, rgba(128,128,128,0.12));
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+}
+.netdisk-office {
+  width: 100%;
+  height: 75vh;
+  display: flex;
+  position: relative;
+}
+.netdisk-office iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+.netdisk-office .netdisk-office-msg {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
+  background: var(--b3-theme-background, #fff);
+}
+.netdisk-office .netdisk-office-msg[hidden] {
+  display: none;
+}
+/* 默认根目录选择器 */
+.netdisk-root-pick {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.netdisk-root-pick .input {
+  flex: 1;
+  min-width: 0;
+}
+.netdisk-picker-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.netdisk-picker-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+}
+.netdisk-picker {
+  position: relative;
+  width: min(520px, 92vw);
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface, #fff);
+  color: var(--text, #1e2538);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+}
+.netdisk-picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.2));
+  font-weight: 600;
+}
+.netdisk-picker-crumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.12));
+  font-size: 13px;
+}
+.netdisk-picker-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  min-height: 200px;
+  max-height: 50vh;
+}
+.netdisk-picker-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border, rgba(128, 128, 128, 0.2));
+}
+.netdisk-picker-body .netdisk-empty {
+  padding: 24px 8px;
+}
+.netdisk-dl-modal {
+  width: min(860px, 94vw);
+  height: min(72vh, 620px);
+}
+.netdisk-dl-grid {
+  display: flex;
+  gap: 0;
+  flex: 1;
+  min-height: 0;
+}
+.netdisk-dl-left,
+.netdisk-dl-right {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.netdisk-dl-left {
+  border-right: 1px solid var(--border, rgba(128, 128, 128, 0.2));
+}
+.netdisk-dl-left .netdisk-picker-crumbs,
+.netdisk-dl-right-title {
+  flex: 0 0 auto;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+.netdisk-dl-left .netdisk-picker-crumbs {
+  flex-wrap: nowrap;
+}
+.netdisk-dl-left .netdisk-picker-crumbs .netdisk-crumb {
+  min-width: 0;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.netdisk-dl-left .netdisk-picker-crumbs .netdisk-crumb-sep {
+  flex: 0 0 auto;
+}
+.netdisk-dl-right-title {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border, rgba(128, 128, 128, 0.12));
+  font-size: 13px;
+  font-weight: 600;
+}
+.netdisk-dl-left .netdisk-picker-body,
+.netdisk-dl-right .netdisk-picker-body {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+}
+.netdisk-dl-right .netdisk-picker-body {
+  overflow-x: hidden;
+  overflow-y: auto;
+  word-break: keep-all;
+}
+.netdisk-file-icon {
+  color: var(--text-secondary, #667);
+  font-style: normal;
+}
+.netdisk-dl-add {
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--primary, #4a6ee0);
+  color: var(--primary, #4a6ee0);
+  background: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.netdisk-dl-add:hover {
+  background: var(--primary, #4a6ee0);
+  color: #fff;
+}
+.netdisk-dl-rule-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 6px;
+}
+.netdisk-dl-rule-row .netdisk-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.netdisk-dl-rule-row .button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
