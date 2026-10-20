@@ -42,6 +42,7 @@
 - [x] Dockerfile 增加 `supervisor`、`poppler-utils`、`tesseract-ocr` 及中英文语言包；`memory_limit` 1G、`max_execution_time` 0
 - [x] 新增 `deploy/supervisord.conf`，统一托管 php-fpm、nginx、nd-worker
 - [x] docker-compose 增加 `ocr-data` 共享卷，供 OCR sidecar 与主容器交换图片
+- [x] docker-compose 增加可选 `ocr:` 服务段（PaddleX serving，`deploy/ocr/init.sh`）：环境变量开放 `OCR_ENGINE`/`OCR_DEVICE`/`OCR_PORT`/`OCR_PROFILE`/`OCR_THREADS`/`OCR_PIP_INDEX`，内存/CPU 限额可调；sidecar 端口统一为 8080，未启用时自动回退 tesseract
 - [x] 保留本仓库分叉：nginx worker `www-data`、页脚 `804260247`、`site_version` 0.5.6、PR #72/#73 的列布局与公告
 
 ### 已知边界

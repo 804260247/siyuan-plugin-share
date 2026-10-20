@@ -2763,9 +2763,9 @@ function netdisk_is_ocr_candidate(string $ext): bool {
 
 const NETDISK_OCR_SIDECAR_WORKDIR = '/ocr';
 
-// PaddleOCR 官方 serving 地址：优先环境变量，默认 http://ocr-sidecar:8988（按部署实际调整）
+// PaddleOCR 官方 serving 地址：优先环境变量，默认 http://ocr:8080（服务名/端口与 compose 的 ocr 服务、deploy/ocr/init.sh 的 OCR_PORT 统一；也可通过 NETDISK_OCR_SIDECAR_URL 显式指定）
 function netdisk_ocr_sidecar_base(): string {
-    return rtrim((string)(getenv('NETDISK_OCR_SIDECAR_URL') ?: 'http://ocr-sidecar:8988'), '/');
+    return rtrim((string)(getenv('NETDISK_OCR_SIDECAR_URL') ?: 'http://ocr:8080'), '/');
 }
 
 function netdisk_ocr_sidecar_enabled(): bool {
