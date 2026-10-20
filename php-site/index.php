@@ -6038,6 +6038,72 @@ function netdisk_office_base_url(string $engine): string {
     return '';
 }
 
+// 统一抓取 WOPI 引擎地址：先带证书校验抓取；https 失败时自动绕过证书校验降级重试一次。
+// 返回 ['ok'=>bool, 'raw'=>string, 'error'=>string, 'note'=>string]；error 区分 DNS / 拒连 / 超时 / 证书 / HTTP 状态码。
+function netdisk_office_http_classify(string $msg): string {
+    $m = strtolower($msg);
+    if (strpos($m, 'getaddrinfo') !== false || strpos($m, 'could not resolve') !== false || strpos($m, 'name or service not known') !== false || strpos($m, 'nodename nor servname') !== false) {
+        return 'DNS 解析失败（主机名不存在或容器内 DNS 不可用）';
+    }
+    if (strpos($m, 'connection refused') !== false) {
+        return '连接被拒绝（端口未监听或被防火墙拦截）';
+    }
+    if (strpos($m, 'timed out') !== false || strpos($m, 'timeout') !== false) {
+        return '连接超时（网络不通或服务未在该端口监听）';
+    }
+    if (strpos($m, 'ssl') !== false || strpos($m, 'certificate') !== false) {
+        return 'TLS 证书校验失败（自签名/过期/主机名不匹配）';
+    }
+    if (strpos($m, 'could not find') !== false || strpos($m, 'unable to') !== false) {
+        return '网络不可达：' . $msg;
+    }
+    return $msg !== '' ? $msg : '未知错误';
+}
+
+function netdisk_office_http_get_once(string $url, bool $insecure): array {
+    $options = ['http' => ['timeout' => 15, 'follow_location' => 1, 'ignore_errors' => true, 'max_redirects' => 5]];
+    if ($insecure) {
+        $options['ssl'] = ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true];
+    }
+    $lastError = '';
+    set_error_handler(function ($no, $msg) use (&$lastError) { $lastError = $msg; return true; });
+    $raw = @file_get_contents($url, false, stream_context_create($options));
+    restore_error_handler();
+    $status = '';
+    if (isset($http_response_header[0]) && is_string($http_response_header[0])) {
+        $status = $http_response_header[0];
+    }
+    if ($raw === false) {
+        return ['ok' => false, 'raw' => '', 'status' => '',
+                'error' => netdisk_office_http_classify($lastError),
+                'ssl_fail' => (stripos($lastError, 'ssl') !== false || stripos($lastError, 'certificate') !== false)];
+    }
+    if ($status !== '' && preg_match('#HTTP/\S+\s+([1-5]\d\d)#', $status, $sm) && (int)$sm[1] >= 400) {
+        return ['ok' => false, 'raw' => $raw, 'status' => $status,
+                'error' => 'HTTP 状态码异常：' . $status, 'ssl_fail' => false];
+    }
+    return ['ok' => true, 'raw' => $raw, 'status' => $status, 'error' => '', 'ssl_fail' => false];
+}
+
+function netdisk_office_fetch(string $url): array {
+    $first = netdisk_office_http_get_once($url, false);
+    if ($first['ok']) {
+        return ['ok' => true, 'raw' => $first['raw'], 'error' => '', 'note' => ''];
+    }
+    if (strpos($url, 'https://') !== 0) {
+        return ['ok' => false, 'raw' => $first['raw'], 'error' => $first['error'], 'note' => ''];
+    }
+    // https 失败：绕过证书校验降级重试一次（局域网自签证书常见场景）
+    $retry = netdisk_office_http_get_once($url, true);
+    if ($retry['ok']) {
+        return ['ok' => true, 'raw' => $retry['raw'], 'error' => '',
+                'note' => '（证书校验未通过，已自动绕过证书校验重试成功；建议为服务配置受信证书或局域网内改走 http）'];
+    }
+    // 两次都失败：绕过证书后仍失败且原因不是证书 => 真实原因是 DNS/拒连/超时/状态码；否则回退首次的证书错误
+    $final = (!$retry['ssl_fail'] && $retry['error'] !== '') ? $retry : $first;
+    return ['ok' => false, 'raw' => $final['raw'], 'error' => $final['error'], 'note' => ''];
+}
+
 // 从引擎的 /hosting/discovery 解析 ext -> view 的 action urlsrc（缓存 1 小时）
 // 若该引擎当前没有已启用的应用，直接返回空（避免误用旧缓存/已删除应用的地址）
 function netdisk_office_discovery(string $engine): array {
@@ -6054,7 +6120,8 @@ function netdisk_office_discovery(string $engine): array {
         }
     }
     $url = $base . '/hosting/discovery';
-    $raw = @file_get_contents($url, false, stream_context_create(['http' => ['timeout' => 15, 'ignore_errors' => true]]));
+    $resp = netdisk_office_fetch($url);
+    $raw = $resp['ok'] ? $resp['raw'] : '';
     $map = [];
     if ($raw !== false && strpos($raw, '<') === 0) {
         preg_match_all('#<action[^>]*name="([^"]+)"[^>]*ext="([^"]+)"[^>]*urlsrc="([^"]+)"#i', $raw, $m, PREG_SET_ORDER);
@@ -6085,12 +6152,15 @@ function netdisk_office_validate_base(string $base): array {
         return ['ok' => false, 'app' => '', 'exts' => [], 'error' => '地址需以 http(s):// 开头'];
     }
     $url = $base . '/hosting/discovery';
-    $raw = @file_get_contents($url, false, stream_context_create(['http' => ['timeout' => 15, 'ignore_errors' => true]]));
-    if ($raw === false || $raw === '') {
-        return ['ok' => false, 'app' => '', 'exts' => [], 'error' => '无法访问 ' . $url];
+    $resp = netdisk_office_fetch($url);
+    $raw = $resp['ok'] ? $resp['raw'] : '';
+    if (!$resp['ok'] || $raw === '') {
+        $reason = $resp['ok'] ? '返回内容为空' : $resp['error'];
+        return ['ok' => false, 'app' => '', 'exts' => [], 'error' => '无法访问 ' . $url . '（' . $reason . '）' . $resp['note']];
     }
     if (strpos($raw, '<') !== 0) {
-        return ['ok' => false, 'app' => '', 'exts' => [], 'error' => '返回内容不是企业文档服务（WOPI discovery）'];
+        $snip = mb_substr(trim(strip_tags((string)$raw)), 0, 80);
+        return ['ok' => false, 'app' => '', 'exts' => [], 'error' => '返回内容不是企业文档服务（WOPI discovery）' . ($snip !== '' ? '；实际返回：' . $snip : '') . $resp['note']];
     }
     preg_match('#<app[^>]*name="([^"]+)"#i', $raw, $am);
     $appName = isset($am[1]) ? html_entity_decode($am[1], ENT_QUOTES | ENT_HTML5) : '(未知)';
@@ -17727,8 +17797,9 @@ if ($path === '/admin/netdisk/office/save' && $_SERVER['REQUEST_METHOD'] === 'PO
 function netdisk_office_discovery_engine_map(string $base, string $ext): ?array {
     $base = rtrim($base, '/');
     $url = $base . '/hosting/discovery';
-    $raw = @file_get_contents($url, false, stream_context_create(['http' => ['timeout' => 15, 'ignore_errors' => true]]));
-    if ($raw === false || strpos($raw, '<') !== 0) {
+    $resp = netdisk_office_fetch($url);
+    $raw = $resp['ok'] ? $resp['raw'] : '';
+    if ($raw === '' || strpos($raw, '<') !== 0) {
         return null;
     }
     $ext = strtolower(ltrim($ext, '.'));
