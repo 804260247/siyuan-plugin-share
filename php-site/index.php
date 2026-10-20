@@ -1984,18 +1984,109 @@ function get_user_limit_bytes(array $user): int {
     return default_storage_limit_bytes();
 }
 
+// 单行存在性检查的统一写法：取值后立即关游标，避免连接持读快照期间再发写语句
+// （SQLite WAL 下的"读升级写"死锁：database is locked 立即返回，busy_timeout 不生效）。
+function pdo_fetch_exists(PDOStatement $stmt): bool {
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
+    return $row !== false;
+}
+
 function recalculate_user_storage(int $userId): int {
     $pdo = db();
     $stmt = $pdo->prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM shares WHERE user_id = :uid AND deleted_at IS NULL');
     $stmt->execute([':uid' => $userId]);
     $shareTotal = (int)($stmt->fetch(PDO::FETCH_ASSOC)['total'] ?? 0);
+    // 单行 fetch 后必须关游标：连接保持读快照时再发 UPDATE 属"读升级写"，
+    // 若此刻 nd-worker 等其它写者持锁，SQLite 立即报 database is locked，busy_timeout 不生效。
+    $stmt->closeCursor();
     $logStmt = $pdo->prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM share_access_logs WHERE user_id = :uid');
     $logStmt->execute([':uid' => $userId]);
     $logTotal = (int)($logStmt->fetch(PDO::FETCH_ASSOC)['total'] ?? 0);
+    $logStmt->closeCursor();
     $total = $shareTotal + $logTotal;
-    $update = $pdo->prepare('UPDATE users SET storage_used_bytes = :total WHERE id = :id');
-    $update->execute([':total' => $total, ':id' => $userId]);
+    try {
+        netdisk_exec_retry(function () use ($pdo, $total, $userId) {
+            $update = $pdo->prepare('UPDATE users SET storage_used_bytes = :total WHERE id = :id');
+            $update->execute([':total' => $total, ':id' => $userId]);
+            $update->closeCursor();
+        }, 6);
+    } catch (Throwable $e) {
+        // 重试耗尽（多为页面渲染路径撞后台写锁）：降级返回库中已存值，绝不向上抛，
+        // 存储数显示可能短暂滞后，下一次成功重算即校正。
+        $fallback = $pdo->prepare('SELECT storage_used_bytes FROM users WHERE id = :id');
+        $fallback->execute([':id' => $userId]);
+        $stored = (int)($fallback->fetchColumn() ?: 0);
+        $fallback->closeCursor();
+        return $stored;
+    }
     return $total;
+}
+
+// 批量重算多个用户的已用存储：整批 1 次 UNION ALL 聚合 + 1 次已存值查询，
+// 仅对值发生变化的用户补 1 次 CASE UPDATE（数字正确时零写入）。
+// 供控制台用户列表等渲染场景使用，避免逐用户"读后写"在 SQLite WAL 下触发升级死锁。
+// 返回 [userId => total]；UPDATE 重试耗尽时降级读取库中已存值，绝不向上抛。
+function recalculate_users_storage_batch(array $userIds): array {
+    $ids = array_values(array_unique(array_filter(array_map('intval', $userIds), static fn($v) => $v > 0)));
+    if (empty($ids)) {
+        return [];
+    }
+    $pdo = db();
+    $ph = implode(',', array_fill(0, count($ids), '?'));
+    $totals = [];
+    $agg = $pdo->prepare("SELECT user_id, COALESCE(SUM(size_bytes), 0) AS total FROM (
+            SELECT user_id, size_bytes FROM shares WHERE deleted_at IS NULL AND user_id IN ($ph)
+            UNION ALL
+            SELECT user_id, size_bytes FROM share_access_logs WHERE user_id IN ($ph)
+        ) GROUP BY user_id");
+    $agg->execute(array_merge($ids, $ids));
+    foreach ($agg->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $totals[(int)$row['user_id']] = (int)$row['total'];
+    }
+    $agg->closeCursor();
+    // 已存列值：用于跳过无变化的 UPDATE（控制台每次刷新都重算，大多数用户值不变，
+    // 跳过写入才能从根源上减少渲染路径与 nd-worker 撞锁的机会）；写锁耗尽时也用它降级。
+    $stored = [];
+    $st = $pdo->prepare("SELECT id, storage_used_bytes FROM users WHERE id IN ($ph)");
+    $st->execute($ids);
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $stored[(int)$row['id']] = (int)$row['storage_used_bytes'];
+    }
+    $st->closeCursor();
+    foreach ($ids as $uid) {
+        if (!isset($totals[$uid])) {
+            $totals[$uid] = 0;
+        }
+    }
+    $dirty = [];
+    foreach ($totals as $uid => $total) {
+        if ($total !== ($stored[$uid] ?? $total)) {
+            $dirty[$uid] = $total;
+        }
+    }
+    if ($dirty) {
+        // id/total 均为 int 强转后拼接，无注入面
+        $cases = [];
+        foreach ($dirty as $uid => $total) {
+            $cases[] = "WHEN $uid THEN $total";
+        }
+        $sql = 'UPDATE users SET storage_used_bytes = CASE id ' . implode(' ', $cases)
+            . ' ELSE storage_used_bytes END WHERE id IN (' . implode(',', array_keys($dirty)) . ')';
+        try {
+            netdisk_exec_retry(function () use ($pdo, $sql) {
+                $upd = $pdo->prepare($sql);
+                $upd->execute();
+                $upd->closeCursor();
+            }, 6);
+        } catch (Throwable $e) {
+            // 写锁耗尽：降级为库中已存值（渲染路径，不允许抛错中断页面；下次成功重算自校正）
+            foreach ($dirty as $uid => $total) {
+                $totals[$uid] = $stored[$uid] ?? $total;
+            }
+        }
+    }
+    return $totals;
 }
 
 function adjust_user_storage(int $userId, int $delta): void {
@@ -4016,6 +4107,7 @@ function netdisk_index_job_create(int $shareId): int {
     $ex = $pdo->prepare('SELECT id FROM netdisk_index_jobs WHERE share_id=:s AND status IN ("pending","running") ORDER BY id DESC LIMIT 1');
     $ex->execute([':s' => $shareId]);
     $existing = (int)($ex->fetchColumn() ?: 0);
+    $ex->closeCursor();
     if ($existing > 0) {
         return $existing;
     }
@@ -4025,7 +4117,13 @@ function netdisk_index_job_create(int $shareId): int {
 }
 
 // 通用锁重试执行：SQLite 在 WAL 下偶发 "database is locked"，重试数次并短暂等待。
-// 总等待窗口应覆盖 db() 的 busy_timeout(15s)。返回受影响行数；重试耗尽后抛出异常（由调用方决定降级）。
+// 总等待窗口应覆盖所用连接的 busy_timeout：
+//   - db() 静态单例连接 = 30s（见 :214 PRAGMA busy_timeout = 30000）
+//   - netdisk_index_job_update 等自建的独立连接 = 15s（PRAGMA busy_timeout = 15000）
+// 默认 40×500ms=20s 对独立连接够用；走 db() 的关键写入应显式传更大 attempts。
+// 返回受影响行数；重试耗尽后抛出异常（由调用方决定降级）。
+// 注意：同连接"读快照未关游标 → 再写"的升级死锁会立即报错、busy_timeout 不生效，
+// 重试对该场景无效，调用方须先 closeCursor()。
 function netdisk_exec_retry(callable $fn, int $attempts = 40): mixed {
     for ($i = 0; $i < $attempts; $i++) {
         try {
@@ -6955,6 +7053,7 @@ function lookup_ip_location(string $ip): array {
     $stmt = $pdo->prepare('SELECT * FROM share_access_geo_cache WHERE ip = :ip LIMIT 1');
     $stmt->execute([':ip' => $ip]);
     $cached = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if ($cached) {
         $updatedAt = strtotime((string)($cached['updated_at'] ?? ''));
         if ($updatedAt && (time() - $updatedAt) < 86400 * 30) {
@@ -7024,6 +7123,7 @@ function purge_share_access_logs(int $shareId): ?int {
     $stmt = $pdo->prepare('SELECT user_id, COALESCE(SUM(size_bytes), 0) AS total FROM share_access_logs WHERE share_id = :sid');
     $stmt->execute([':sid' => $shareId]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     $userId = $row ? (int)$row['user_id'] : null;
     $total = $row ? (int)$row['total'] : 0;
     $pdo->prepare('DELETE FROM share_access_logs WHERE share_id = :sid')->execute([':sid' => $shareId]);
@@ -7038,6 +7138,7 @@ function purge_user_access_logs(int $userId): int {
     $stmt = $pdo->prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM share_access_logs WHERE user_id = :uid');
     $stmt->execute([':uid' => $userId]);
     $total = (int)($stmt->fetch(PDO::FETCH_ASSOC)['total'] ?? 0);
+    $stmt->closeCursor();
     $pdo->prepare('DELETE FROM share_access_logs WHERE user_id = :uid')->execute([':uid' => $userId]);
     adjust_user_storage($userId, -$total);
     return $total;
@@ -7053,6 +7154,7 @@ function cleanup_user_access_logs(int $userId, int $days): void {
         ':cutoff' => $cutoff,
     ]);
     $total = (int)($stmt->fetch(PDO::FETCH_ASSOC)['total'] ?? 0);
+    $stmt->closeCursor();
     if ($total <= 0) {
         return;
     }
@@ -7744,6 +7846,7 @@ function handle_share_comment_submit(string $slug): void {
         $check = $pdo->prepare('SELECT email FROM share_comments WHERE id = :id AND share_id = :share_id');
         $check->execute([':id' => $parentId, ':share_id' => $shareId]);
         $row = $check->fetch(PDO::FETCH_ASSOC);
+        $check->closeCursor();
         if (!$row) {
             flash('comment_error', '回复目标不存在');
             redirect($redirectPath);
@@ -7878,6 +7981,7 @@ function handle_share_comment_delete(string $slug): void {
     $stmt = $pdo->prepare('SELECT * FROM share_comments WHERE id = :id AND share_id = :share_id');
     $stmt->execute([':id' => $commentId, ':share_id' => (int)$share['id']]);
     $comment = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$comment) {
         flash('comment_error', '评论不存在');
         redirect($redirectPath);
@@ -7995,6 +8099,7 @@ function handle_share_comment_edit(string $slug): void {
     $stmt = $pdo->prepare('SELECT * FROM share_comments WHERE id = :id AND share_id = :share_id');
     $stmt->execute([':id' => $commentId, ':share_id' => (int)$share['id']]);
     $comment = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$comment) {
         flash('comment_error', '评论不存在');
         redirect($redirectPath);
@@ -8260,6 +8365,7 @@ function verify_email_code(string $email, string $code): bool {
         ':now' => now(),
     ]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$row) {
         return false;
     }
@@ -8298,6 +8404,7 @@ function verify_reset_code(int $userId, string $email, string $code): bool {
         ':now' => now(),
     ]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$row) {
         return false;
     }
@@ -9041,6 +9148,9 @@ function collect_asset_entries(array $files, array $paths, array $docIds): array
 function allocate_share_id(PDO $pdo): int {
     $stmt = $pdo->query('SELECT share_id FROM recycled_share_ids ORDER BY share_id ASC LIMIT 1');
     $shareId = (int)($stmt ? $stmt->fetchColumn() : 0);
+    if ($stmt) {
+        $stmt->closeCursor();
+    }
     if ($shareId > 0) {
         $del = $pdo->prepare('DELETE FROM recycled_share_ids WHERE share_id = :share_id');
         $del->execute([':share_id' => $shareId]);
@@ -9085,6 +9195,7 @@ function hard_delete_share(int $shareId): ?int {
     $stmt = $pdo->prepare('SELECT user_id FROM shares WHERE id = :id');
     $stmt->execute([':id' => $shareId]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$row) {
         return null;
     }
@@ -9116,6 +9227,7 @@ function delete_user_account(int $userId): bool {
     $stmt = $pdo->prepare('SELECT email, role FROM users WHERE id = :id');
     $stmt->execute([':id' => $userId]);
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$user) {
         return false;
     }
@@ -9406,9 +9518,11 @@ function recalculate_share_size(int $shareId): int {
     $stmt = $pdo->prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM share_docs WHERE share_id = :share_id');
     $stmt->execute([':share_id' => $shareId]);
     $docSize = (int)$stmt->fetchColumn();
+    $stmt->closeCursor();
     $stmt = $pdo->prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM share_assets WHERE share_id = :share_id');
     $stmt->execute([':share_id' => $shareId]);
     $assetSize = (int)$stmt->fetchColumn();
+    $stmt->closeCursor();
     $commentSize = share_comment_size($shareId);
     $total = $docSize + $assetSize + $commentSize;
     $stmt = $pdo->prepare('UPDATE shares SET size_bytes = :size_bytes, updated_at = :updated_at WHERE id = :id');
@@ -9542,6 +9656,7 @@ function handle_api(string $path): void {
             ':uid' => $user['id'],
         ]);
         $share = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->closeCursor();
         if (!$share) {
             api_response(404, null, 'Share not found');
         }
@@ -9550,9 +9665,13 @@ function handle_api(string $path): void {
         $docStmt = $pdo->prepare('SELECT id, doc_id, title, icon, hpath, parent_id, sort_index, sort_order, size_bytes, content_hash, meta_hash
             FROM share_docs WHERE share_id = :sid ORDER BY sort_order ASC, id ASC');
         $docStmt->execute([':sid' => $shareId]);
+        // 先取完并关闭 SELECT 游标再写：循环内持有读快照时执行 UPDATE 属"读升级写"，
+        // 撞上其它写者会立即 database is locked（busy_timeout 不生效）。
+        $docRows = $docStmt->fetchAll(PDO::FETCH_ASSOC);
+        $docStmt->closeCursor();
         $docHashUpdate = $pdo->prepare('UPDATE share_docs SET content_hash = :content_hash, meta_hash = :meta_hash WHERE id = :id');
         $docMarkdownStmt = $pdo->prepare('SELECT markdown FROM share_docs WHERE share_id = :sid AND id = :id LIMIT 1');
-        while ($row = $docStmt->fetch(PDO::FETCH_ASSOC)) {
+        foreach ($docRows as $row) {
             $contentHash = normalize_hash_hex($row['content_hash'] ?? '');
             $metaHash = normalize_hash_hex($row['meta_hash'] ?? '');
             if ($contentHash === '') {
@@ -9561,6 +9680,7 @@ function handle_api(string $path): void {
                     ':id' => (int)($row['id'] ?? 0),
                 ]);
                 $docMarkdown = (string)($docMarkdownStmt->fetchColumn() ?: '');
+                $docMarkdownStmt->closeCursor();
                 $contentHash = compute_doc_content_hash($docMarkdown);
                 unset($docMarkdown);
             }
@@ -9595,8 +9715,10 @@ function handle_api(string $path): void {
             ':sid' => $shareId,
             ':prefix' => comment_asset_prefix() . '%',
         ]);
+        $assetRows = $assetStmt->fetchAll(PDO::FETCH_ASSOC);
+        $assetStmt->closeCursor();
         $assetHashUpdate = $pdo->prepare('UPDATE share_assets SET asset_hash = :asset_hash WHERE id = :id');
-        while ($row = $assetStmt->fetch(PDO::FETCH_ASSOC)) {
+        foreach ($assetRows as $row) {
             $assetHash = normalize_hash_hex($row['asset_hash'] ?? '');
             if ($assetHash === '') {
                 $filePath = (string)($row['file_path'] ?? '');
@@ -9646,7 +9768,9 @@ function handle_api(string $path): void {
                 ':id' => $shareId,
                 ':uid' => $user['id'],
             ]);
-            if (!$check->fetchColumn()) {
+            $hardExists = (bool)$check->fetchColumn();
+            $check->closeCursor();
+            if (!$hardExists) {
                 api_response(404, null, '分享不存在');
             }
             hard_delete_share($shareId);
@@ -9675,6 +9799,7 @@ function handle_api(string $path): void {
             ':uid' => $user['id'],
         ]);
         $share = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->closeCursor();
         if (!$share) {
             api_response(404, null, 'Share not found');
         }
@@ -12171,7 +12296,9 @@ function seed_share_visitors_from_logs(int $shareId): void {
     $pdo = db();
     $stmt = $pdo->prepare('SELECT COUNT(*) FROM share_visitors WHERE share_id = :sid');
     $stmt->execute([':sid' => $shareId]);
-    if ((int)$stmt->fetchColumn() > 0) {
+    $visitorCount = (int)$stmt->fetchColumn();
+    $stmt->closeCursor();
+    if ($visitorCount > 0) {
         return;
     }
     $pdo->prepare('INSERT OR IGNORE INTO share_visitors (share_id, visitor_id, created_at)
@@ -13149,6 +13276,7 @@ function route_share(string $slug, ?string $docId = null): void {
             ':id' => $rowId,
         ]);
         $markdown = $docMarkdownStmt->fetchColumn();
+        $docMarkdownStmt->closeCursor();
         return is_string($markdown) ? $markdown : '';
     };
     if (empty($docs)) {
@@ -13762,6 +13890,7 @@ if ($path === '/login/email' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $stmt = $pdo->prepare('SELECT * FROM users WHERE email = :email LIMIT 1');
     $stmt->execute([':email' => $email]);
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$user) {
         flash('error', '该邮箱未注册');
         redirect('/login?tab=email&step=verify');
@@ -13961,7 +14090,7 @@ if ($path === '/register') {
             if ($email !== '') {
                 $checkEmail = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
                 $checkEmail->execute([':email' => $email]);
-                if ($checkEmail->fetch()) {
+                if (pdo_fetch_exists($checkEmail)) {
                     flash('error', '该邮箱已注册');
                     redirect('/register');
                 }
@@ -14021,7 +14150,7 @@ if ($path === '/register') {
         $pdo = db();
         $checkEmail = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
         $checkEmail->execute([':email' => $email]);
-        if ($checkEmail->fetch()) {
+        if (pdo_fetch_exists($checkEmail)) {
             flash('error', '该邮箱已注册');
             redirect('/register?step=verify');
         }
@@ -14228,6 +14357,7 @@ if ($path === '/reset') {
         $stmt = $pdo->prepare('SELECT * FROM users WHERE email = :email LIMIT 1');
         $stmt->execute([':email' => $email]);
         $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->closeCursor();
         if (!$user) {
             flash('error', '账号不存在');
             redirect('/reset');
@@ -15534,6 +15664,7 @@ if ($path === '/admin') {
     $userCountStmt = $pdo->prepare($userCountSql);
     $userCountStmt->execute($userParams);
     $totalUsers = (int)$userCountStmt->fetchColumn();
+    $userCountStmt->closeCursor();
     [$userPage, $userSize, $userPages, $userOffset] = paginate($totalUsers, $userPage, $userSize);
     $userSql .= ' ORDER BY created_at DESC LIMIT :limit OFFSET :offset';
     $userStmt = $pdo->prepare($userSql);
@@ -15544,8 +15675,13 @@ if ($path === '/admin') {
     $userStmt->bindValue(':offset', $userOffset, PDO::PARAM_INT);
     $userStmt->execute();
     $users = $userStmt->fetchAll(PDO::FETCH_ASSOC);
+    $userStmt->closeCursor();
+    // 批量聚合重算（整页 2 条 SQL），替代逐用户 3 条 SQL 的"读后写"循环，
+    // 避免与 nd-worker 心跳/队列写入撞 SQLite 升级死锁（database is locked）。
+    $storageMap = recalculate_users_storage_batch(array_column($users, 'id'));
     foreach ($users as &$u) {
-        $u['storage_used_bytes'] = recalculate_user_storage((int)$u['id']);
+        $uid = (int)$u['id'];
+        $u['storage_used_bytes'] = $storageMap[$uid] ?? (int)($u['storage_used_bytes'] ?? 0);
     }
     unset($u);
 
@@ -17042,7 +17178,7 @@ if ($path === '/admin/user-create' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($email !== '') {
         $checkEmail = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
         $checkEmail->execute([':email' => $email]);
-        if ($checkEmail->fetch()) {
+        if (pdo_fetch_exists($checkEmail)) {
             $_SESSION['user_create_form'] = $createForm;
             flash('error', '邮箱已被其他账号使用');
             redirect('/admin#users');
@@ -17050,7 +17186,7 @@ if ($path === '/admin/user-create' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     $check = $pdo->prepare('SELECT id FROM users WHERE username = :username LIMIT 1');
     $check->execute([':username' => $username]);
-    if ($check->fetch()) {
+    if (pdo_fetch_exists($check)) {
         $_SESSION['user_create_form'] = $createForm;
         flash('error', '用户名已存在');
         redirect('/admin#users');
@@ -17115,14 +17251,14 @@ if ($path === '/admin/user-update' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($email !== '') {
         $checkEmail = $pdo->prepare('SELECT id FROM users WHERE email = :email AND id != :id');
         $checkEmail->execute([':email' => $email, ':id' => $userId]);
-        if ($checkEmail->fetch()) {
+        if (pdo_fetch_exists($checkEmail)) {
             flash('error', '邮箱已被其他账号使用');
             redirect('/admin#users');
         }
     }
     $check = $pdo->prepare('SELECT id FROM users WHERE username = :username AND id != :id');
     $check->execute([':username' => $username, ':id' => $userId]);
-    if ($check->fetch()) {
+    if (pdo_fetch_exists($check)) {
         flash('error', '用户名已存在');
         redirect('/admin#users');
     }
@@ -17642,6 +17778,7 @@ if ($path === '/admin/netdisk/office/delete' && $_SERVER['REQUEST_METHOD'] === '
         $stmt = $pdo->prepare('SELECT engine, base_url FROM office_apps WHERE id = :id');
         $stmt->execute([':id' => $appId]);
         $deletedApp = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->closeCursor();
         $stmt = $pdo->prepare('DELETE FROM office_apps WHERE id = :id');
         $stmt->execute([':id' => $appId]);
         if ($deletedApp) {
@@ -18394,6 +18531,7 @@ if ($path === '/admin/comment/edit' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         WHERE share_comments.id = :id');
     $stmt->execute([':id' => $commentId]);
     $comment = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$comment) {
         flash('error', '评论不存在');
         redirect('/admin#scan');

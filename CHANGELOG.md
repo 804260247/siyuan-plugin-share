@@ -37,6 +37,13 @@
 - [x] 缩略图/内容响应增加 MIME 白名单、`X-Content-Type-Options: nosniff` 与 SVG 沙箱 CSP
 - [x] WOPI 回调校验 fileId；OCR 全部外部命令经 `escapeshellarg` 转义并设置超时
 
+### 稳定性修复（NAS 实测后追加）
+
+- [x] 修复控制台渲染撞 SQLite 升级死锁：「新增连接」后重定向渲染 /admin 报 `Fatal error: database is locked`
+- [x] `recalculate_user_storage()` 读快照未关游标即发 UPDATE 的模式全库改造：单行取值后统一 `closeCursor()`，关键写入用 `netdisk_exec_retry()` 包裹，重试耗尽后降级读取库中已存值，渲染路径绝不向上抛
+- [x] 控制台用户列表改为批量聚合重算（整页最多 3 条 SQL，值未变的用户跳过 UPDATE），从源头消除逐用户循环的高频写入
+- [x] php-fpm 错误可见性加固：`display_errors=Off`、`log_errors=On`，配合 `catch_workers_output=yes` 导入 supervisor 日志，生产页面不再泄露堆栈与绝对路径
+
 ### 部署
 
 - [x] Dockerfile 增加 `supervisor`、`poppler-utils`、`tesseract-ocr` 及中英文语言包；`memory_limit` 1G、`max_execution_time` 0

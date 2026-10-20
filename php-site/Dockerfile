@@ -42,13 +42,27 @@ COPY --chown=www-data:www-data php-site/ /var/www/html/
 RUN chmod -R a+rX /var/www/html
 
 # Configure PHP runtime limits
+# display_errors=Off + log_errors=On：生产页面不再泄露堆栈/绝对路径（上游镜像无 php.ini，
+# 内置默认 display_errors=1，SQLite 撞锁的 Fatal error 曾直接打给用户）。
 RUN set -eux; \
     { \
         echo "upload_max_filesize = 100M"; \
         echo "post_max_size = 100M"; \
         echo "memory_limit = 1G"; \
         echo "max_execution_time = 0"; \
-    } > /usr/local/etc/php/conf.d/uploads.ini
+        echo "display_errors = Off"; \
+        echo "log_errors = On"; \
+    } > /usr/local/etc/php/conf.d/uploads.ini; \
+    { \
+        echo ""; \
+        echo "; --- 错误可见性加固（随网盘扩展移植追加） ---"; \
+        echo "; worker stderr 交给 master，否则 error_log 会落到 /dev/null"; \
+        echo "catch_workers_output = yes"; \
+        echo "decorate_workers_output = no"; \
+        echo "php_admin_value[error_log] = /proc/self/fd/2"; \
+        echo "php_admin_flag[log_errors] = on"; \
+        echo "php_admin_flag[display_errors] = off"; \
+    } >> /usr/local/etc/php-fpm.d/www.conf
 
 # Configure nginx
 # user www-data：nginx worker 与 php-fpm 同 uid，宿主 clone 的 640/750 权限也不会挡住静态资源。
