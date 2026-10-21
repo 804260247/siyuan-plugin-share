@@ -3114,13 +3114,6 @@ body.sps-resizing {
   );
 }
 
-/* Desktop: sidebar shows tree only (tab bar hidden but keeps tree actions) */
-@media (min-width: 961px) {
-  .kb-side-tabs .kb-side-tab {
-    display: none;
-  }
-}
-
 /* ── Share sidebar info (above search) ── */
 
 .kb-side-info {
