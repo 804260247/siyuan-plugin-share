@@ -2364,6 +2364,7 @@ function netdisk_tab_state(array $share, ?array $docCounts = null, ?PDO $pdo = n
 }
 
 function cloudreve_http_request(string $method, string $url, ?array $json = null, array $headers = []): ?array {
+    cloudreve_http_set_last_error('', 0);
     $headerLines = array_merge([
         'User-Agent: SiyuanShareNetdisk',
         'Content-Type: application/json',
@@ -2380,11 +2381,28 @@ function cloudreve_http_request(string $method, string $url, ?array $json = null
             CURLOPT_HTTPHEADER => $headerLines,
             CURLOPT_POSTFIELDS => $json === null ? '' : json_encode($json, JSON_UNESCAPED_UNICODE),
         ]);
+        curl_setopt($ch, CURLOPT_HEADER, false);
         $raw = @curl_exec($ch);
         $err = curl_error($ch);
+        $errno = curl_errno($ch);
+        $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
         if ($raw === false || $raw === '') {
+            if ($errno !== 0 || $err !== '') {
+                // curl 错误文案归一化成 netdisk_office_http_classify 认识的关键词
+                $norm = $err;
+                if ($errno === 6) { $norm = 'Could not resolve host: ' . $err; }
+                elseif ($errno === 7) { $norm = 'Connection refused: ' . $err; }
+                elseif ($errno === 28) { $norm = 'Connection timed out: ' . $err; }
+                elseif ($errno === 35 || $errno === 60 || $errno === 51 || $errno === 58 || $errno === 59 || $errno === 53) { $norm = 'SSL certificate problem: ' . $err; }
+                cloudreve_http_set_last_error($norm !== '' ? $norm : ('curl 错误号 ' . $errno), $httpCode);
+            } elseif ($httpCode >= 400) {
+                cloudreve_http_set_last_error('HTTP 状态码异常：' . $httpCode, $httpCode);
+            }
             return null;
+        }
+        if ($httpCode >= 400) {
+            cloudreve_http_set_last_error('HTTP 状态码异常：' . $httpCode, $httpCode);
         }
         $decoded = json_decode($raw, true);
         return is_array($decoded) ? $decoded : null;
@@ -2398,12 +2416,40 @@ function cloudreve_http_request(string $method, string $url, ?array $json = null
             'content' => $json === null ? '' : json_encode($json, JSON_UNESCAPED_UNICODE),
         ],
     ];
+    $lastErr = '';
+    set_error_handler(function ($no, $msg) use (&$lastErr) { $lastErr = $msg; return true; });
     $raw = @file_get_contents($url, false, stream_context_create($ctx));
+    restore_error_handler();
+    $statusLine = isset($http_response_header[0]) && is_string($http_response_header[0]) ? $http_response_header[0] : '';
     if ($raw === false) {
+        if ($lastErr !== '') {
+            cloudreve_http_set_last_error($lastErr, 0);
+        }
+        return null;
+    }
+    if (preg_match('#HTTP/\S+\s+([1-5]\d\d)#', $statusLine, $sm) && (int)$sm[1] >= 400) {
+        cloudreve_http_set_last_error('HTTP 状态码异常：' . $statusLine, (int)$sm[1]);
+        $decoded4 = json_decode($raw, true);
+        if (is_array($decoded4)) { return $decoded4; }
         return null;
     }
     $decoded = json_decode($raw, true);
     return is_array($decoded) ? $decoded : null;
+}
+
+// 最近一次 cloudreve_http_request 的传输层错误（连接/DNS/超时/TLS），成功或未捕获时为空串
+function cloudreve_http_last_error(): string {
+    return (string)($GLOBALS['__cloudreve_http_last_error'] ?? '');
+}
+
+function cloudreve_http_set_last_error(string $msg, int $httpCode = 0): void {
+    $GLOBALS['__cloudreve_http_last_error'] = $msg;
+    $GLOBALS['__cloudreve_http_last_code'] = $httpCode;
+}
+
+// 最近一次 cloudreve_http_request 失败的 HTTP 状态码（0 表示未拿到响应）
+function cloudreve_http_last_code(): int {
+    return (int)($GLOBALS['__cloudreve_http_last_code'] ?? 0);
 }
 
 // 对应某条连接配置的 token 缓存键
@@ -2428,11 +2474,56 @@ function cloudreve_login(array $cfg): bool {
     if (!is_array($token) || empty($token['access_token'])) {
         return false;
     }
+    cloudreve_store_login_tokens($id, $token);
+    return true;
+}
+
+// cloudreve_login 的带原因版本：返回 ['ok'=>bool, 'reason'=>string]，reason 供控制台「测试连接」透传，
+// 绝不包含密码或 token。细分四类：解密失败（口令字段无法还原）/ 服务不可访问 / 账号或密码错误（带 Cloudreve msg 与状态码）/ 响应异常。
+function cloudreve_login_detailed(array $cfg): array {
+    $id = (int)($cfg['id'] ?? 0);
+    $stored = trim((string)($cfg['password'] ?? ''));
+    $c = cloudreve_conn($cfg);
+    if ($stored !== '' && $c['password'] === '') {
+        return ['ok' => false, 'reason' => '已存密码解密失败（storage/.netdisk_secret 与加密时不一致），请编辑连接后重新输入密码'];
+    }
+    if ($c['base_url'] === '' || $c['email'] === '' || $c['password'] === '') {
+        return ['ok' => false, 'reason' => '地址/账号/密码不能为空'];
+    }
+    $resp = cloudreve_http_request('POST', $c['base_url'] . '/api/v4/session/token', [
+        'email' => $c['email'],
+        'password' => $c['password'],
+    ]);
+    if (!$resp || (int)($resp['code'] ?? 1) !== 0) {
+        $code = (int)cloudreve_http_last_code();
+        $transport = cloudreve_http_last_error();
+        $srvMsg = is_array($resp) ? trim((string)($resp['msg'] ?? '')) : '';
+        // 401/403：服务可达但凭据被拒 —— 优先按账号密码错误报，不要被传输层文案掩盖
+        if ($code === 401 || $code === 403) {
+            return ['ok' => false, 'reason' => '账号或密码错误（HTTP ' . $code . '）' . ($srvMsg !== '' ? '：' . $srvMsg : '')];
+        }
+        if ($transport !== '') {
+            return ['ok' => false, 'reason' => '服务不可访问：' . netdisk_office_http_classify($transport)];
+        }
+        if (is_array($resp)) {
+            return ['ok' => false, 'reason' => '登录被拒绝' . ($code ? '（HTTP ' . $code . '）' : '') . ($srvMsg !== '' ? '：' . $srvMsg : '')];
+        }
+        return ['ok' => false, 'reason' => '登录请求失败：未能收到有效 JSON 响应'];
+    }
+    $token = $resp['data']['token'] ?? null;
+    if (!is_array($token) || empty($token['access_token'])) {
+        return ['ok' => false, 'reason' => '登录响应异常：未返回 access_token'];
+    }
+    cloudreve_store_login_tokens($id, $token);
+    return ['ok' => true, 'reason' => ''];
+}
+
+// 登录成功后写入某条连接的 access/refresh token 缓存（cloudreve_login 与 cloudreve_login_detailed 共用）
+function cloudreve_store_login_tokens(int $id, array $token): void {
     set_setting(cloudreve_token_key($id, 'access'), netdisk_encrypt_secret((string)$token['access_token']));
     set_setting(cloudreve_token_key($id, 'refresh'), netdisk_encrypt_secret((string)($token['refresh_token'] ?? '')));
     $exp = strtotime((string)($token['access_expires'] ?? ''));
     set_setting(cloudreve_token_key($id, 'expires'), (string)($exp ? $exp : 0));
-    return true;
 }
 
 function cloudreve_access_token(array $cfg): string {
@@ -5617,6 +5708,58 @@ function handle_netdisk_preview_page(string $slug): void {
     exit;
 }
 
+// 从 URL 剥掉 query/fragment，只保留 scheme://host:port/path —— 报错透传时防止泄露签名 token
+function netdisk_url_sanitized(string $url): string {
+    $parts = parse_url($url);
+    if (!is_array($parts) || empty($parts['host'])) { return $url; }
+    $u = strtolower((string)($parts['scheme'] ?? 'http')) . '://'
+       . (string)$parts['host']
+       . (isset($parts['port']) ? ':' . $parts['port'] : '')
+       . (string)($parts['path'] ?? '');
+    return $u;
+}
+
+// 服务端代理拉取网盘内容（文件字节/缩略图）统一收口：
+// 复用 netdisk_office_http_classify 五分类；https 失败按同口径绕过证书降级重试一次（自签证书场景）；
+// 失败返回 error 文案（分类 + 脱敏目标地址），供 api_response(502) 透传，避免只剩一句笼统「获取失败」。
+function netdisk_proxy_fetch(string $url, int $timeout): array {
+    $once = function (bool $insecure) use ($url, $timeout): array {
+        $options = ['http' => [
+            'timeout' => $timeout,
+            'follow_location' => 1,
+            'ignore_errors' => true,
+            'max_redirects' => 5,
+        ]];
+        if ($insecure) {
+            $options['ssl'] = ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true];
+        }
+        $lastError = '';
+        set_error_handler(function ($no, $msg) use (&$lastError) { $lastError = $msg; return true; });
+        $raw = @file_get_contents($url, false, stream_context_create($options));
+        restore_error_handler();
+        $status = isset($http_response_header[0]) && is_string($http_response_header[0]) ? $http_response_header[0] : '';
+        if ($raw === false) {
+            return ['ok' => false, 'raw' => '', 'error' => netdisk_office_http_classify($lastError),
+                    'ssl_fail' => (stripos($lastError, 'ssl') !== false || stripos($lastError, 'certificate') !== false)];
+        }
+        if (preg_match('#HTTP/\S+\s+([1-5]\d\d)#', $status, $sm) && (int)$sm[1] >= 400) {
+            return ['ok' => false, 'raw' => $raw, 'error' => 'HTTP 状态码异常：' . $status, 'ssl_fail' => false];
+        }
+        return ['ok' => true, 'raw' => $raw, 'error' => '', 'ssl_fail' => false];
+    };
+    $first = $once(false);
+    if ($first['ok']) { return $first; }
+    if (strpos($url, 'https://') !== 0) {
+        return ['ok' => false, 'raw' => $first['raw'],
+                'error' => $first['error'] . '（目标：' . netdisk_url_sanitized($url) . '）', 'ssl_fail' => false];
+    }
+    $retry = $once(true);
+    if ($retry['ok']) { return $retry; }
+    $final = (!$retry['ssl_fail'] && $retry['error'] !== '') ? $retry : $first;
+    return ['ok' => false, 'raw' => $final['raw'],
+            'error' => $final['error'] . '（目标：' . netdisk_url_sanitized($url) . '；自签证书降级重试仍失败）', 'ssl_fail' => false];
+}
+
 function handle_netdisk_thumb(string $slug): void {
     $gated = netdisk_gate_share($slug);
     if (!$gated) {
@@ -5637,13 +5780,11 @@ function handle_netdisk_thumb(string $slug): void {
     if (!preg_match('#^https?://#i', $thumb)) {
         api_response(404, null, '缩略图不可直接代理');
     }
-    $ctx = stream_context_create([
-        'http' => ['timeout' => 20, 'ignore_errors' => true],
-    ]);
-    $raw = @file_get_contents($thumb, false, $ctx);
-    if ($raw === false) {
-        api_response(502, null, '获取缩略图失败');
+    $resp = netdisk_proxy_fetch($thumb, 20);
+    if (!$resp['ok']) {
+        api_response(502, null, '获取缩略图失败：' . $resp['error']);
     }
+    $raw = $resp['raw'];
     $imgInfo = @getimagesizefromstring($raw);
     $imgMime = is_array($imgInfo) ? (string)($imgInfo['mime'] ?? '') : '';
     if (!preg_match('#^image/(png|jpeg|gif|webp|bmp|avif)$#', $imgMime)) {
@@ -5679,13 +5820,11 @@ function handle_netdisk_content(string $slug): void {
         api_response(502, null, '获取文件地址失败');
     }
     $fileUrl = (string)$urls[0]['url'];
-    $ctx = stream_context_create([
-        'http' => ['timeout' => 30, 'ignore_errors' => true, 'follow_location' => 1],
-    ]);
-    $raw = @file_get_contents($fileUrl, false, $ctx);
-    if ($raw === false) {
-        api_response(502, null, '获取文件内容失败');
+    $resp = netdisk_proxy_fetch($fileUrl, 30);
+    if (!$resp['ok']) {
+        api_response(502, null, '获取文件内容失败：' . $resp['error']);
     }
+    $raw = $resp['raw'];
     $ext = netdisk_file_ext($name);
     $mime = detect_share_asset_mime_by_ext($ext);
     header('Content-Type: ' . $mime);
@@ -5778,8 +5917,9 @@ function netdisk_test_connection(array $cfg): array {
     if ($c['base_url'] === '' || $c['email'] === '' || $c['password'] === '') {
         return ['ok' => false, 'message' => '地址/账号/密码不能为空'];
     }
-    if (!cloudreve_login($cfg)) {
-        return ['ok' => false, 'message' => '登录失败：账号或密码错误 / 服务不可访问'];
+    $login = cloudreve_login_detailed($cfg);
+    if (!$login['ok']) {
+        return ['ok' => false, 'message' => '登录失败：' . $login['reason']];
     }
     $token = cloudreve_access_token($cfg);
     if ($token === '') {
@@ -6083,6 +6223,9 @@ function netdisk_office_http_classify(string $msg): string {
     }
     if (strpos($m, 'timed out') !== false || strpos($m, 'timeout') !== false) {
         return '连接超时（网络不通或服务未在该端口监听）';
+    }
+    if (strpos($m, 'wrong version number') !== false || strpos($m, 'unsupported protocol') !== false) {
+        return 'TLS 握手失败：目标端口可能并不是 HTTPS 服务（wrong version number），若该服务为明文端口请改用 http:// 地址';
     }
     if (strpos($m, 'ssl') !== false || strpos($m, 'certificate') !== false) {
         return 'TLS 证书校验失败（自签名/过期/主机名不匹配）';

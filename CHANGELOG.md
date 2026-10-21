@@ -46,6 +46,7 @@
 - [x] 修复分享页「网盘」标签在桌面端不显示：上游样式 `@media (min-width: 961px)` 整体隐藏 `.kb-side-tab`（服务端已正确渲染、管理端状态列显示「可显示」，但宽屏下标签被 CSS 隐藏不可点击），删除该规则后桌面端与窄屏一致显示全部标签，默认仍激活「文档树」；脚注弹窗侧栏同被此规则误伤的「目录」标签一并恢复
 - [x] 修复宽屏下左栏「目录」「最近更新」标签与右栏重复：右栏 `.share-right` 桌面端本就常驻渲染这两个面板（≤960px 才隐藏、靠左栏标签兜底），新增 `@media (min-width: 961px)` 仅隐藏左栏这两个标签按钮，宽屏只留「文档树 / 网盘」，窄屏四标签保持不变；用 `body:not(.sps-footnote-tab)` 排除脚注弹窗（其自建文档的 shell 同为 share-shell--notebook 且唯一标签就是 toc，直接限定 notebook 会误伤）
 - [x] 修复标签宽度随点击切换而抖动：「文档树」标签激活时 JS 显示折叠/展开按钮挤占标签行宽度，`.kb-side-tab` 无 `white-space: nowrap` 且默认可收缩，CJK 文本逐字换行成竖排三行。标签按钮加 `flex: 0 0 auto; white-space: nowrap`（宽度只由内容决定），标签行加 `flex-wrap: wrap`（空间不足整体换行，行间隙 16px 使激活下划线不贴死）
+- [x] 网盘连通性诊断透传：`handle_netdisk_content()`/`handle_netdisk_thumb()` 的文件/缩略图代理拉取收口 `netdisk_proxy_fetch()`，复用五分类错误口径且 https 自签证书自动降级重试一次，502 报错带错误分类与脱敏目标地址（剥掉 query，防泄露签名 token）；控制台「测试连接」细分「已存密码解密失败（.netdisk_secret 与加密时不一致，需重新输入密码）」/「服务不可访问（分类原因）」/「账号或密码错误（带 HTTP 状态码与 Cloudreve 原始 msg）」；TLS `wrong version number` 单独识别为「端口可能是明文 HTTP 服务，请改用 http://」——Collabora 9980 实际跑明文端口而应用地址填 https 的场景一眼可辨
 - [x] php-fpm 错误可见性加固：`display_errors=Off`、`log_errors=On`，配合 `catch_workers_output=yes` 导入 supervisor 日志，生产页面不再泄露堆栈与绝对路径
 - [x] 「网盘标签为何没出现」可诊断：控制台「分享绑定」表格新增「网盘标签」列，按与分享页完全同口径的 `netdisk_tab_state()` 输出「可显示 / 不可显示：原因」（未开启、无可用连接、绑定连接停用/缺少地址或邮箱、连接不存在、单文档分享页等原因逐项区分），不再需要打开分享页猜
 
