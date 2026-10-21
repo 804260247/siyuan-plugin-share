@@ -2723,7 +2723,8 @@ body.sps-announce-resizing {
 .kb-side-tabs {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 16px; /* 已含 row-gap:16px，换行后下划线(-11px)落在行间隙内不贴死 */
+  flex-wrap: wrap;
   padding: 4px 6px 10px;
   border-bottom: 1px solid var(--border);
   flex: 0 0 auto;
@@ -2738,6 +2739,18 @@ body.sps-announce-resizing {
   font-weight: 600;
   cursor: pointer;
   position: relative;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* 宽屏：目录/最近更新由右栏（.share-right）常驻显示，隐藏左栏重复标签。
+   body:not(.sps-footnote-tab) 排除脚注弹窗：弹窗（app.js doc.write）自建文档的
+   shell 同为 share-shell--notebook，且唯一标签就是 toc，限定到 notebook 仍会误伤。 */
+@media (min-width: 961px) {
+  body:not(.sps-footnote-tab) .kb-side-tab[data-share-tab="toc"],
+  body:not(.sps-footnote-tab) .kb-side-tab[data-share-tab="recent"] {
+    display: none;
+  }
 }
 
 .kb-side-tab.is-active {

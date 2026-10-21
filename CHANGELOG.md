@@ -44,6 +44,8 @@
 - [x] `recalculate_user_storage()` 读快照未关游标即发 UPDATE 的模式全库改造：单行取值后统一 `closeCursor()`，关键写入用 `netdisk_exec_retry()` 包裹，重试耗尽后降级读取库中已存值，渲染路径绝不向上抛
 - [x] 控制台用户列表改为批量聚合重算（整页最多 3 条 SQL，值未变的用户跳过 UPDATE），从源头消除逐用户循环的高频写入
 - [x] 修复分享页「网盘」标签在桌面端不显示：上游样式 `@media (min-width: 961px)` 整体隐藏 `.kb-side-tab`（服务端已正确渲染、管理端状态列显示「可显示」，但宽屏下标签被 CSS 隐藏不可点击），删除该规则后桌面端与窄屏一致显示全部标签，默认仍激活「文档树」；脚注弹窗侧栏同被此规则误伤的「目录」标签一并恢复
+- [x] 修复宽屏下左栏「目录」「最近更新」标签与右栏重复：右栏 `.share-right` 桌面端本就常驻渲染这两个面板（≤960px 才隐藏、靠左栏标签兜底），新增 `@media (min-width: 961px)` 仅隐藏左栏这两个标签按钮，宽屏只留「文档树 / 网盘」，窄屏四标签保持不变；用 `body:not(.sps-footnote-tab)` 排除脚注弹窗（其自建文档的 shell 同为 share-shell--notebook 且唯一标签就是 toc，直接限定 notebook 会误伤）
+- [x] 修复标签宽度随点击切换而抖动：「文档树」标签激活时 JS 显示折叠/展开按钮挤占标签行宽度，`.kb-side-tab` 无 `white-space: nowrap` 且默认可收缩，CJK 文本逐字换行成竖排三行。标签按钮加 `flex: 0 0 auto; white-space: nowrap`（宽度只由内容决定），标签行加 `flex-wrap: wrap`（空间不足整体换行，行间隙 16px 使激活下划线不贴死）
 - [x] php-fpm 错误可见性加固：`display_errors=Off`、`log_errors=On`，配合 `catch_workers_output=yes` 导入 supervisor 日志，生产页面不再泄露堆栈与绝对路径
 - [x] 「网盘标签为何没出现」可诊断：控制台「分享绑定」表格新增「网盘标签」列，按与分享页完全同口径的 `netdisk_tab_state()` 输出「可显示 / 不可显示：原因」（未开启、无可用连接、绑定连接停用/缺少地址或邮箱、连接不存在、单文档分享页等原因逐项区分），不再需要打开分享页猜
 
