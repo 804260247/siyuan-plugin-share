@@ -40,10 +40,11 @@
 ### 稳定性修复（NAS 实测后追加）
 
 - [x] 修复控制台渲染撞 SQLite 升级死锁：「新增连接」后重定向渲染 /admin 报 `Fatal error: database is locked`
-- 修复 WOPI 应用校验失败报错不明：新增 `netdisk_office_fetch()` 统一抓取 `/hosting/discovery`，https 自签证书场景自动绕过校验降级重试一次，失败原因（DNS / 拒连 / 超时 / 证书 / HTTP 状态码）透传到报错文案
+- [x] 修复 WOPI 应用校验失败报错不明：新增 `netdisk_office_fetch()` 统一抓取 `/hosting/discovery`，https 自签证书场景自动绕过校验降级重试一次，失败原因（DNS / 拒连 / 超时 / 证书 / HTTP 状态码）透传到报错文案
 - [x] `recalculate_user_storage()` 读快照未关游标即发 UPDATE 的模式全库改造：单行取值后统一 `closeCursor()`，关键写入用 `netdisk_exec_retry()` 包裹，重试耗尽后降级读取库中已存值，渲染路径绝不向上抛
 - [x] 控制台用户列表改为批量聚合重算（整页最多 3 条 SQL，值未变的用户跳过 UPDATE），从源头消除逐用户循环的高频写入
 - [x] php-fpm 错误可见性加固：`display_errors=Off`、`log_errors=On`，配合 `catch_workers_output=yes` 导入 supervisor 日志，生产页面不再泄露堆栈与绝对路径
+- [x] 「网盘标签为何没出现」可诊断：控制台「分享绑定」表格新增「网盘标签」列，按与分享页完全同口径的 `netdisk_tab_state()` 输出「可显示 / 不可显示：原因」（未开启、无可用连接、绑定连接停用/缺少地址或邮箱、连接不存在、单文档分享页等原因逐项区分），不再需要打开分享页猜
 
 ### 部署
 

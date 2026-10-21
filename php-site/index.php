@@ -2330,6 +2330,39 @@ function cloudreve_enabled(): bool {
     return false;
 }
 
+// 网盘标签渲染状态：与分享页侧边栏门槛完全同口径（netdisk_share_config + cloudreve_enabled），
+// 并额外细分「为什么没按钮」，供控制台「分享绑定 → 网盘标签」列直接展示诊断结果，
+// 避免分享页静默隐藏（既不渲染按钮也不报错）让用户自己猜。
+// $docCounts: 可选的 share_id => 文档数 映射（多分享场景批量预取，避免循环内逐条查询）。
+function netdisk_tab_state(array $share, ?array $docCounts = null, ?PDO $pdo = null): array {
+    $base = netdisk_share_config($share, $pdo);
+    if (!$base['enabled']) {
+        return ['show' => false, 'reason' => '未开启'];
+    }
+    if (!cloudreve_enabled()) {
+        return ['show' => false, 'reason' => '无可用 Cloudreve 连接（需启用且填写地址与邮箱）'];
+    }
+    if (!$base['cfg']) {
+        if ((int)($base['config_id'] ?? 0) <= 0) {
+            return ['show' => false, 'reason' => '未绑定连接，且启用中的连接不唯一，请在「绑定连接」中选择'];
+        }
+        return ['show' => false, 'reason' => '绑定的连接不存在，请重新绑定'];
+    }
+    if ((int)($base['cfg']['enabled'] ?? 0) !== 1) {
+        return ['show' => false, 'reason' => '绑定的连接已停用'];
+    }
+    if (trim((string)($base['cfg']['base_url'] ?? '')) === '' || trim((string)($base['cfg']['email'] ?? '')) === '') {
+        return ['show' => false, 'reason' => '绑定连接缺少地址或邮箱'];
+    }
+    if ((string)($share['type'] ?? '') === 'doc' && $docCounts !== null) {
+        $count = (int)($docCounts[(int)($share['id'] ?? 0)] ?? 0);
+        if ($count <= 1) {
+            return ['show' => false, 'reason' => '单文档分享页不显示网盘标签'];
+        }
+    }
+    return ['show' => true, 'reason' => '可显示'];
+}
+
 function cloudreve_http_request(string $method, string $url, ?array $json = null, array $headers = []): ?array {
     $headerLines = array_merge([
         'User-Agent: SiyuanShareNetdisk',
@@ -13410,7 +13443,7 @@ function route_share(string $slug, ?string $docId = null): void {
             $sidebar .= '<button class="kb-side-tab is-active" type="button" data-share-tab="tree">文档树</button>';
             $sidebar .= '<button class="kb-side-tab" type="button" data-share-tab="toc">目录</button>';
             $sidebar .= '<button class="kb-side-tab" type="button" data-share-tab="recent">最近更新</button>';
-            if (netdisk_share_config($share)['enabled'] && cloudreve_enabled()) {
+            if (netdisk_tab_state($share)['show']) {
                 $sidebar .= render_netdisk_tab_button();
             }
             $sidebar .= '<div class="kb-side-actions" data-share-tree-actions>';
@@ -13427,7 +13460,7 @@ function route_share(string $slug, ?string $docId = null): void {
             $sidebar .= '<div class="kb-side-panel" data-share-panel="recent" hidden>';
             $sidebar .= '<div class="kb-side-body share-recent-body">' . render_share_recent_list($docs, $slug, 5) . '</div>';
             $sidebar .= '</div>';
-            if (netdisk_share_config($share)['enabled'] && cloudreve_enabled()) {
+            if (netdisk_tab_state($share)['show']) {
                 $sidebar .= render_netdisk_panel($slug);
             }
             $sidebar .= '</aside>';
@@ -13542,7 +13575,7 @@ function route_share(string $slug, ?string $docId = null): void {
             $sidebar .= '<button class="kb-side-tab is-active" type="button" data-share-tab="tree">文档树</button>';
         $sidebar .= '<button class="kb-side-tab" type="button" data-share-tab="toc">目录</button>';
         $sidebar .= '<button class="kb-side-tab" type="button" data-share-tab="recent">最近更新</button>';
-        if (netdisk_share_config($share)['enabled'] && cloudreve_enabled()) {
+        if (netdisk_tab_state($share)['show']) {
             $sidebar .= render_netdisk_tab_button();
         }
         $sidebar .= '<div class="kb-side-actions" data-share-tree-actions>';
@@ -13559,7 +13592,7 @@ function route_share(string $slug, ?string $docId = null): void {
         $sidebar .= '<div class="kb-side-panel" data-share-panel="recent" hidden>';
         $sidebar .= '<div class="kb-side-body share-recent-body">' . render_share_recent_list($docs, $slug, 5) . '</div>';
         $sidebar .= '</div>';
-        if (netdisk_share_config($share)['enabled'] && cloudreve_enabled()) {
+        if (netdisk_tab_state($share)['show']) {
             $sidebar .= render_netdisk_panel($slug);
         }
         $sidebar .= '</aside>';
@@ -16482,15 +16515,23 @@ if ($path === '/admin') {
 
     // ===================== 分享绑定 =====================
     $content .= '<h3 style="margin-top:20px;margin-bottom:8px">分享绑定（为已分享的笔记开启网盘）</h3>';
-    $netdiskSharesStmt = $pdo->prepare('SELECT id, title, slug, netdisk_enabled, netdisk_root, netdisk_permission, netdisk_config_id FROM shares WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 500');
+    $netdiskSharesStmt = $pdo->prepare('SELECT id, type, title, slug, netdisk_enabled, netdisk_root, netdisk_permission, netdisk_config_id FROM shares WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 500');
     $netdiskSharesStmt->execute();
     $netdiskShares = $netdiskSharesStmt->fetchAll(PDO::FETCH_ASSOC);
+    // 批量预取每个分享的文档数（fetchAll 自动关游标，避免渲染循环内 SELECT→UPDATE 撞 SQLite 升级锁）
+    $netdiskDocCounts = [];
+    $netdiskDocStmt = $pdo->query('SELECT share_id, COUNT(*) AS cnt FROM share_docs GROUP BY share_id');
+    if ($netdiskDocStmt) {
+        foreach ($netdiskDocStmt->fetchAll(PDO::FETCH_ASSOC) as $docCountRow) {
+            $netdiskDocCounts[(int)$docCountRow['share_id']] = (int)$docCountRow['cnt'];
+        }
+    }
     if (empty($cloudreveConfigs)) {
         $content .= '<div class="notice">请先在上方添加至少一个 Cloudreve 连接配置。</div>';
     } elseif (empty($netdiskShares)) {
         $content .= '<p class="muted">暂无分享，先创建分享后再配置网盘。</p>';
     } else {
-        $content .= '<div class="table-scroll table-scroll-has-actions" style="margin-top:12px"><table class="table table-has-actions"><thead><tr><th>标题</th><th>链接</th><th>启用网盘</th><th>绑定连接</th><th class="actions">操作</th></tr></thead><tbody>';
+        $content .= '<div class="table-scroll table-scroll-has-actions" style="margin-top:12px"><table class="table table-has-actions"><thead><tr><th>标题</th><th>链接</th><th>启用网盘</th><th>绑定连接</th><th>网盘标签</th><th class="actions">操作</th></tr></thead><tbody>';
         foreach ($netdiskShares as $ns) {
             $nsTitle = htmlspecialchars((string)($ns['title'] ?? ''));
             $nsUrl = share_url((string)$ns['slug']);
@@ -16508,6 +16549,11 @@ if ($path === '/admin') {
                 $content .= '<option value="' . (int)$cfgOpt['id'] . '"' . $optSelected . '>' . htmlspecialchars((string)$cfgOpt['name']) . $optDisabled . '</option>';
             }
             $content .= '</select></td>';
+            $nsState = netdisk_tab_state($ns, $netdiskDocCounts);
+            $nsStateHtml = $nsState['show']
+                ? '<span style="color:#16a34a">可显示</span>'
+                : '<span style="color:#c00">' . htmlspecialchars($nsState['reason']) . '</span>';
+            $content .= '<td>' . $nsStateHtml . '</td>';
             $content .= '<td class="actions">';
             $content .= '<button class="button" type="button" data-netdisk-dl-manage data-share-id="' . (int)$ns['id'] . '" data-share-title="' . htmlspecialchars($nsTitle) . '" data-netdisk-config-id="' . (int)$nsCfgId . '">下载规则</button>';
             $content .= '<a class="button" href="' . htmlspecialchars($nsUrl) . '" target="_blank">打开分享</a>';
