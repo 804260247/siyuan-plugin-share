@@ -3086,6 +3086,13 @@ body.sps-announce-resizing {
   white-space: nowrap;
 }
 
+/* 网盘文件预览激活时：收起右栏（目录/最近更新是文档维度的，预览时无意义），
+   --right-width 已由 JS 置 0（背景渐变随之延伸），此处彻底隐藏右栏与右侧把手条 */
+body.sps-netdisk-preview .share-page .share-right,
+body.sps-netdisk-preview .share-page [data-share-gutter="right"] {
+  display: none;
+}
+
 /* Smooth width changes (collapsing / expanding); instant while dragging */
 .share-shell--notebook,
 .share-shell--notebook .kb-sidebar,

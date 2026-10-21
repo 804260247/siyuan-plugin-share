@@ -2446,7 +2446,9 @@
       );
       page.style.setProperty(
         "--right-width",
-        `${state.rightCollapsed ? 0 : clamp(state.right, MIN_RIGHT, MAX_RIGHT)}px`,
+        document.body.classList.contains("sps-netdisk-preview")
+          ? "0px"
+          : `${state.rightCollapsed ? 0 : clamp(state.right, MIN_RIGHT, MAX_RIGHT)}px`,
       );
       page.classList.toggle("is-left-collapsed", Boolean(state.leftCollapsed));
       page.classList.toggle("is-right-collapsed", Boolean(state.rightCollapsed));
@@ -3044,10 +3046,34 @@
       });
   };
 
+  // 预览期间收起右侧栏（目录/最近更新是文档维度的，预览时属干扰）；
+  // 恢复入口：loadDoc（点击文档树/搜索命中的文档）调用 window.__spsNetdiskRestoreRight()。
+  const collapseRightForPreview = () => {
+    if (document.body.classList.contains("sps-netdisk-preview")) return;
+    document.body.classList.add("sps-netdisk-preview");
+    const page = document.querySelector(".share-page");
+    if (page) {
+      page.dataset.spsSavedRight = page.style.getPropertyValue("--right-width") || "";
+      page.style.setProperty("--right-width", "0px");
+    }
+  };
+  window.__spsNetdiskRestoreRight = () => {
+    if (!document.body.classList.contains("sps-netdisk-preview")) return;
+    document.body.classList.remove("sps-netdisk-preview");
+    const page = document.querySelector(".share-page");
+    if (page) {
+      const saved = page.dataset.spsSavedRight || "";
+      if (saved) page.style.setProperty("--right-width", saved);
+      else page.style.removeProperty("--right-width");
+      delete page.dataset.spsSavedRight;
+    }
+  };
+
   // 网盘文件预览（右侧正文区）：网盘标签与搜索结果命中共用
   const openNetdiskPreview = async (slug, base, uri, name, ext, canDownload) => {
     const main = document.querySelector(".kb-main, .share-article");
     if (!main) return;
+    collapseRightForPreview();
     const url = base + "/s/" + encodeURIComponent(slug) + "/netdisk/open?uri=" + encodeURIComponent(uri) + "&name=" + encodeURIComponent(name);
     let info = null;
     let errMsg = "";
@@ -4278,6 +4304,7 @@
     };
 
     const loadDoc = async (url, {pushState = true} = {}) => {
+      if (window.__spsNetdiskRestoreRight) window.__spsNetdiskRestoreRight();
       clearFootnoteWindows();
       const currentId = ++requestId;
       if (controller) controller.abort();
