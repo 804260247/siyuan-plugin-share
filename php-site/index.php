@@ -5719,45 +5719,89 @@ function netdisk_url_sanitized(string $url): string {
     return $u;
 }
 
-// 服务端代理拉取网盘内容（文件字节/缩略图）统一收口：
-// 复用 netdisk_office_http_classify 五分类；https 失败按同口径绕过证书降级重试一次（自签证书场景）；
-// 失败返回 error 文案（分类 + 脱敏目标地址），供 api_response(502) 透传，避免只剩一句笼统「获取失败」。
+// 服务端代理拉取网盘内容（文件字节/缩略图）统一收口（curl 实现）：
+// - 显式跟随重定向（≤5 次），协议白名单仅 http/https（CURLOPT_PROTOCOLS/REDIR_PROTOCOLS），防重定向落点穿越 file:// 等；
+// - 用 header 回调收集重定向链，失败时每一跳都过 netdisk_url_sanitized()（剥 query，防签名 token 泄露）拼进错误 msg；
+// - 失败跳主机 ≠ 入参主机时，追加「请检查 Cloudreve 站点 URL / 存储节点直链配置」提示；
+// - 复用 netdisk_office_http_classify 五分类归一化；https 失败按第 5 提交同口径仅关证书校验降级重试一次（不改协议）；
+// - 「自签证书降级重试仍失败」后缀仅在最终失败确属 TLS 类时拼接（修掉此前无条件拼接的误导）。
+// 注意：CURLOPT_TIMEOUT 为整次请求（含全部重定向跳）的总时长上限，与旧 PHP 流实现的逐跳 timeout 语义不同。
+function netdisk_proxy_fetch_curl_once(string $url, int $timeout, bool $insecure): array {
+    $locations = [];
+    $statusLine = '';
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 5,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_CONNECTTIMEOUT => min(15, $timeout),
+        CURLOPT_TIMEOUT => $timeout,
+        CURLOPT_SSL_VERIFYPEER => !$insecure,
+        CURLOPT_SSL_VERIFYHOST => $insecure ? 0 : 2,
+        CURLOPT_HEADERFUNCTION => function ($ch, $header) use (&$locations, &$statusLine) {
+            if (stripos($header, 'location:') === 0) {
+                $loc = trim(substr($header, 9));
+                if ($loc !== '') { $locations[] = $loc; }
+            } elseif (preg_match('#^HTTP/\S+\s+[1-5]\d\d#', $header)) {
+                $statusLine = trim($header); // 多跳时保留最后一个状态行
+            }
+            return strlen($header);
+        },
+    ]);
+    $raw = curl_exec($ch);
+    $errno = curl_errno($ch);
+    $errmsg = curl_error($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    // 证书类失败（可通过关校验绕过）与「端口不是 HTTPS」类握手失败（关校验也绕不过）分开：
+    // 前者才配「自签证书降级重试仍失败」后缀，后者应把真实原因（协议不匹配）报出去。
+    $certFail = (in_array($errno, [51, 58, 59, 60, 77], true)
+        || stripos($errmsg, 'certificate') !== false || stripos($errmsg, 'self-signed') !== false);
+    if ($raw === false || $errno !== 0) {
+        // 失败跳：最后一个重定向落点；没有发生重定向时即入参 URL 本身
+        $failTarget = $locations !== [] ? end($locations) : $url;
+        $chain = implode(' → ', array_map('netdisk_url_sanitized', array_merge([$url], $locations)));
+        // curl 错误文案归一化成 netdisk_office_http_classify 认识的关键词（与 cloudreve_http_request 同口径）
+        $norm = '';
+        if ($errno === 6) { $norm = 'Could not resolve host: ' . $errmsg; }
+        elseif ($errno === 7) { $norm = 'Connection refused: ' . $errmsg; }
+        elseif ($errno === 28) { $norm = 'Connection timed out: ' . $errmsg; }
+        elseif ($errno === 60 || $errno === 51 || $errno === 58 || $errno === 59 || $errno === 53 || $errno === 77) { $norm = 'SSL certificate problem: ' . $errmsg; }
+        elseif ($errno === 35) { $norm = 'SSL connect error: ' . $errmsg; }
+        else { $norm = $errmsg !== '' ? $errmsg : ('curl 错误号 ' . $errno); }
+        $error = netdisk_office_http_classify($norm) . '（目标：' . $chain . '）';
+        $failHost = strtolower((string)(parse_url($failTarget, PHP_URL_HOST) ?: ''));
+        $baseHost = strtolower((string)(parse_url($url, PHP_URL_HOST) ?: ''));
+        if ($failHost !== '' && $baseHost !== '' && $failHost !== $baseHost) {
+            $error .= '；失败跳主机与配置地址不一致，请检查 Cloudreve 站点 URL / 存储节点直链配置';
+        }
+        return ['ok' => false, 'raw' => '', 'error' => $error, 'ssl_fail' => $certFail];
+    }
+    if ($status >= 400) {
+        $statusText = $statusLine !== '' ? $statusLine : ('HTTP ' . $status);
+        $chain = implode(' → ', array_map('netdisk_url_sanitized', array_merge([$url], $locations)));
+        return ['ok' => false, 'raw' => (string)$raw,
+                'error' => 'HTTP 状态码异常：' . $statusText . '（目标：' . $chain . '）', 'ssl_fail' => false];
+    }
+    return ['ok' => true, 'raw' => (string)$raw, 'error' => '', 'ssl_fail' => false];
+}
+
 function netdisk_proxy_fetch(string $url, int $timeout): array {
-    $once = function (bool $insecure) use ($url, $timeout): array {
-        $options = ['http' => [
-            'timeout' => $timeout,
-            'follow_location' => 1,
-            'ignore_errors' => true,
-            'max_redirects' => 5,
-        ]];
-        if ($insecure) {
-            $options['ssl'] = ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true];
-        }
-        $lastError = '';
-        set_error_handler(function ($no, $msg) use (&$lastError) { $lastError = $msg; return true; });
-        $raw = @file_get_contents($url, false, stream_context_create($options));
-        restore_error_handler();
-        $status = isset($http_response_header[0]) && is_string($http_response_header[0]) ? $http_response_header[0] : '';
-        if ($raw === false) {
-            return ['ok' => false, 'raw' => '', 'error' => netdisk_office_http_classify($lastError),
-                    'ssl_fail' => (stripos($lastError, 'ssl') !== false || stripos($lastError, 'certificate') !== false)];
-        }
-        if (preg_match('#HTTP/\S+\s+([1-5]\d\d)#', $status, $sm) && (int)$sm[1] >= 400) {
-            return ['ok' => false, 'raw' => $raw, 'error' => 'HTTP 状态码异常：' . $status, 'ssl_fail' => false];
-        }
-        return ['ok' => true, 'raw' => $raw, 'error' => '', 'ssl_fail' => false];
-    };
-    $first = $once(false);
+    $first = netdisk_proxy_fetch_curl_once($url, $timeout, false);
     if ($first['ok']) { return $first; }
     if (strpos($url, 'https://') !== 0) {
-        return ['ok' => false, 'raw' => $first['raw'],
-                'error' => $first['error'] . '（目标：' . netdisk_url_sanitized($url) . '）', 'ssl_fail' => false];
+        return ['ok' => false, 'raw' => $first['raw'], 'error' => $first['error'], 'ssl_fail' => false];
     }
-    $retry = $once(true);
+    // https 失败：绕过证书校验降级重试一次（局域网自签证书常见场景，只关校验不改协议）
+    $retry = netdisk_proxy_fetch_curl_once($url, $timeout, true);
     if ($retry['ok']) { return $retry; }
+    // 两次都失败：绕过证书后仍失败且原因不是证书 => 真实原因是 DNS/拒连/超时/状态码；否则回退首次的证书错误
     $final = (!$retry['ssl_fail'] && $retry['error'] !== '') ? $retry : $first;
-    return ['ok' => false, 'raw' => $final['raw'],
-            'error' => $final['error'] . '（目标：' . netdisk_url_sanitized($url) . '；自签证书降级重试仍失败）', 'ssl_fail' => false];
+    $suffix = $final['ssl_fail'] ? '；自签证书降级重试仍失败' : '';
+    return ['ok' => false, 'raw' => $final['raw'], 'error' => $final['error'] . $suffix, 'ssl_fail' => false];
 }
 
 function handle_netdisk_thumb(string $slug): void {
@@ -6224,8 +6268,8 @@ function netdisk_office_http_classify(string $msg): string {
     if (strpos($m, 'timed out') !== false || strpos($m, 'timeout') !== false) {
         return '连接超时（网络不通或服务未在该端口监听）';
     }
-    if (strpos($m, 'wrong version number') !== false || strpos($m, 'unsupported protocol') !== false) {
-        return 'TLS 握手失败：目标端口可能并不是 HTTPS 服务（wrong version number），若该服务为明文端口请改用 http:// 地址';
+    if (strpos($m, 'wrong version number') !== false || strpos($m, 'packet length too long') !== false || strpos($m, 'unsupported protocol') !== false || strpos($m, 'ssl connect error') !== false) {
+        return 'TLS 握手失败：目标端口可能并不是 HTTPS 服务（wrong version number / packet length too long），若该服务为明文端口请改用 http:// 地址';
     }
     if (strpos($m, 'ssl') !== false || strpos($m, 'certificate') !== false) {
         return 'TLS 证书校验失败（自签名/过期/主机名不匹配）';

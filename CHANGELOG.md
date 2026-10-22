@@ -48,6 +48,7 @@
 - [x] 修复标签宽度随点击切换而抖动：「文档树」标签激活时 JS 显示折叠/展开按钮挤占标签行宽度，`.kb-side-tab` 无 `white-space: nowrap` 且默认可收缩，CJK 文本逐字换行成竖排三行。标签按钮加 `flex: 0 0 auto; white-space: nowrap`（宽度只由内容决定），标签行加 `flex-wrap: wrap`（空间不足整体换行，行间隙 16px 使激活下划线不贴死）
 - [x] 网盘连通性诊断透传：`handle_netdisk_content()`/`handle_netdisk_thumb()` 的文件/缩略图代理拉取收口 `netdisk_proxy_fetch()`，复用五分类错误口径且 https 自签证书自动降级重试一次，502 报错带错误分类与脱敏目标地址（剥掉 query，防泄露签名 token）；控制台「测试连接」细分「已存密码解密失败（.netdisk_secret 与加密时不一致，需重新输入密码）」/「服务不可访问（分类原因）」/「账号或密码错误（带 HTTP 状态码与 Cloudreve 原始 msg）」；TLS `wrong version number` 单独识别为「端口可能是明文 HTTP 服务，请改用 http://」——Collabora 9980 实际跑明文端口而应用地址填 https 的场景一眼可辨
 - [x] 分享页打开网盘文件预览时自动收起右侧栏（目录/最近更新均为文档维度，预览时属干扰）：body 级 `sps-netdisk-preview` class + 右栏与右侧把手隐藏，`--right-width` 置 0 使背景渐变同步延伸；点击文档树/搜索命中任一文档加载后即恢复右栏原状态；窄屏本无右栏不受影响
+- [x] 网盘代理拉取诊断增强（重定向链透传）：`netdisk_proxy_fetch()` 改为 curl 实现，失败时错误 msg 拼出**完整脱敏重定向链**（每一跳剥 query 防签名 token 泄露），Cloudreve 拉文件 302 到容器内不可达的站点地址时能一眼看出被拒的是哪一跳；失败跳主机 ≠ 配置地址主机时追加「请检查 Cloudreve 站点 URL / 存储节点直链配置」提示；重定向协议白名单仅 http/https（防 `file://` 等落点穿越）；「自签证书降级重试仍失败」后缀仅在确属证书类失败时出现，明文端口误配 https 时改为准确报「TLS 握手失败：目标端口可能并不是 HTTPS 服务」；五分类口径、https 降级重试只关证书校验不改协议、thumb 20s / content 30s 均不变（注：curl 的超时为整次请求含重定向链的总时长上限）
 - [x] php-fpm 错误可见性加固：`display_errors=Off`、`log_errors=On`，配合 `catch_workers_output=yes` 导入 supervisor 日志，生产页面不再泄露堆栈与绝对路径
 - [x] 「网盘标签为何没出现」可诊断：控制台「分享绑定」表格新增「网盘标签」列，按与分享页完全同口径的 `netdisk_tab_state()` 输出「可显示 / 不可显示：原因」（未开启、无可用连接、绑定连接停用/缺少地址或邮箱、连接不存在、单文档分享页等原因逐项区分），不再需要打开分享页猜
 
