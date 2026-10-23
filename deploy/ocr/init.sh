@@ -55,6 +55,29 @@ fi
 
 echo "[ocr-init] engine=${OCR_ENGINE} device=${OCR_DEVICE} port=${OCR_PORT} profile=${OCR_PROFILE} threads=${OCR_THREADS}"
 
+# ---- 系统库：完整版 opencv 运行时所需（必须在 pip 装 paddlex[ocr] 之前备齐）----
+# paddlex[ocr] 拉进来的是 opencv-contrib-python（完整版、非 headless），其 native
+# 模块 cv2 加载时需要 libGL.so.1 与 glib；python:3.11-slim 基础镜像默认没有，
+# 缺失时 import cv2 直接崩：ImportError: libGL.so.1: cannot open shared object
+# file（用户 NAS 实测，栈在 paddlex/modules/.../visualizer.py import cv2）。
+# libglib2.0-0 在 trixie 因 64-bit time_t 迁移改名 libglib2.0-0t64，用 || 回退。
+# libgomp1 是 onnxruntime CPU EP 的运行时依赖，slim 不保证自带，装了无害。
+# 幂等守卫：libGL.so.1 已存在则不再走 apt（重启不重复耗 apt update 索引时间）。
+if [ ! -e /usr/lib/x86_64-linux-gnu/libGL.so.1 ]; then
+    echo "[ocr-init] installing system libs (libgl1/libglib2.0-0/libgomp1) ..."
+    apt-get update -qq </dev/null \
+        || { echo "[ocr-init] FATAL: apt-get update failed"; exit 1; }
+    apt-get install -y --no-install-recommends libgl1 </dev/null \
+        || { echo "[ocr-init] FATAL: apt-get install libgl1 failed"; exit 1; }
+    apt-get install -y --no-install-recommends libglib2.0-0 </dev/null \
+        || apt-get install -y --no-install-recommends libglib2.0-0t64 </dev/null \
+        || { echo "[ocr-init] FATAL: apt-get install libglib2.0-0(-t64) failed"; exit 1; }
+    apt-get install -y --no-install-recommends libgomp1 </dev/null \
+        || { echo "[ocr-init] FATAL: apt-get install libgomp1 failed"; exit 1; }
+else
+    echo "[ocr-init] system libs already present, skip apt (idempotent)"
+fi
+
 # ---- 依赖安装（容器重建后若已安装则 pip 秒过）----
 # paddlepaddle 提供官方模型格式支持；onnxruntime 引擎首次运行需 paddle2onnx 做格式转换
 # paddlex[ocr]：OCR 产线自身依赖组（opencv-contrib/pypdfium2/pyclipper/shapely/
@@ -67,6 +90,14 @@ echo "[ocr-init] engine=${OCR_ENGINE} device=${OCR_DEVICE} port=${OCR_PORT} prof
 # </dev/null：sidecar 无 TTY/无 stdin，任何工具意外读交互输入时立即 EOF 而非挂起
 python3 -m pip install --no-cache-dir "${PIP_ARGS[@]}" \
     paddlepaddle==3.0.0 "paddlex[ocr]==3.0.3" paddle2onnx onnxruntime </dev/null
+
+# ---- fail-fast 预检：确认 cv2 native 库就位 ----
+# 缺系统库时让日志一句话讲清根因，而不是 exec 阶段甩 40 行 traceback。
+# 故意用 import cv2 而非 import paddlex：后者会顺带触发模型索引扫描，慢且可能
+# 引发下载，不适合做启动预检。
+python3 -c 'import cv2' </dev/null 2>/dev/null \
+    || { echo "[ocr-init] FATAL: cv2 import failed, missing system libs (libGL/libglib)"; exit 1; }
+echo "[ocr-init] cv2 import ok"
 
 # serving 插件（uvicorn/fastapi 等，提供 /ocr、/openapi.json HTTP 服务）
 paddlex --install serving "${PIP_ARGS[@]}" </dev/null
