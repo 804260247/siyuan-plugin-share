@@ -2446,7 +2446,9 @@
       );
       page.style.setProperty(
         "--right-width",
-        `${state.rightCollapsed ? 0 : clamp(state.right, MIN_RIGHT, MAX_RIGHT)}px`,
+        document.body.classList.contains("sps-netdisk-preview")
+          ? "0px"
+          : `${state.rightCollapsed ? 0 : clamp(state.right, MIN_RIGHT, MAX_RIGHT)}px`,
       );
       page.classList.toggle("is-left-collapsed", Boolean(state.leftCollapsed));
       page.classList.toggle("is-right-collapsed", Boolean(state.rightCollapsed));
@@ -2785,6 +2787,1412 @@
     render();
   };
 
+  const initNetdisk = () => {
+    const panel = document.querySelector('[data-share-panel="netdisk"]');
+    if (!panel) return;
+    const slug = panel.getAttribute("data-netdisk-slug") || "";
+    const listEl = panel.querySelector("[data-netdisk-list]");
+    const crumbsEl = panel.querySelector("[data-netdisk-crumbs]");
+    const refreshBtn = panel.querySelector("[data-netdisk-up]");
+    const getBasePath = () => {
+      const pathMatch = window.location.pathname.match(/^(.*?)\/s\//);
+      return pathMatch ? pathMatch[1] : "";
+    };
+    const escapeAttr = (value) =>
+      String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => {
+        switch (ch) {
+          case "&": return "&amp;";
+          case "<": return "&lt;";
+          case ">": return "&gt;";
+          case '"': return "&quot;";
+          case "'": return "&#39;";
+          default: return ch;
+        }
+      });
+    const base = getBasePath();
+    if (!listEl || !crumbsEl) return;
+
+    let currentUri = "";
+    let currentFiles = [];
+    const stack = [];
+
+    const renderCrumbs = () => {
+      let html = '<button class="netdisk-crumb" type="button" data-uri="">网盘</button>';
+      stack.forEach((item, idx) => {
+        html += '<span class="netdisk-crumb-sep">/</span>';
+        html += `<button class="netdisk-crumb" type="button" data-uri="${escapeAttr(item.uri)}">${escapeHtml(item.name)}</button>`;
+      });
+      crumbsEl.innerHTML = html;
+      crumbsEl.querySelectorAll("[data-uri]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const uri = btn.getAttribute("data-uri") || "";
+          while (stack.length && stack[stack.length - 1].uri !== uri) stack.pop();
+          loadDir(uri);
+        });
+      });
+    };
+
+    const loadDir = async (uri) => {
+      currentUri = uri || "";
+      listEl.innerHTML = '<div class="netdisk-empty">加载中…</div>';
+      try {
+        const url = base + "/s/" + encodeURIComponent(slug) + "/netdisk/list?uri=" + encodeURIComponent(uri || "");
+        const resp = await fetch(url, { credentials: "same-origin" });
+        const payload = await resp.json().catch(() => null);
+        if (!payload || payload.code !== 0) {
+          listEl.innerHTML = '<div class="netdisk-empty">加载失败</div>';
+          return;
+        }
+        currentFiles = payload.data.files || [];
+        renderCrumbs();
+        renderList(payload.data);
+      } catch (err) {
+        listEl.innerHTML = '<div class="netdisk-empty">加载出错</div>';
+      }
+    };
+
+    const renderList = (data) => {
+      const files = currentFiles;
+      if (!files.length) {
+        listEl.innerHTML = '<div class="netdisk-empty">空目录</div>';
+        return;
+      }
+      let html = '<ul class="netdisk-files">';
+      const folders = files.filter((f) => f.is_folder);
+      const docs = files.filter((f) => !f.is_folder);
+      folders.forEach((f) => {
+        html +=
+          '<li class="netdisk-row" data-folder="1">' +
+          netdiskIconSvg("", true) +
+          '<span class="netdisk-name" title="' + escapeHtml(f.name) + '">' + escapeHtml(f.name) + "</span>" +
+          "</li>";
+      });
+      docs.forEach((f) => {
+        html +=
+          '<li class="netdisk-row" data-uri="' + escapeAttr(f.uri) + '" data-name="' + escapeAttr(f.name) + '" data-ext="' + escapeAttr(f.ext) + '" data-can-download="' + (f.can_download ? "1" : "0") + '">' +
+          netdiskIconSvg(f.ext, false) +
+          '<span class="netdisk-name" title="' + escapeHtml(f.name) + '">' + escapeHtml(f.name) + "</span>" +
+          '<span class="netdisk-size">' + (f.size ? formatNetdiskSize(f.size) : "") + "</span>" +
+          (f.can_download
+            ? '<button class="netdisk-download" type="button" data-netdisk-download data-uri="' + escapeAttr(f.uri) + '" data-name="' + escapeAttr(f.name) + '" title="下载">' +
+              netdiskSvgWrap('<path d="M12 3v10m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>') +
+              "</button>"
+            : "") +
+          "</li>";
+      });
+      html += "</ul>";
+      listEl.innerHTML = html;
+
+      listEl.querySelectorAll("[data-folder]").forEach((el) => {
+        el.addEventListener("click", () => {
+          const idx = Array.from(listEl.querySelectorAll("[data-folder]")).indexOf(el);
+          const folder = folders[idx];
+          if (!folder) return;
+          stack.push({ uri: folder.uri, name: folder.name });
+          loadDir(folder.uri);
+        });
+      });
+      listEl.querySelectorAll("li[data-uri][data-name]").forEach((el) => {
+        el.addEventListener("click", () => {
+          openFile(
+            el.getAttribute("data-uri"),
+            el.getAttribute("data-name"),
+            el.getAttribute("data-ext"),
+            el.getAttribute("data-can-download") === "1",
+          );
+        });
+      });
+      listEl.querySelectorAll("[data-netdisk-download]").forEach((btn) => {
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+          ev.preventDefault();
+          ev.preventDefault();
+          const u = btn.getAttribute("data-uri") || "";
+          const n = btn.getAttribute("data-name") || "";
+          const dlUrl = base + "/s/" + encodeURIComponent(slug) + "/netdisk/download?uri=" + encodeURIComponent(u) + "&name=" + encodeURIComponent(n);
+          const a = document.createElement("a");
+          a.href = dlUrl;
+          a.download = n || "";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+        });
+      });
+    };
+
+    const openFile = async (uri, name, ext, canDownload) => {
+      await openNetdiskPreview(slug, base, uri, name, ext, canDownload);
+    };
+
+    if (refreshBtn) {
+      refreshBtn.addEventListener("click", () => loadDir(currentUri));
+    }
+
+    const tabBtn = document.querySelector('[data-share-tab="netdisk"]');
+    if (tabBtn) {
+      tabBtn.addEventListener("click", () => {
+        if (!listEl.dataset.loaded) {
+          listEl.dataset.loaded = "1";
+          loadDir("");
+        }
+      });
+    }
+  };
+
+  const formatNetdiskSize = (bytes) => {
+    if (!bytes || bytes <= 0) return "";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let val = bytes;
+    let idx = 0;
+    while (val >= 1024 && idx < units.length - 1) {
+      val /= 1024;
+      idx++;
+    }
+    return val.toFixed(val >= 10 || idx === 0 ? 0 : 1) + " " + units[idx];
+  };
+
+  // 网盘文件类型 SVG 图标（内嵌，无需外部图标库）
+  const netdiskSvgWrap = (body) =>
+    '<svg class="netdisk-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + body + "</svg>";
+  const NETDISK_ICONS = {
+    folder: netdiskSvgWrap('<path d="M3 6a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6z"/>'),
+    image: netdiskSvgWrap('<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="m21 15-5-5-8 8"/>'),
+    video: netdiskSvgWrap('<rect x="2" y="5" width="16" height="14" rx="2"/><path d="m18 10 4-2v8l-4-2v-4z"/>'),
+    audio: netdiskSvgWrap('<path d="M9 18V6l10-2v12"/><circle cx="6" cy="18" r="3"/><circle cx="16" cy="16" r="3"/>'),
+    pdf: netdiskSvgWrap('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6z"/><path d="M14 3v6h6"/><path d="M9 14h.01M12 14h.01M15 14h.01M9 17h.01M12 17h.01"/>'),
+    word: netdiskSvgWrap('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6z"/><path d="M14 3v6h6"/><path d="m9 13 1.5 4 1.5-4M12.5 17l1.5-4 1.5 4M9 15.5h3"/>'),
+    excel: netdiskSvgWrap('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6z"/><path d="M14 3v6h6"/><path d="m9 13 3 3M12 13l-3 3M15 13l-4 4M15 17l-4-4"/>'),
+    ppt: netdiskSvgWrap('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6z"/><path d="M14 3v6h6"/><path d="M10 17v-4M10 14h2.5a1.5 1.5 0 0 1 0 3H10M15 13v4M15 15h1.5a1 1 0 0 0 0-2H15"/>'),
+    txt: netdiskSvgWrap('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6z"/><path d="M14 3v6h6"/><path d="M9 13h6M9 16h6"/>'),
+    md: netdiskSvgWrap('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6z"/><path d="M14 3v6h6"/><path d="M8 15v-3M8 12h2l-1.2 1.8L8 15zM14 12v3M14 15l1.5-3 1.5 3"/>'),
+    archive: netdiskSvgWrap('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M10 9v6M14 9v6M10 15h4"/>'),
+    code: netdiskSvgWrap('<path d="m8 8-4 4 4 4M16 8l4 4-4 4M13 6l-2 12"/>'),
+    generic: netdiskSvgWrap('<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6z"/><path d="M14 3v6h6"/>'),
+  };
+  const netdiskIconCategory = (ext) => {
+    const e = (ext || "").toLowerCase();
+    if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "avif"].includes(e)) return "image";
+    if (["mp4", "webm", "ogv", "mov", "mkv", "avi", "m4v"].includes(e)) return "video";
+    if (["mp3", "wav", "flac", "m4a", "aac", "ogg", "oga", "opus"].includes(e)) return "audio";
+    if (e === "pdf") return "pdf";
+    if (["doc", "docx", "odt", "rtf", "dot", "dotx"].includes(e)) return "word";
+    if (["xls", "xlsx", "ods", "csv", "tsv"].includes(e)) return "excel";
+    if (["ppt", "pptx", "odp", "pps", "ppsx"].includes(e)) return "ppt";
+    if (["md", "markdown"].includes(e)) return "md";
+    if (["txt", "log", "ini", "conf", "srt", "vtt"].includes(e)) return "txt";
+    if (["zip", "rar", "7z", "tar", "gz", "bz2", "xz"].includes(e)) return "archive";
+    if (["js", "ts", "py", "go", "java", "c", "cpp", "h", "php", "rb", "sh", "html", "css", "json", "xml", "yaml", "yml", "sql"].includes(e)) return "code";
+    return "generic";
+  };
+  const netdiskIconSvg = (ext, isFolder) => {
+    const key = isFolder ? "folder" : netdiskIconCategory(ext);
+    return '<span class="netdisk-svg-wrap netdisk-svg-' + key + '">' + (NETDISK_ICONS[key] || NETDISK_ICONS.generic) + "</span>";
+  };
+
+  // 内嵌 SVG 图标使用样式（.netdisk-svg-wrap/.netdisk-svg）需要配合 style.css
+
+  // Excel / CSV 只读预览：按需懒加载 SheetJS，再用内容代理取字节渲染成表格
+  const renderNetdiskSheet = (container, src, name) => {
+    const loadSheetJS = () =>
+      new Promise((resolve, reject) => {
+        if (window.XLSX) {
+          resolve(window.XLSX);
+          return;
+        }
+        const base = (() => {
+          const m = window.location.pathname.match(/^(.*?)\/s\//);
+          return m ? m[1] : "";
+        })();
+        const script = document.createElement("script");
+        script.src = base + "/assets/vendor/xlsx.full.min.js";
+        script.onload = () => (window.XLSX ? resolve(window.XLSX) : reject(new Error("XLSX 未加载")));
+        script.onerror = () => reject(new Error("加载 XLSX 库失败"));
+        document.head.appendChild(script);
+      });
+
+    loadSheetJS()
+      .then((XLSX) =>
+        fetch(src, { credentials: "same-origin" })
+          .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject()))
+          .then((buf) => XLSX.read(new Uint8Array(buf), { type: "array" })),
+      )
+      .then((wb) => {
+        if (!wb.SheetNames.length) {
+          container.innerHTML = '<div class="netdisk-preview-empty">表格为空</div>';
+          return;
+        }
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const rows = window.XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+        if (!rows.length) {
+          container.innerHTML = '<div class="netdisk-preview-empty">表格为空</div>';
+          return;
+        }
+        let html = '<div class="netdisk-sheet-tabs">' + wb.SheetNames.map((s) => '<span class="netdisk-sheet-tab">' + escapeHtml(s) + "</span>").join("") + "</div>";
+        html += '<div class="netdisk-sheet-scroll"><table class="netdisk-sheet-table"><tbody>';
+        rows.forEach((row, r) => {
+          html += "<tr>";
+          const cells = Array.isArray(row) ? row : [row];
+          cells.forEach((cell, c) => {
+            html += (r === 0 ? "<th>" : "<td>") + escapeHtml(String(cell == null ? "" : cell)) + (r === 0 ? "</th>" : "</td>");
+          });
+          html += "</tr>";
+        });
+        html += "</tbody></table></div>";
+        container.innerHTML = html;
+      })
+      .catch((e) => {
+        container.innerHTML = '<div class="netdisk-preview-empty">表格预览失败：' + escapeHtml(e && e.message ? e.message : "解析错误") + "</div>";
+      });
+  };
+
+  // 预览期间收起右侧栏（目录/最近更新是文档维度的，预览时属干扰）；
+  // 恢复入口：loadDoc（点击文档树/搜索命中的文档）调用 window.__spsNetdiskRestoreRight()。
+  const collapseRightForPreview = () => {
+    if (document.body.classList.contains("sps-netdisk-preview")) return;
+    document.body.classList.add("sps-netdisk-preview");
+    const page = document.querySelector(".share-page");
+    if (page) {
+      page.dataset.spsSavedRight = page.style.getPropertyValue("--right-width") || "";
+      page.style.setProperty("--right-width", "0px");
+    }
+  };
+  window.__spsNetdiskRestoreRight = () => {
+    if (!document.body.classList.contains("sps-netdisk-preview")) return;
+    document.body.classList.remove("sps-netdisk-preview");
+    const page = document.querySelector(".share-page");
+    if (page) {
+      const saved = page.dataset.spsSavedRight || "";
+      if (saved) page.style.setProperty("--right-width", saved);
+      else page.style.removeProperty("--right-width");
+      delete page.dataset.spsSavedRight;
+    }
+  };
+
+  // 网盘文件预览（右侧正文区）：网盘标签与搜索结果命中共用
+  const openNetdiskPreview = async (slug, base, uri, name, ext, canDownload) => {
+    const main = document.querySelector(".kb-main, .share-article");
+    if (!main) return;
+    collapseRightForPreview();
+    const url = base + "/s/" + encodeURIComponent(slug) + "/netdisk/open?uri=" + encodeURIComponent(uri) + "&name=" + encodeURIComponent(name);
+    let info = null;
+    let errMsg = "";
+    try {
+      const resp = await fetch(url, { credentials: "same-origin" });
+      const payload = await resp.json().catch(() => null);
+      if (payload && payload.code === 0) info = payload.data;
+      else if (payload && payload.msg) errMsg = payload.msg;
+    } catch (err) {}
+    main.innerHTML =
+      '<div class="netdisk-preview">' +
+      '<div class="netdisk-preview-toolbar">' +
+      '<span class="netdisk-preview-name">' + escapeHtml(name) + "</span>" +
+      '<span style="flex:1"></span>' +
+      (canDownload
+        ? '<button class="button ghost" type="button" data-netdisk-preview-download title="下载文件">' +
+          netdiskSvgWrap('<path d="M12 3v10m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>') +
+          " 下载</button>"
+        : "") +
+      '<button class="button ghost" type="button" data-netdisk-fullscreen title="新标签页全屏显示">' +
+      netdiskSvgWrap('<path d="M8 3H5a2 2 0 0 0-2 2v3M21 8V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3M16 21h3a2 2 0 0 0 2-2v-3"/>') +
+      "</button>" +
+      "</div>" +
+      '<div class="netdisk-preview-body" data-netdisk-preview-body></div>' +
+      "</div>";
+    main.querySelector("[data-netdisk-preview-download]")?.addEventListener("click", () => {
+      const dlUrl = base + "/s/" + encodeURIComponent(slug) + "/netdisk/download?uri=" + encodeURIComponent(uri) + "&name=" + encodeURIComponent(name);
+      const a = document.createElement("a");
+      a.href = dlUrl;
+      a.download = name || "";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    });
+    main.querySelector("[data-netdisk-fullscreen]").addEventListener("click", () => {
+      const pvUrl = base + "/s/" + encodeURIComponent(slug) + "/netdisk/preview?uri=" + encodeURIComponent(uri) + "&name=" + encodeURIComponent(name);
+      window.open(pvUrl, "_blank", "noopener");
+    });
+    const body = main.querySelector("[data-netdisk-preview-body]");
+    if (!info) {
+      body.innerHTML = '<div class="netdisk-preview-empty">无法打开文件</div>';
+      return;
+    }
+    if (info.type === "image" || info.type === "media") {
+      body.innerHTML = info.type === "image"
+        ? '<img class="netdisk-preview-media" src="' + escapeHtml(info.src) + '" alt="' + escapeHtml(name) + '">'
+        : '<video class="netdisk-preview-media" controls autoplay src="' + escapeHtml(info.src) + '"></video>';
+    } else if (info.type === "pdf") {
+      body.innerHTML =
+        '<iframe class="netdisk-preview-frame" src="' + escapeHtml(info.src) + '"></iframe>';
+    } else if (info.type === "excel") {
+      body.innerHTML =
+        '<div class="netdisk-preview-sheet" data-netdisk-sheet><div class="netdisk-preview-empty">正在解析表格…</div></div>';
+      renderNetdiskSheet(body.querySelector("[data-netdisk-sheet]"), info.src, name);
+    } else if (info.type === "text") {
+      body.innerHTML =
+        '<textarea class="netdisk-preview-text" readonly spellcheck="false"></textarea>';
+      fetch(info.src, { credentials: "same-origin" })
+        .then((r) => (r.ok ? r.text() : Promise.reject()))
+        .then((t) => {
+          body.querySelector(".netdisk-preview-text").value = t;
+        })
+        .catch(() => {
+          body.innerHTML = '<div class="netdisk-preview-empty">无法读取文本</div>';
+        });
+    } else if (info.type === "office") {
+      body.innerHTML =
+        '<div class="netdisk-office">' +
+        '<iframe src="' + escapeHtml(info.url || "") + '" allowfullscreen sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads allow-modals"></iframe>' +
+        '<div class="netdisk-office-msg netdisk-preview-empty" hidden></div>' +
+        "</div>";
+      const officeFrame = body.querySelector(".netdisk-office iframe");
+      const officeMsg = body.querySelector(".netdisk-office-msg");
+      let loadOk = false;
+      officeFrame.addEventListener("load", () => {
+        loadOk = true;
+        officeMsg.hidden = true;
+      });
+      officeFrame.addEventListener("error", () => {
+        officeMsg.hidden = false;
+        officeMsg.textContent = "无法加载 office 预览：请确认预览引擎（" + escapeHtml(info.engine || "") + "）地址可访问，且本站“网站地址”为 office 服务器可回调的公网域名。";
+      });
+      setTimeout(() => {
+        if (!loadOk) {
+          officeMsg.hidden = false;
+          officeMsg.textContent = "加载 office 预览超时：请确认预览引擎（" + escapeHtml(info.engine || "") + "）服务可达，且反代已放行 /hosting/wopi/ 与 WebSocket。";
+        }
+      }, 15000);
+    } else {
+      body.innerHTML = '<div class="netdisk-preview-empty">' + escapeHtml(info.message || "该文件类型不支持在线预览") + "</div>";
+    }
+  };
+
+  const initNetdiskRootPicker = () => {
+    const btns = document.querySelectorAll("[data-netdisk-pick-root]");
+    if (!btns.length) return;
+    const escapeAttr = (value) =>
+      String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => {
+        switch (ch) {
+          case "&": return "&amp;";
+          case "<": return "&lt;";
+          case ">": return "&gt;";
+          case '"': return "&quot;";
+          case "'": return "&#39;";
+          default: return ch;
+        }
+      });
+    let modalEl = null;
+    let currentUri = "";
+    // 导航栈：记录进入的目录链（uri + 显示名），用于渲染可点击面包屑
+    let pickStack = [];
+    const getForm = (btn) => btn.closest("form");
+    const openModal = (btn) => {
+      const form = getForm(btn);
+      if (!form) return;
+      closeModal();
+      modalEl = document.createElement("div");
+      modalEl.className = "netdisk-picker-modal";
+      modalEl.innerHTML =
+        '<div class="netdisk-picker-backdrop" data-netdisk-pick-close></div>' +
+        '<div class="netdisk-picker">' +
+        '<div class="netdisk-picker-head">' +
+        "<span>选择默认根目录</span>" +
+        '<button class="button ghost" type="button" data-netdisk-pick-close>&times;</button>' +
+        "</div>" +
+        '<div class="netdisk-picker-crumbs" data-netdisk-pick-crumbs><span class="netdisk-crumb">根目录</span>…</div>' +
+        '<div class="netdisk-picker-body" data-netdisk-pick-body><div class="netdisk-empty">加载中…</div></div>' +
+        '<div class="netdisk-picker-foot">' +
+        '<button class="button primary" type="button" data-netdisk-pick-confirm>选择此目录</button>' +
+        "</div>" +
+        "</div>";
+      document.body.appendChild(modalEl);
+      modalEl.querySelectorAll("[data-netdisk-pick-close]").forEach((el) => el.addEventListener("click", closeModal));
+      modalEl.querySelector("[data-netdisk-pick-confirm]").addEventListener("click", () => {
+        const input = form.querySelector('input[name="default_root"]');
+        if (input && currentUri) {
+          input.value = currentUri;
+        }
+        closeModal();
+      });
+      const current = (form.querySelector('input[name="default_root"]') || {}).value || "";
+      // 初始：清空导航栈，default_root 为空或已是 my 前缀时从该处打开；否则从 my 根打开
+      // （@share 等非 my 前缀的默认根直接列出可能为空，用户可通过面包屑回到 my 根选择）
+      pickStack = [];
+      let initial = current || "cloudreve://my";
+      if (initial.indexOf("cloudreve://my") !== 0) {
+        initial = "cloudreve://my";
+      }
+      loadFolders(btn, initial);
+    };
+    const closeModal = () => {
+      if (modalEl) {
+        modalEl.remove();
+        modalEl = null;
+      }
+    };
+    const loadFolders = async (btn, uri, name) => {
+      const form = getForm(btn);
+      if (!form) return;
+      const body = modalEl.querySelector("[data-netdisk-pick-body]");
+      if (!body) return;
+      body.innerHTML = '<div class="netdisk-empty">加载中…</div>';
+      const fd = new FormData(form);
+      // 新增连接态：清除残留的 config_id（编辑态注入后未清理会导致选择目录连到上一个连接）
+      const toggle = document.querySelector("[data-netdisk-cfg-toggle]");
+      if (!toggle || (toggle.textContent || "").indexOf("新增") === 0) {
+        fd.delete("config_id");
+      }
+      fd.set("uri", uri || "");
+      const resp = await fetch("/admin/netdisk/folders", {
+        method: "POST",
+        credentials: "same-origin",
+        body: fd,
+      });
+      const payload = await resp.json().catch(() => null);
+      if (!payload || payload.code !== 0) {
+        body.innerHTML = '<div class="netdisk-empty">' + escapeHtml(payload && payload.msg ? payload.msg : "加载失败") + "</div>";
+        return;
+      }
+      // 维护导航栈：点击子目录时入栈（name 非空）；根目录/面包屑跳转时由调用方先行调整栈
+      if (name) {
+        const last = pickStack[pickStack.length - 1];
+        if (!last || last.uri !== (payload.data.current || uri || "")) {
+          pickStack.push({ uri: payload.data.current || uri || "", name: name });
+        }
+      }
+      currentUri = payload.data.current || "";
+      renderCrumbs(btn, payload.data);
+      const folders = payload.data.folders || [];
+      if (!folders.length) {
+        body.innerHTML = '<div class="netdisk-empty">此目录下没有子文件夹</div>';
+        return;
+      }
+      let html = '<ul class="netdisk-files">';
+      folders.forEach((f) => {
+        html +=
+          '<li class="netdisk-row" data-netdisk-pick-folder="' + escapeAttr(f.uri) + '">' +
+          netdiskIconSvg("", true) +
+          '<span class="netdisk-name">' + escapeHtml(f.name) + "</span>" +
+          "</li>";
+      });
+      html += "</ul>";
+      body.innerHTML = html;
+      body.querySelectorAll("[data-netdisk-pick-folder]").forEach((el) => {
+        el.addEventListener("click", () => {
+          const nn = el.querySelector(".netdisk-name");
+          loadFolders(btn, el.getAttribute("data-netdisk-pick-folder"), nn ? nn.textContent : "");
+        });
+      });
+    };
+    const goRoot = (btn) => {
+      loadFolders(btn, "cloudreve://my", "");
+    };
+    const goCrumb = (btn, uri) => {
+      // 截断栈到目标层（含该层自身），再加载
+      while (pickStack.length && pickStack[pickStack.length - 1].uri !== uri) {
+        pickStack.pop();
+      }
+      if (!pickStack.length) {
+        // 点的是根目录
+        loadFolders(btn, uri, "");
+        return;
+      }
+      loadFolders(btn, uri, "");
+    };
+    const renderCrumbs = (btn, data) => {
+      const crumbs = modalEl.querySelector("[data-netdisk-pick-crumbs]");
+      if (!crumbs) return;
+      // 根目录 = cloudreve://my（网盘根），无论 default_root 是否 @share 都能回到含“测试”等真实目录树的顶层
+      let html = '<button class="netdisk-crumb" type="button" data-netdisk-pick-go="__root__">根目录</button>';
+      pickStack.forEach((item) => {
+        html += '<span class="netdisk-crumb-sep">/</span>';
+        html += '<button class="netdisk-crumb" type="button" data-netdisk-pick-go="' + escapeAttr(item.uri) + '">' + escapeHtml(item.name) + "</button>";
+      });
+      crumbs.innerHTML = html;
+      crumbs.querySelectorAll("[data-netdisk-pick-go]").forEach((el) => {
+        el.addEventListener("click", () => {
+          const u = el.getAttribute("data-netdisk-pick-go");
+          if (u === "__root__") {
+            pickStack = [];
+            goRoot(btn);
+          } else {
+            goCrumb(btn, u);
+          }
+        });
+      });
+    };
+    btns.forEach((btn) => btn.addEventListener("click", () => openModal(btn)));
+  };
+
+  const initNetdiskFormToggles = () => {
+    const bind = (toggleSel, formSel, onShowAdd) => {
+      const toggle = document.querySelector(toggleSel);
+      const form = document.querySelector(formSel);
+      if (!toggle || !form) return;
+      const original = toggle.textContent;
+      const notifyAdd = () => {
+        if (typeof onShowAdd === "function") onShowAdd(form);
+      };
+      toggle.addEventListener("click", () => {
+        const show = form.hidden;
+        form.hidden = !show;
+        toggle.textContent = show ? "收起" : original;
+        if (show && /新增/.test(original || "")) notifyAdd();
+      });
+    };
+    const resetCfgFormToAdd = (form) => {
+      // 新增连接态：清除编辑残留的 config_id 与已填字段，保证干净新增
+      const idIn = form.querySelector('input[name="config_id"]');
+      if (idIn) idIn.value = "";
+      form.querySelectorAll('input[type="text"], input[type="password"], input:not([type]), input[type="url"], input[type="email"], input[type="number"]').forEach((inp) => {
+        if (!inp.hasAttribute("data-keep")) inp.value = "";
+      });
+      const pwd = form.querySelector('input[name="password"]');
+      if (pwd) {
+        pwd.required = true;
+        pwd.placeholder = "";
+      }
+      const en = form.querySelector('input[name="enabled"]');
+      if (en) en.checked = true;
+      const root = form.querySelector('input[name="default_root"]');
+      if (root) root.value = "cloudreve://my";
+      // OCR 默认不启用 + 配置区隐藏
+      const ocrTog = form.querySelector("[data-netdisk-index-ocr-toggle]");
+      if (ocrTog) ocrTog.checked = false;
+      syncOcrFields(form);
+    };
+    const syncOcrFields = (form) => {
+      const tog = form.querySelector("[data-netdisk-index-ocr-toggle]");
+      const fields = form.querySelector("[data-netdisk-index-ocr-fields]");
+      if (!tog || !fields) return;
+      fields.hidden = !tog.checked;
+    };
+    bind("[data-netdisk-cfg-toggle]", "[data-netdisk-cfg-form]", resetCfgFormToAdd);
+    bind("[data-netdisk-office-toggle]", "[data-netdisk-office-form]");
+    // OCR 开关：勾选时显示识别参数区，取消时隐藏
+    document.querySelectorAll("[data-netdisk-index-ocr-toggle]").forEach((tog) => {
+      tog.addEventListener("change", () => {
+        const form = tog.closest("form");
+        if (form) syncOcrFields(form);
+      });
+    });
+    // 页面加载时按已保存的 OCR 状态同步一次字段区显示
+    const cfgForm = document.querySelector("[data-netdisk-cfg-form]");
+    if (cfgForm) syncOcrFields(cfgForm);
+  };
+
+  const initNetdiskDownloadRules = () => {
+    const btns = document.querySelectorAll("[data-netdisk-dl-manage]");
+    if (!btns.length) return;
+    let modalEl = null;
+    let shareId = 0;
+    let shareTitle = "";
+    let configId = 0;
+    let rules = [];
+    const dlStack = [];
+
+    const csrfValue = () => {
+      const el = document.querySelector('input[name="csrf"]');
+      return el ? el.value : "";
+    };
+
+    const closeModal = () => {
+      if (modalEl) {
+        modalEl.remove();
+        modalEl = null;
+      }
+    };
+
+    const renderRules = () => {
+      if (!modalEl) return;
+      const listEl = modalEl.querySelector("[data-netdisk-dl-list]");
+      if (!listEl) return;
+      if (!rules.length) {
+        listEl.innerHTML = '<div class="netdisk-empty">尚未配置下载规则（默认禁止下载）。</div>';
+        return;
+      }
+      let html = '<ul class="netdisk-files">';
+      rules.forEach((r) => {
+        const dispName = r.name || decodeURIComponent((r.uri || "").split("/").pop() || r.uri);
+        html +=
+          '<li class="netdisk-row netdisk-dl-rule-row">' +
+          (r.is_folder
+            ? netdiskIconSvg("", true)
+            : '<span class="netdisk-file-icon">&#128196;</span>') +
+          '<span class="netdisk-name" title="' + escapeHtml(r.uri) + '">' + escapeHtml(dispName) + "</span>" +
+          '<button class="button danger" type="button" data-netdisk-dl-remove="' + escapeHtml(String(r.id)) + '">移除</button>' +
+          "</li>";
+      });
+      html += "</ul>";
+      listEl.innerHTML = html;
+      listEl.querySelectorAll("[data-netdisk-dl-remove]").forEach((el) => {
+        el.addEventListener("click", () => deleteRule(el.getAttribute("data-netdisk-dl-remove")));
+      });
+    };
+
+    const loadRules = async () => {
+      if (!modalEl) return;
+      const listEl = modalEl.querySelector("[data-netdisk-dl-list]");
+      if (listEl) listEl.innerHTML = '<div class="netdisk-empty">加载中…</div>';
+      const fd = new FormData();
+      fd.set("csrf", csrfValue());
+      fd.set("share_id", String(shareId));
+      const resp = await fetch("/admin/netdisk/download/rules", {
+        method: "POST",
+        credentials: "same-origin",
+        body: fd,
+      });
+      const payload = await resp.json().catch(() => null);
+      if (!payload || payload.code !== 0) {
+        if (listEl) listEl.innerHTML = '<div class="netdisk-empty">加载失败</div>';
+        return;
+      }
+      rules = payload.data || [];
+      renderRules();
+    };
+
+    const deleteRule = async (id) => {
+      const fd = new FormData();
+      fd.set("csrf", csrfValue());
+      fd.set("share_id", String(shareId));
+      fd.set("rule_id", id);
+      const resp = await fetch("/admin/netdisk/download/delete", {
+        method: "POST",
+        credentials: "same-origin",
+        body: fd,
+      });
+      const payload = await resp.json().catch(() => null);
+      if (!payload || payload.code !== 0) {
+        alert(payload && payload.msg ? payload.msg : "删除失败");
+        return;
+      }
+      rules = rules.filter((r) => String(r.id) !== id);
+      renderRules();
+    };
+
+    const renderDlCrumbs = () => {
+      if (!modalEl) return;
+      const crumbs = modalEl.querySelector("[data-netdisk-dl-crumbs]");
+      if (!crumbs) return;
+      let ch = '<button class="netdisk-crumb" type="button" data-netdisk-dl-go="">根目录</button>';
+      dlStack.forEach((item, idx) => {
+        ch += '<span class="netdisk-crumb-sep">/</span>';
+        ch += '<button class="netdisk-crumb" type="button" data-netdisk-dl-go="' + escapeHtml(item.uri) + '" data-netdisk-dl-go-idx="' + idx + '">' + escapeHtml(item.name) + "</button>";
+      });
+      crumbs.innerHTML = ch;
+      crumbs.querySelectorAll("[data-netdisk-dl-go]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const goIdx = btn.hasAttribute("data-netdisk-dl-go-idx") ? Number(btn.getAttribute("data-netdisk-dl-go-idx")) : -1;
+          if (goIdx >= 0) {
+            dlStack.length = goIdx + 1;
+          } else {
+            dlStack.length = 0;
+          }
+          loadFolders(btn.getAttribute("data-netdisk-dl-go"));
+        });
+      });
+    };
+
+    const loadFolders = async (uri) => {
+      const body = modalEl.querySelector("[data-netdisk-dl-body]");
+      body.innerHTML = '<div class="netdisk-empty">加载中…</div>';
+      const fd = new FormData();
+      fd.set("csrf", csrfValue());
+      fd.set("config_id", String(configId));
+      fd.set("uri", uri || "");
+      const resp = await fetch("/admin/netdisk/folders", {
+        method: "POST",
+        credentials: "same-origin",
+        body: fd,
+      });
+      const payload = await resp.json().catch(() => null);
+      if (!payload || payload.code !== 0) {
+        body.innerHTML = '<div class="netdisk-empty">' + escapeHtml(payload && payload.msg ? payload.msg : "加载失败") + "</div>";
+        return;
+      }
+      renderDlCrumbs();
+      const folders = payload.data.folders || [];
+      const files = payload.data.files || [];
+      if (!folders.length && !files.length) {
+        body.innerHTML = '<div class="netdisk-empty">此目录下没有子文件夹或文件</div>';
+        return;
+      }
+      let html = '<ul class="netdisk-files">';
+      folders.forEach((f) => {
+        html +=
+          '<li class="netdisk-row" data-netdisk-dl-pick="' + escapeHtml(f.uri) + '" data-netdisk-dl-type="folder">' +
+          netdiskIconSvg("", true) +
+          '<span class="netdisk-name" title="' + escapeHtml(f.name) + '">' + escapeHtml(f.name) + "</span>" +
+          '<span class="muted">文件夹</span>' +
+          '<button class="netdisk-dl-add" type="button" data-netdisk-dl-add="' + escapeHtml(f.uri) + '" data-netdisk-dl-add-type="folder" title="添加此文件夹（含其下所有文件）">+ 添加</button>' +
+          "</li>";
+      });
+      files.forEach((fl) => {
+        html +=
+          '<li class="netdisk-row" data-netdisk-dl-pick="' + escapeHtml(fl.uri) + '" data-netdisk-dl-type="file">' +
+          '<span class="netdisk-file-icon">&#128196;</span>' +
+          '<span class="netdisk-name" title="' + escapeHtml(fl.name) + '">' + escapeHtml(fl.name) + "</span>" +
+          '<span class="muted">文件</span>' +
+          '<button class="netdisk-dl-add" type="button" data-netdisk-dl-add="' + escapeHtml(fl.uri) + '" data-netdisk-dl-add-type="file" title="添加此文件">+ 添加</button>' +
+          "</li>";
+      });
+      html += "</ul>";
+      body.innerHTML = html;
+      body.querySelectorAll("[data-netdisk-dl-pick]").forEach((el) => {
+        el.addEventListener("click", () => {
+          if (el.getAttribute("data-netdisk-dl-type") === "folder") {
+            const fName = el.querySelector(".netdisk-name") ? el.querySelector(".netdisk-name").textContent : "";
+            dlStack.push({ uri: el.getAttribute("data-netdisk-dl-pick"), name: fName });
+            loadFolders(el.getAttribute("data-netdisk-dl-pick"));
+          } else {
+            addRule(el.getAttribute("data-netdisk-dl-pick"), el.getAttribute("data-netdisk-dl-type"), "");
+          }
+        });
+      });
+      body.querySelectorAll("[data-netdisk-dl-add]").forEach((btn) => {
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          addRule(btn.getAttribute("data-netdisk-dl-add"), btn.getAttribute("data-netdisk-dl-add-type"), "");
+        });
+      });
+    };
+
+    const addRule = async (uri, type, name) => {
+      const fd = new FormData();
+      fd.set("csrf", csrfValue());
+      fd.set("share_id", String(shareId));
+      fd.set("uri", uri);
+      fd.set("is_folder", type === "folder" ? "1" : "0");
+      const resp = await fetch("/admin/netdisk/download/save", {
+        method: "POST",
+        credentials: "same-origin",
+        body: fd,
+      });
+      const payload = await resp.json().catch(() => null);
+      if (!payload || payload.code !== 0) {
+        alert(payload && payload.msg ? payload.msg : "保存失败");
+        return;
+      }
+      loadRules();
+    };
+
+    const openModal = (btn) => {
+      shareId = Number(btn.getAttribute("data-share-id") || "0");
+      shareTitle = btn.getAttribute("data-share-title") || "";
+      configId = Number(btn.getAttribute("data-netdisk-config-id") || "0");
+      modalEl = document.createElement("div");
+      modalEl.className = "netdisk-picker-modal";
+      modalEl.innerHTML =
+        '<div class="netdisk-picker-backdrop" data-netdisk-dl-close></div>' +
+        '<div class="netdisk-picker netdisk-dl-modal">' +
+        '<div class="netdisk-picker-head">' +
+        "<span>下载规则 - " + escapeHtml(shareTitle) + "</span>" +
+        '<button class="button ghost" type="button" data-netdisk-dl-close>&times;</button>' +
+        "</div>" +
+        '<div class="netdisk-dl-grid">' +
+        '<div class="netdisk-dl-left">' +
+        '<div class="netdisk-picker-crumbs" data-netdisk-dl-crumbs></div>' +
+        '<div class="netdisk-picker-body" data-netdisk-dl-body><div class="netdisk-empty">加载中…</div></div>' +
+        "</div>" +
+        '<div class="netdisk-dl-right">' +
+        '<div class="netdisk-dl-right-title">已授权下载（文件夹=含其下所有文件）</div>' +
+        '<div class="netdisk-picker-body" data-netdisk-dl-list></div>' +
+        "</div>" +
+        "</div>" +
+        "</div>";
+      document.body.appendChild(modalEl);
+      modalEl.querySelectorAll("[data-netdisk-dl-close]").forEach((el) => el.addEventListener("click", closeModal));
+      dlStack.length = 0;
+      loadRules();
+      loadFolders("");
+    };
+
+    btns.forEach((btn) => btn.addEventListener("click", () => openModal(btn)));
+  };
+
+  const initNetdiskInlineEdit = () => {
+    const cfgEdits = document.querySelectorAll("[data-cfg-edit]");
+    const officeEdits = document.querySelectorAll("[data-office-edit]");
+    if (!cfgEdits.length && !officeEdits.length) return;
+
+    const resetFormToAdd = (formWrap, toggle, idName, submitText) => {
+      const form = formWrap.querySelector("form");
+      const idIn = form.querySelector('input[name="' + idName + '"]');
+      if (idIn) idIn.value = "";
+      const submit = form.querySelector('button[type="submit"]');
+      if (submit) submit.textContent = submitText;
+      const cancel = form.querySelector("[data-netdisk-cancel-edit]");
+      if (cancel) cancel.remove();
+      if (toggle) toggle.textContent = submitText;
+      formWrap.hidden = true;
+    };
+
+    const startEdit = (btn, formWrapSel, toggleSel, idName, idVal, submitText) => {
+      const formWrap = document.querySelector(formWrapSel);
+      const toggle = document.querySelector(toggleSel);
+      if (!formWrap) return;
+      const form = formWrap.querySelector("form");
+      formWrap.hidden = false;
+      if (toggle) toggle.textContent = "正在编辑";
+      let idIn = form.querySelector('input[name="' + idName + '"]');
+      if (!idIn) {
+        idIn = document.createElement("input");
+        idIn.type = "hidden";
+        idIn.name = idName;
+        form.appendChild(idIn);
+      }
+      idIn.value = String(idVal);
+      const submit = form.querySelector('button[type="submit"]');
+      if (submit) submit.textContent = submitText;
+      let cancel = form.querySelector("[data-netdisk-cancel-edit]");
+      if (!cancel) {
+        cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.className = "button ghost";
+        cancel.textContent = "取消编辑";
+        cancel.setAttribute("data-netdisk-cancel-edit", "");
+        const actions = form.querySelector("div");
+        if (submit && submit.parentNode) {
+          submit.parentNode.appendChild(cancel);
+        } else {
+          form.appendChild(cancel);
+        }
+        cancel.addEventListener("click", () => {
+          const id = idName === "config_id" ? "新增连接" : "添加应用";
+          resetFormToAdd(formWrap, toggle, idName, id);
+          // 清空已预填的值，回到“新增”空表单
+          form.querySelectorAll('input[type="text"], input[type="password"], input:not([type]), input[type="url"], input[type="email"]').forEach((inp) => {
+            if (!inp.hasAttribute("data-keep")) inp.value = "";
+          });
+          const password = form.querySelector('input[name="password"]');
+          if (password) {
+            password.required = true;
+            password.placeholder = "";
+          }
+          const enabled = form.querySelector('input[name="enabled"], input[name="app_enabled"]');
+          if (enabled) enabled.checked = true;
+          const target = idName === "config_id" ? formWrap : document.getElementById("netdisk-preview");
+          if (target) target.scrollIntoView({behavior: "smooth", block: "start"});
+        });
+      }
+      const target = idName === "config_id" ? formWrap : document.getElementById("netdisk-preview");
+      if (target) target.scrollIntoView({behavior: "smooth", block: "start"});
+    };
+
+    cfgEdits.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const formWrap = document.querySelector("[data-netdisk-cfg-form]");
+        if (!formWrap) return;
+        const form = formWrap.querySelector("form");
+        const set = (sel, val) => {
+          const el = form.querySelector(sel);
+          if (el) el.value = val;
+        };
+        set('input[name="name"]', btn.getAttribute("data-cfg-name") || "");
+        set('input[name="base_url"]', btn.getAttribute("data-cfg-base") || "");
+        set('input[name="email"]', btn.getAttribute("data-cfg-email") || "");
+        const pwd = form.querySelector('input[name="password"]');
+        if (pwd) {
+          pwd.value = "";
+          pwd.required = false;
+          pwd.placeholder = "留空表示不修改密码";
+        }
+        set('input[name="default_root"]', btn.getAttribute("data-cfg-root") || "cloudreve://my");
+        const en = form.querySelector('input[name="enabled"]');
+        if (en) en.checked = btn.getAttribute("data-cfg-enabled") === "1";
+        startEdit(btn, "[data-netdisk-cfg-form]", "[data-netdisk-cfg-toggle]", "config_id", btn.getAttribute("data-cfg-id"), "保存修改");
+      });
+    });
+
+    officeEdits.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const formWrap = document.querySelector("[data-netdisk-office-form]");
+        if (!formWrap) return;
+        const form = formWrap.querySelector("form");
+        const set = (sel, val) => {
+          const el = form.querySelector(sel);
+          if (el) el.value = val;
+        };
+        set('input[name="app_name"]', btn.getAttribute("data-app-name") || "");
+        set('input[name="app_base_url"]', btn.getAttribute("data-app-url") || "");
+        const en = form.querySelector('input[name="app_enabled"]');
+        if (en) en.checked = btn.getAttribute("data-app-enabled") === "1";
+        startEdit(btn, "[data-netdisk-office-form]", "[data-netdisk-office-toggle]", "app_id", btn.getAttribute("data-app-id"), "保存修改");
+      });
+    });
+  };
+
+  const initNetdiskAdminTest = () => {
+    const forms = document.querySelectorAll(
+      'form[action$="/admin/netdisk/config/test"], form[action$="/admin/netdisk/office/test"]',
+    );
+    forms.forEach((form) => {
+      form.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        const submitBtn = form.querySelector("button[type='submit']");
+        const originalText = submitBtn ? submitBtn.textContent : "";
+        if (submitBtn) {
+          submitBtn.disabled = true;
+          submitBtn.textContent = "测试中…";
+        }
+        try {
+          const resp = await fetch(form.action, {
+            method: "POST",
+            credentials: "same-origin",
+            body: new FormData(form),
+          });
+          const payload = await resp.json().catch(() => null);
+          if (payload && payload.code === 0) {
+            showToast(payload.data && payload.data.message ? payload.data.message : "测试成功", "");
+          } else {
+            showToast(payload && payload.msg ? payload.msg : "测试失败", "error");
+          }
+        } catch (err) {
+          showToast("请求失败", "error");
+        } finally {
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.textContent = originalText;
+          }
+        }
+      });
+    });
+    // 连接配置表单内的“测试连接”按钮（新增/编辑均可实时测试当前输入）
+    document.querySelectorAll("[data-netdisk-cfg-test]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const form = btn.closest("form");
+        if (!form) return;
+        btn.disabled = true;
+        const originalText = btn.textContent;
+        btn.textContent = "测试中…";
+        try {
+          const resp = await fetch("/admin/netdisk/config/test", {
+            method: "POST",
+            credentials: "same-origin",
+            body: new FormData(form),
+          });
+          const payload = await resp.json().catch(() => null);
+          if (payload && payload.code === 0) {
+            showToast(payload.data && payload.data.message ? payload.data.message : "测试成功", "");
+          } else {
+            showToast(payload && payload.msg ? payload.msg : "测试失败", "error");
+          }
+        } catch (err) {
+          showToast("请求失败", "error");
+        } finally {
+          btn.disabled = false;
+          btn.textContent = originalText;
+        }
+      });
+    });
+  };
+
+  const initNetdiskCfgReindex = () => {
+    // 全文索引区"连接 OCR 配置"：重建/终止二合一按钮 + 展开编辑
+    const csrfValue = () => {
+      const el = document.querySelector('input[name="csrf"]');
+      return el ? el.value : "";
+    };
+    // 按连接状态同步"重建/终止"按钮外观：运行中显示"终止索引"，否则"重建索引"
+    const syncCfgActionButtons = (configs) => {
+      document.querySelectorAll("[data-netdisk-cfg-action]").forEach((btn) => {
+        const cfgId = btn.getAttribute("data-config-id");
+        const cfg = (configs || []).find((c) => String(c.config_id) === String(cfgId));
+        const status = cfg ? (cfg.job_status || "idle") : "idle";
+        const running = status === "running" || status === "pending";
+        const failed = status === "failed";
+        if (running) {
+          btn.setAttribute("data-running", "1");
+          btn.textContent = "终止索引";
+          btn.classList.add("danger");
+        } else if (failed) {
+          btn.setAttribute("data-running", "0");
+          btn.setAttribute("data-retry", "1");
+          btn.textContent = "重试（续跑）";
+          btn.classList.remove("danger");
+        } else {
+          btn.setAttribute("data-running", "0");
+          btn.removeAttribute("data-retry");
+          btn.textContent = "重建索引";
+          btn.classList.remove("danger");
+        }
+      });
+    };
+    document.querySelectorAll("[data-netdisk-cfg-action]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const cfgId = btn.getAttribute("data-config-id");
+        const cfgName = btn.getAttribute("data-config-name") || "该连接";
+        const running = btn.getAttribute("data-running") === "1";
+        const msg = running
+          ? "确定终止「" + cfgName + "」所有分享的索引重建？"
+          : "确定重建「" + cfgName + "」绑定的所有分享的索引？";
+        if (!window.confirm(msg)) return;
+        btn.disabled = true;
+        const original = btn.textContent;
+        btn.textContent = running ? "终止中…" : "排队中…";
+        try {
+          const fd = new FormData();
+          fd.append("csrf", csrfValue());
+          fd.append("config_id", cfgId);
+          const isRetry = btn.getAttribute("data-retry") === "1";
+          const url = running ? "/admin/netdisk/reindex/cancel" : (isRetry ? "/admin/netdisk/reindex/retry" : "/admin/netdisk/reindex");
+          const resp = await fetch(url, { method: "POST", credentials: "same-origin", body: fd });
+          const payload = await resp.json().catch(() => null);
+          const ok = resp.ok || (payload && payload.code === 0);
+          showToast(ok ? (running ? "已请求终止该连接所有分享的索引重建" : "已为该连接加入重建队列") : "请求失败", ok ? "" : "error");
+          if (ok) setTimeout(() => {
+            const box = document.querySelector("[data-nd-reindex-status]");
+            if (box && typeof box._ndPoll === "function") box._ndPoll();
+          }, 600);
+        } catch (err) {
+          showToast("请求失败", "error");
+        } finally {
+          btn.disabled = false;
+          btn.textContent = original;
+          // 立即按最新状态刷新按钮
+          const box = document.querySelector("[data-nd-reindex-status]");
+          if (box && typeof box._ndPoll === "function") box._ndPoll();
+        }
+      });
+    });
+    // 全文索引区"连接 OCR 配置"的展开/收起编辑表单
+    document.querySelectorAll("[data-netdisk-icfg-toggle]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const cfgId = btn.getAttribute("data-cfg-id");
+        const row = document.querySelector('[data-nd-icfg-edit="' + cfgId + '"]');
+        if (!row) return;
+        row.hidden = !row.hidden;
+        btn.textContent = row.hidden ? "配置" : "收起";
+        // 展开时同步 OCR 开关与字段区显示
+        const form = row.querySelector("form");
+        if (form) {
+          const tog = form.querySelector("[data-netdisk-index-ocr-toggle]");
+          const fields = form.querySelector("[data-netdisk-index-ocr-fields]");
+          if (tog && fields) fields.hidden = !tog.checked;
+        }
+      });
+    });
+    // 暴露按钮同步函数，供状态卡片 poll 每次刷新后调用（把 configs 状态映射到按钮）
+    document.querySelectorAll("[data-netdisk-icfg-toggle]").forEach((t) => {});
+    window.__ndSyncCfgActions = syncCfgActionButtons;
+    // 连接 OCR 配置保存：AJAX 提交（避免整页跳转显示 JSON）
+    document.querySelectorAll('form[action$="/admin/netdisk/index-config/save"]').forEach((form) => {
+      form.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        const submitBtn = form.querySelector('button[type="submit"]');
+        const originalText = submitBtn ? submitBtn.textContent : "";
+        if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = "保存中…"; }
+        try {
+          const resp = await fetch(form.action, { method: "POST", credentials: "same-origin", body: new FormData(form) });
+          const payload = await resp.json().catch(() => null);
+          if (payload && payload.code === 0) {
+            showToast(payload.msg || "已保存", "");
+            // 保存成功：收起该连接编辑行，按钮还原为“配置”
+            const saveRow = form.closest('[data-nd-icfg-edit]');
+            if (saveRow) saveRow.hidden = true;
+            const saveCfgId = saveRow ? (saveRow.getAttribute('data-nd-icfg-edit') || '') : '';
+            if (saveCfgId) { const tb = document.querySelector('[data-netdisk-icfg-toggle][data-cfg-id="' + saveCfgId + '"]'); if (tb) tb.textContent = "配置"; }
+            // 卡片区为后端渲染，延时刷新以更新显示值
+            setTimeout(() => { window.location.reload(); }, 800);
+          } else {
+            showToast(payload && payload.msg ? payload.msg : "保存失败", "error");
+          }
+        } catch (err) {
+          showToast("保存失败", "error");
+        } finally {
+          if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = originalText; }
+        }
+      });
+    });
+  };
+
+  const initNetdiskReindexStatus = () => {
+    const statusBox = document.querySelector("[data-nd-reindex-status]");
+    if (!statusBox) return;
+
+    const statusLabel = (s) => {
+      if (s === "pending") return "排队中";
+      if (s === "running") return "重建中";
+      if (s === "done") return "完成";
+      if (s === "failed") return "失败";
+      if (s === "cancelled") return "已终止";
+      return s;
+    };
+
+    // 行缓存：避免每 3s 整体重建 innerHTML（否则选中/复制会被打断）
+    let rowCache = new Map(); // share_id -> { row, progressText, bar, detail, hb, status, stats, lastStatus }
+
+    const buildRowHtmlInner = (s, job, progressHtml, statsHtml) => {
+      const cancelBtn = (job.status === "running" || job.status === "pending")
+        ? '<button type="button" class="button ghost nd-cancel-btn" data-nd-cancel data-share="' + (s.share_id || "") + '" data-confirm="确定终止该分享的索引重建？">终止检索</button>'
+        : "";
+      return "<td data-nd-title>" + escapeHtml(s.title || "分享#" + s.share_id) + "</td>" +
+        '<td><span class="muted" data-nd-status>' + statusLabel(job.status) + "</span></td>" +
+        "<td>" + progressHtml + "</td><td data-nd-stats>" + statsHtml + "</td>" +
+        '<td class="nd-cancel-col">' + cancelBtn + "</td>";
+    };
+
+    const bindCancel = (rootEl) => {
+      rootEl.querySelectorAll("[data-nd-cancel]").forEach((btn) => {
+        if (btn.dataset.ndBound) return;
+        btn.dataset.ndBound = "1";
+        btn.addEventListener("click", async () => {
+          const shareId = btn.getAttribute("data-share");
+          const msg = btn.getAttribute("data-confirm") || "确定终止该分享的索引重建？";
+          if (!window.confirm(msg)) return;
+          btn.disabled = true;
+          const original = btn.textContent;
+          btn.textContent = "终止中…";
+          try {
+            const fd = new FormData();
+            fd.append("share_id", shareId);
+            const csrfEl = document.querySelector('input[name="csrf"]');
+            const csrfV = csrfEl ? csrfEl.value : "";
+            if (csrfV) fd.append("csrf", csrfV);
+            const resp = await fetch("/admin/netdisk/reindex/cancel", {
+              method: "POST",
+              credentials: "same-origin",
+              body: fd,
+            });
+            const payload = await resp.json().catch(() => null);
+            if (payload && payload.code === 0) {
+              btn.textContent = "已请求终止";
+              setTimeout(() => poll(), 500);
+            } else {
+              btn.textContent = "请求失败";
+              setTimeout(() => { btn.textContent = original; btn.disabled = false; }, 2000);
+            }
+          } catch (e) {
+            btn.textContent = "请求失败";
+            setTimeout(() => { btn.textContent = original; btn.disabled = false; }, 2000);
+          }
+        });
+      });
+    };
+
+    const buildRowHtml = (s, job, progressHtml, statsHtml) => {
+      return "<tr data-nd-share='" + (s.share_id || "") + "'>" + buildRowHtmlInner(s, job, progressHtml, statsHtml) + "</tr>";
+    };
+
+    const buildProgressHtml = (job, progressPctFn) => {
+      const dirTotal = job.total_dirs || 0;
+      const fileTotal = job.total_files || 0;
+      let text = "";
+      // OCR 阶段：遍历已完成 files 跑满，显示 OCR 完成占比
+      const totalFiles = job.total_files || 0;
+      const files = job.files || 0;
+      const inOcrPhase = totalFiles > 0 && files >= totalFiles && (job.ocr_total || 0) > 0;
+      if (inOcrPhase) {
+        text = "OCR " + (job.ocr_done_count || 0) + "/" + (job.ocr_total || 0) + "（文件 " + files + "/" + totalFiles + "）";
+      } else {
+        if (dirTotal > 0) text += "目录 " + (job.processed_dirs || 0) + "/" + dirTotal;
+        if (fileTotal > 0) {
+          if (text) text += " · ";
+          text += "文件 " + files + "/" + fileTotal;
+        }
+      }
+      if (!text) text = "正在遍历…";
+      let h = '<span class="nd-progress-text">' + escapeHtml(text) + "</span>";
+      h += '<div class="nd-progress"><span class="nd-progress-bar" style="width:' + progressPctFn(job) + '"></span></div>';
+      let cur = "";
+      if (job.current_name) cur += "正在处理：" + escapeHtml(job.current_name);
+      if (job.current_detail) cur += (cur ? "，" : "") + escapeHtml(job.current_detail);
+      if (job.queue_remaining > 0) cur += (cur ? "，" : "") + "剩余排队 " + job.queue_remaining;
+      if (job.status === "pending" && job.attempts > 0) cur += (cur ? "，" : "") + "等待重试（第 " + job.attempts + " 次）";
+      if (cur) h += '<div class="nd-progress-detail">' + cur + "</div>";
+      let hbHtml = "";
+      if (job.heartbeat_at) {
+        const hbAge = Math.max(0, Math.round(Date.now() / 1000 - job.heartbeat_at));
+        if (hbAge > 300) {
+          hbHtml = '<div class="nd-progress-interrupted">⚠ 已 ' + hbAge + "s 无心跳，重建可能已中断，请重新触发重建</div>";
+        } else if (hbAge > 60) {
+          hbHtml = '<div class="nd-progress-warn">⚠ 已 ' + hbAge + "s 无心跳，可能卡住</div>";
+        } else {
+          hbHtml = '<div class="nd-progress-hb">最后活动 ' + hbAge + "s 前</div>";
+        }
+      } else {
+        hbHtml = '<div class="nd-progress-warn">⚠ 未收到心跳，可能后台未正常工作</div>';
+      }
+      h += hbHtml;
+      return h;
+    };
+
+    const ndErrorAdvice = (err) => {
+      const e = String(err || "");
+      const tips = [];
+      if (/database is locked|General error: 5|HY000/i.test(e)) tips.push("建议：数据库锁冲突，稍等片刻再重试，或降低 OCR 并发数");
+      if (/memory|Out of memory|Memory/i.test(e)) tips.push("建议：内存不足，降低 OCR 并发数与 DPI 上限（如并发 2、DPI 150）");
+      if (/timeout|timed out|timedout/i.test(e)) tips.push("建议：处理超时，缩小单次重建范围或降低 OCR 分辨率");
+      if (/download|502|504|connection/i.test(e)) tips.push("建议：网络/连接异常，检查 Cloudreve 连接配置后重试");
+      if (/lock-conflict|锁冲突/i.test(e)) tips.push("建议：锁冲突频繁，降低 OCR 并发数或减少同时重建的分享数");
+      if (/OCR|tesseract|pdftoppm|recognize/i.test(e)) tips.push("建议：OCR 引擎异常，确认 sidecar/服务正常，或降低 DPI");
+      if (/heartbeat|心跳|中断/i.test(e)) tips.push("建议：worker 中断，多为内存/超时，可重试（续跑）或调低并发与 DPI");
+      return tips.length ? tips.join("；") : "";
+    };
+
+    const ndJobErrorText = (job) => {
+      const err = job.error ? String(job.error) : "";
+      let brief = err;
+      if (/SQLSTATE|General error|database is locked|HY000/i.test(err)) {
+        brief = "索引失败（数据库锁冲突/内部错误）";
+      }
+      if (!brief) brief = "失败";
+      // 完整错误放 title，鼠标悬浮可见；正文只显示友好摘要，避免 SQL 原始串占满整列
+      return '<span class="nd-error-brief" title="' + escapeHtml(err) + '">' + escapeHtml(brief) + "</span>";
+    };
+
+    const buildStatsHtml = (job) => {
+      let s = "文件 " + (job.files || 0) + "，目录 " + (job.folders || 0) + "，正文 " + (job.texts || 0) +
+        "，错误 " + (job.errors || 0);
+      // OCR 阶段实时进度（files 已跑满时显示 ocr_done_count/ocr_total）
+      const totalFiles = job.total_files || 0;
+      const files = job.files || 0;
+      if (totalFiles > 0 && files >= totalFiles && (job.ocr_total || 0) > 0) {
+        s += "，OCR " + (job.ocr_done_count || 0) + "/" + (job.ocr_total || 0);
+      } else if (job.ocr_done) {
+        s += "，OCR完成 " + job.ocr_done;
+      }
+      if (job.ocr_queued) s += "，入低优队列 " + job.ocr_queued;
+      if (job.notes) s += "（" + job.notes + "）";
+      return s;
+    };
+
+    const jobStatusLabel = (s) => {
+      if (s === "running") return "重建中";
+      if (s === "pending") return "排队中";
+      if (s === "done") return "完成";
+      if (s === "failed") return "失败";
+      if (s === "cancelled") return "已终止";
+      return "就绪";
+    };
+
+    const render = (payload) => {
+      if (!payload || payload.code !== 0 || !payload.data) {
+        if (statusBox.dataset.mode !== "err") {
+          statusBox.dataset.mode = "err";
+          statusBox.innerHTML = '<div class="muted">索引状态获取失败。</div>';
+        }
+        return;
+      }
+      const summary = payload.data.summary || {};
+      const queue = summary.ocr_queue || {};
+      const configs = payload.data.configs || [];
+      const progressPctFn = (job) => {
+        // 索引进度条只反映"文件遍历/索引"进度，不跟 OCR（OCR 有独立进度条）
+        let denom = job?.total_dirs || 0;
+        let num = job?.processed_dirs || 0;
+        if (!denom && (job?.total_files || 0) > 0) {
+          denom = job.total_files || 0;
+          num = job.files || 0;
+        }
+        if (!denom) return "2%";
+        const pct = Math.min(100, Math.round((num / denom) * 100));
+        return Math.max(2, pct) + "%";
+      };
+      if (!configs.length) {
+        if (statusBox.dataset.mode !== "empty") {
+          statusBox.dataset.mode = "empty";
+          statusBox.innerHTML = '<div class="muted">尚未配置 Cloudreve 连接。请先添加连接配置。</div>';
+        }
+        return;
+      }
+      // 全部按连接重绘（连接数很少，每 3s 全量刷新可接受）
+      if (statusBox.dataset.mode !== "table") {
+        statusBox.dataset.mode = "table";
+      }
+      let html = '<table class="table" style="max-width:880px;table-layout:fixed;width:100%"><colgroup><col style="width:18%"><col style="width:11%"><col style="width:34%"><col style="width:37%"></colgroup><thead><tr><th>连接</th><th>状态</th><th>进度</th><th>统计</th></tr></thead><tbody>';
+      configs.forEach((cfg) => {
+        const agg = cfg.agg || {};
+        const active = agg.active_job || null;
+        const jobStatus = cfg.job_status || "idle";
+        const shareTotal = agg.share_total || 0;
+        const doneShares = (agg.done_shares || 0) + (agg.cancelled_shares || 0);
+        // 进度列文本
+        let progText = "";
+        let progDetail = "";
+        let barPct = "2%";
+        let ocrText = "";
+        let ocrBarPct = "0%";
+        const filesDone = agg.files_done || 0;
+        const filesTotal = agg.files_total || 0;
+        if (active && (active.status === "running" || active.status === "pending")) {
+          progText = "文件 " + filesDone + "/" + (filesTotal || "?") + (shareTotal ? "（" + shareTotal + " 个分享）" : "");
+          barPct = progressPctFn(active);
+          if (active.current_name) progDetail = "正在处理：" + active.current_name;
+          if (active.current_detail) progDetail += (progDetail ? "，" : "") + active.current_detail;
+          // OCR 文件级进度（高优池文件总数/已完成）
+          const ocrTotalFiles = active.ocr_files_total || 0;
+          if (ocrTotalFiles > 0) {
+            // 池内用剩余排队反推已完成（queue_remaining 每 2s 更新）；finalize 阶段用 ocr_files_done 递增
+            const ocrDoneViaQueue = Math.max(0, ocrTotalFiles - (active.queue_remaining || 0));
+            const ocrDoneFiles = Math.min(ocrTotalFiles, Math.max(active.ocr_files_done || 0, ocrDoneViaQueue));
+            ocrText = "OCR 文件 " + ocrDoneFiles + "/" + ocrTotalFiles;
+            ocrBarPct = Math.max(2, Math.min(100, Math.round((ocrDoneFiles / ocrTotalFiles) * 100))) + "%";
+          }
+        } else if (jobStatus === "failed") {
+          progText = active && active.error ? active.error : "重建失败";
+          const adv = ndErrorAdvice(active && active.error ? active.error : "");
+          progDetail = adv ? "💡 " + adv : (progDetail || "");
+          barPct = "100%";
+        } else {
+          progText = filesTotal ? ("文件 " + filesDone + "/" + filesTotal) : (shareTotal ? shareTotal + " 个分享" : "未重建");
+          if (doneShares >= shareTotal && shareTotal > 0) barPct = "100%";
+        }
+        // 统计列
+        let statsHtml = "分享 " + shareTotal + "，完成 " + doneShares;
+        if (agg.running_shares) statsHtml += "，重建中 " + agg.running_shares;
+        if (agg.pending_shares) statsHtml += "，排队 " + agg.pending_shares;
+        if (agg.failed_shares) statsHtml += "，失败 " + agg.failed_shares;
+        if (filesTotal) statsHtml += "，文件 " + filesDone + "/" + filesTotal;
+        // 状态徽标
+        let statusHtml = '<span class="muted">' + jobStatusLabel(jobStatus) + "</span>";
+        if (jobStatus === "running") statusHtml = '<span style="color:#d97706">重建中</span>';
+        if (jobStatus === "failed") statusHtml = '<span style="color:#dc2626">失败</span>';
+        if (jobStatus === "done" || (shareTotal > 0 && doneShares === shareTotal)) statusHtml = '<span style="color:#16a34a">完成</span>';
+
+        html += "<tr data-nd-cfg='" + (cfg.config_id || "") + "'>";
+        html += "<td data-nd-title>" + escapeHtml(cfg.name || ("连接 #" + cfg.config_id)) + "</td>";
+        html += "<td>" + statusHtml + "</td>";
+        html += '<td class="nd-progress-cell">';
+        // 进度条 A：索引/文件遍历
+        html += '<div class="nd-progress-row"><span class="nd-progress-label">索引</span><span class="nd-progress-text">' + escapeHtml(progText) + "</span></div>" +
+          '<div class="nd-progress"><span class="nd-progress-bar" style="width:' + barPct + '"></span></div>';
+        // 进度条 B：OCR 文件级（运行时且高优池有文件时显示）
+        if (ocrText) {
+          html += '<div class="nd-progress-row" style="margin-top:6px"><span class="nd-progress-label">OCR</span><span class="nd-progress-text">' + escapeHtml(ocrText) + "</span></div>" +
+            '<div class="nd-progress"><span class="nd-progress-bar" style="width:' + ocrBarPct + '"></span></div>';
+        }
+        if (progDetail) html += '<div class="nd-progress-detail">' + escapeHtml(progDetail) + "</div>";
+        html += "</td>";
+        html += "<td data-nd-stats>" + escapeHtml(statsHtml) + "</td>";
+        html += "</tr>";
+      });
+      html += "</tbody></table>";
+      html += '<div class="muted" style="margin-top:8px">低优先级队列：排队 ' + (queue.pending || 0) +
+        "，处理中 " + (queue.running || 0) + "，完成 " + (queue.done || 0) + "，失败 " + (queue.failed || 0) +
+        "。页面每 3 秒自动刷新。</div>";
+      statusBox.innerHTML = html;
+      // 同步连接 OCR 配置表的"重建/终止"按钮状态（运行中显示终止、空闲显示重建）
+      if (typeof window.__ndSyncCfgActions === "function") {
+        window.__ndSyncCfgActions(configs);
+      }
+    };
+
+    const poll = async () => {
+      try {
+        const resp = await fetch("/admin/netdisk/reindex/status", { credentials: "same-origin" });
+        const payload = await resp.json().catch(() => null);
+        render(payload);
+      } catch (err) {
+        console.error("[netdisk-reindex-status] poll failed:", err);
+      }
+    };
+    // 挂载到状态容器，供重建/终止等按钮点击后立即触发一次轮询刷新进度
+    statusBox._ndPoll = poll;
+    poll();
+    setInterval(poll, 3000);
+  };
+
   const initShareDrawer = () => {
     const openBtn = document.querySelector("[data-share-drawer-open]");
     const backdrop = document.querySelector("[data-share-drawer-close]");
@@ -2896,6 +4304,7 @@
     };
 
     const loadDoc = async (url, {pushState = true} = {}) => {
+      if (window.__spsNetdiskRestoreRight) window.__spsNetdiskRestoreRight();
       clearFootnoteWindows();
       const currentId = ++requestId;
       if (controller) controller.abort();
@@ -6176,12 +7585,15 @@ const initImageViewer = () => {
       return div.innerHTML;
     };
 
-    const highlightText = (text, query) => {
+    const highlightText = (text, query, extraTerms) => {
       if (!query) return escapeHtml(text);
       const escaped = escapeHtml(text);
       const words = query.split(/\s+/).filter(w => w.length > 0);
-      if (!words.length) return escaped;
-      const pattern = words.map(w => {
+      // 合并模糊命中词：snippet 里可能出现与查询形近但不等于的词（如"旋转变压器"→"变压器"），
+      // 仅靠查询词正则无法高亮，这里把 fuzzy_terms 一并加入匹配（精确度高、仅用于本 snippet）。
+      const termList = words.concat(extraTerms || []);
+      if (!termList.length) return escaped;
+      const pattern = termList.map(w => {
         const wEscaped = escapeHtml(w);
         return wEscaped.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       }).join("|");
@@ -6201,7 +7613,200 @@ const initImageViewer = () => {
       }
     };
 
+    const escapeSearch = (str) => {
+      const div = document.createElement("div");
+      div.textContent = str == null ? "" : str;
+      return div.innerHTML;
+    };
+
+    let lastResults = null; // {docResults, ndNameHits, ndContentHits, query, diag}
+    let ndPath = []; // [{uri,name}] 搜索区内当前文件夹导航栈
+    let searchSeq = 0; // 防竞态：只允许最新一次检索渲染结果
+
+    const netdiskFileUrl = (uri, name) =>
+      getBasePath() + "/s/" + encodeURIComponent(slug) + "/netdisk/preview?uri=" + encodeURIComponent(uri) + "&name=" + encodeURIComponent(name);
+
+    // 生成一条网盘行（与网盘标签页视觉一致）
+    const ndRowHtml = (f) => {
+      const title = (f.is_folder ? "文件夹" : "文件") + "：" + f.name;
+      const sizeHtml = f.size ? '<span class="netdisk-size">' + formatNetdiskSize(f.size) + "</span>" : "";
+      const dl = f.can_download
+        ? '<button class="netdisk-download" type="button" data-netdisk-download title="下载" data-uri="' + escapeSearch(f.uri) + '" data-name="' + escapeSearch(f.name) + '">' +
+          netdiskSvgWrap('<path d="M12 3v10m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>') +
+          "</button>"
+        : "";
+      if (f.is_folder) {
+        return '<li class="netdisk-row" data-nd-folder data-uri="' + escapeSearch(f.uri) + '" data-name="' + escapeSearch(f.name) + '" title="' + escapeSearch(title) + '">' +
+          netdiskIconSvg("", true) +
+          '<span class="netdisk-name" title="' + escapeSearch(f.name) + '">' + escapeSearch(f.name) + "</span>" +
+          "</li>";
+      }
+      return '<li class="netdisk-row" data-nd-file data-uri="' + escapeSearch(f.uri) + '" data-name="' + escapeSearch(f.name) + '" data-ext="' + escapeSearch(f.ext || "") + '" data-can-download="' + (f.can_download ? "1" : "0") + '" title="' + escapeSearch(title) + '">' +
+        netdiskIconSvg(f.ext, false) +
+        '<span class="netdisk-name" title="' + escapeSearch(f.name) + '">' + escapeSearch(f.name) + "</span>" +
+        sizeHtml +
+        dl +
+        "</li>";
+    };
+
+    // 搜索命中行：行1=图标+文件名(高亮)+大小+下载钮；行2=路径；内容命中再补行3=命中片段(高亮)
+    const ndHitHtml = (r, query, isContent) => {
+            const relPath = r.path || "";
+      const title = (r.is_folder ? "文件夹：" : "文件：") + (relPath ? relPath : r.name);
+      const nameHtml = highlightText(r.name, query);
+      const sizeHtml = r.size ? '<span class="netdisk-size">' + formatNetdiskSize(r.size) + "</span>" : "";
+      const dl = r.can_download
+        ? '<button class="netdisk-download" type="button" data-netdisk-download title="下载" data-uri="' + escapeSearch(r.uri) + '" data-name="' + escapeSearch(r.name) + '">' +
+          netdiskSvgWrap('<path d="M12 3v10m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>') +
+          "</button>"
+        : "";
+      const hitAttrs = r.is_folder
+        ? 'data-nd-folder data-uri="' + escapeSearch(r.uri) + '" data-name="' + escapeSearch(r.name) + '"'
+        : 'data-nd-file data-uri="' + escapeSearch(r.uri) + '" data-name="' + escapeSearch(r.name) + '" data-ext="' + escapeSearch(r.ext || "txt") + '" data-can-download="' + (r.can_download ? "1" : "0") + '"';
+      let html = '<li class="nd-hit" ' + hitAttrs + ' title="' + escapeSearch(title) + '">';
+      html += '<div class="nd-hit-line1">';
+      html += r.is_folder ? netdiskIconSvg("", true) : netdiskIconSvg(r.ext, false);
+      html += '<span class="nd-hit-name">' + nameHtml + "</span>";
+      html += sizeHtml;
+      html += dl;
+      html += "</div>";
+      if (relPath) {
+        // 路径行：去掉末尾文件名只显示所在目录；前缀 网盘/
+
+        const pSlash = relPath.lastIndexOf("/");
+        let dirPath = relPath;
+        if (pSlash > 0) { dirPath = relPath.slice(0, pSlash); } else if (pSlash === 0) { dirPath = ""; }
+        const pathLabel = "路径：网盘/" + (dirPath ? dirPath.replace(/^\//, "") + "/" : "");
+        html += '<div class="nd-hit-path" title="' + escapeSearch(relPath) + '">' + highlightText(pathLabel, query) + "</div>";
+      }
+      if (isContent) {
+        const snips = (r.snippets && r.snippets.length ? r.snippets : (r.snippet ? [{ offset: 0, text: r.snippet }] : []));
+        if (snips.length) {
+          // 默认只显示第一处匹配片段；其余折叠，可展开
+          const firstSnip = String(snips[0].text || "").length > 160 ? String(snips[0].text).slice(0, 160) + "…" : String(snips[0].text || "");
+          const firstTerms = snips[0].fuzzy_terms || [];
+          html += '<div class="nd-hit-snippet">' + highlightText(firstSnip, query, firstTerms) + "</div>";
+          if (snips.length > 1) {
+            html += '<div class="nd-hit-snippet-fold" data-nd-snip-fold>' +
+              '<button type="button" class="nd-snip-toggle" data-nd-snip-toggle style="border:none;background:none;color:var(--primary,#4a6ee0);cursor:pointer;padding:0;font-size:0.72rem">展开全部 ' + snips.length + " 处匹配</button>" +
+              '<div class="nd-snip-more" data-nd-snip-more hidden>';
+            snips.slice(1).forEach((sn) => {
+              const snText = String(sn.text || "").length > 200 ? String(sn.text).slice(0, 200) + "…" : String(sn.text || "");
+              html += '<div class="nd-hit-snippet">' + highlightText(snText, query, sn.fuzzy_terms || []) + "</div>";
+            });
+            html += "</div></div>";
+          }
+        }
+      }
+      html += "</li>";
+      return html;
+    };
+
+    // 为容器内的网盘行绑定事件
+    const bindNdRows = (container) => {
+      container.querySelectorAll("[data-nd-folder]").forEach((el) => {
+        el.addEventListener("click", () => {
+          openNdFolder(el.getAttribute("data-uri"), el.getAttribute("data-name"));
+        });
+      });
+      // 内容命中多片段：展开/收起
+      container.querySelectorAll("[data-nd-snip-toggle]").forEach((btn) => {
+        if (!btn.getAttribute("data-expand-text")) {
+          btn.setAttribute("data-expand-text", btn.textContent);
+        }
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+          const fold = btn.closest("[data-nd-snip-fold]");
+          const more = fold ? fold.querySelector("[data-nd-snip-more]") : null;
+          if (!fold || !more) return;
+          const hidden = more.hidden;
+          more.hidden = !hidden;
+          btn.textContent = hidden ? "收起" : btn.getAttribute("data-expand-text");
+        });
+      });
+      container.querySelectorAll("[data-nd-file]").forEach((el) => {
+        el.addEventListener("click", () => {
+          openNetdiskPreview(slug, getBasePath(), el.getAttribute("data-uri"), el.getAttribute("data-name"), el.getAttribute("data-ext"), el.getAttribute("data-can-download") === "1");
+        });
+      });
+      container.querySelectorAll("[data-netdisk-download]").forEach((btn) => {
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const u = btn.getAttribute("data-uri") || "";
+          const n = btn.getAttribute("data-name") || "";
+          const dlUrl = getBasePath() + "/s/" + encodeURIComponent(slug) + "/netdisk/download?uri=" + encodeURIComponent(u) + "&name=" + encodeURIComponent(n);
+          const a = document.createElement("a");
+          a.href = dlUrl;
+          a.download = n || "";
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+        });
+      });
+    };
+
+    // 渲染某个文件夹的子列表（复用 /netdisk/list）
+    const openNdFolder = async (uri, name) => {
+      ndPath.push({ uri, name });
+      await renderNdList();
+    };
+
+    const renderNdList = async () => {
+      const cur = ndPath[ndPath.length - 1];
+      const base = getBasePath();
+      let html = '<div class="kb-search-ndnav">';
+      html += '<button class="kb-search-back" type="button" data-nd-back>← 返回搜索结果</button>';
+      ndPath.forEach((p, idx) => {
+        html += '<button class="kb-search-crumb" type="button" data-nd-crumb="' + idx + '" title="' + escapeSearch(p.name) + '">' + escapeSearch(p.name) + "</button>";
+        if (idx < ndPath.length - 1) html += '<span class="kb-search-crumb-sep">/</span>';
+      });
+      html += '</div>';
+      resultsEl.innerHTML = html + '<div class="kb-search-empty">正在加载文件夹…</div>';
+      resultsEl.hidden = false;
+      hideTabsAndPanels(true);
+      resultsEl.querySelector("[data-nd-back]").addEventListener("click", () => {
+        if (lastResults) {
+          renderResults(lastResults.docResults, lastResults.ndNameHits, lastResults.ndContentHits, lastResults.query, lastResults.diag);
+        }
+      });
+      resultsEl.querySelectorAll("[data-nd-crumb]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const idx = Number(btn.getAttribute("data-nd-crumb"));
+          ndPath = ndPath.slice(0, idx + 1);
+          renderNdList();
+        });
+      });
+      try {
+        const url = base + "/s/" + encodeURIComponent(slug) + "/netdisk/list?uri=" + encodeURIComponent(cur.uri);
+        const resp = await fetch(url, { credentials: "same-origin" });
+        const payload = await resp.json().catch(() => null);
+        if (!payload || payload.code !== 0) {
+          resultsEl.innerHTML = '<div class="kb-search-empty">加载失败</div>';
+          hideTabsAndPanels(true);
+          return;
+        }
+        const files = (payload.data && payload.data.files) || [];
+        if (!files.length) {
+          resultsEl.innerHTML = '<div class="kb-search-empty">此文件夹为空</div>';
+          hideTabsAndPanels(true);
+          return;
+        }
+        let rows = '<ul class="netdisk-files">';
+        files.forEach((f) => { rows += ndRowHtml(f); });
+        rows += "</ul>";
+        resultsEl.innerHTML = html + rows;
+        bindNdRows(resultsEl);
+        resultsEl.hidden = false;
+        hideTabsAndPanels(true);
+      } catch (err) {
+        resultsEl.innerHTML = '<div class="kb-search-empty">加载出错</div>';
+        hideTabsAndPanels(true);
+      }
+    };
+
     const doSearch = async (query) => {
+      const mySeq = ++searchSeq;
       if (abortController) abortController.abort();
       if (!query || query.length < 1) {
         resultsEl.hidden = true;
@@ -6211,63 +7816,184 @@ const initImageViewer = () => {
       }
       abortController = new AbortController();
       const base = getBasePath();
-      const url = base + "/s/" + encodeURIComponent(slug) + "/search?q=" + encodeURIComponent(query);
-      try {
-        const resp = await fetch(url, {
-          credentials: "same-origin",
-          signal: abortController.signal,
-        });
-        const payload = await resp.json().catch(() => null);
-        if (!payload || payload.code !== 0) {
-          resultsEl.innerHTML = '<div class="kb-search-empty">搜索失败</div>';
-          resultsEl.hidden = false;
-          hideTabsAndPanels(true);
-          return;
+      const hasNetdisk = !!sidebar.querySelector('[data-share-panel="netdisk"]');
+      const docUrl = base + "/s/" + encodeURIComponent(slug) + "/search?q=" + encodeURIComponent(query);
+      const ndUrl = hasNetdisk
+        ? base + "/s/" + encodeURIComponent(slug) + "/netdisk/search?q=" + encodeURIComponent(query)
+        : null;
+      resultsEl.innerHTML = '<div class="kb-search-empty">正在检索…</div>';
+      resultsEl.hidden = false;
+      hideTabsAndPanels(true);
+
+      // 文档与网盘分别 fetch，各自返回后立即渲染，互不阻塞
+      let docResults = [];
+      let ndNameHits = [];
+      let ndContentHits = [];
+      let diag = "";
+      let docDone = false;
+      let ndDone = !ndUrl; // 无网盘时视为已结束
+
+      const commitRender = () => {
+        if (mySeq !== searchSeq) return;
+        renderResults(docResults, ndNameHits, ndContentHits, query, diag, !ndDone);
+      };
+
+      const docTask = async () => {
+        try {
+          const resp = await fetch(docUrl, { credentials: "same-origin", signal: abortController.signal });
+          const payload = await resp.json().catch(() => null);
+          if (mySeq !== searchSeq) return;
+          if (payload && payload.code === 0) {
+            docResults = (payload.data && payload.data.results) || [];
+          }
+          docDone = true;
+          lastResults = { docResults, ndNameHits, ndContentHits, query, diag };
+          ndPath = [];
+          commitRender();
+        } catch (err) {
+          if (err?.name === "AbortError") return;
+          if (mySeq !== searchSeq) return;
+          docDone = true;
+          commitRender();
         }
-        const results = payload.data?.results || [];
-        renderResults(results, query);
-      } catch (err) {
-        if (err?.name === "AbortError") return;
-        resultsEl.innerHTML = '<div class="kb-search-empty">搜索出错</div>';
-        resultsEl.hidden = false;
-        hideTabsAndPanels(true);
-      }
+      };
+
+      const ndTask = async () => {
+        if (!ndUrl) return;
+        try {
+          const resp = await fetch(ndUrl, { credentials: "same-origin", signal: abortController.signal });
+          const payload = await resp.json().catch(() => null);
+          if (mySeq !== searchSeq) return;
+          if (payload && payload.code === 0) {
+            ndNameHits = (payload.data && payload.data.nameHits) || [];
+            ndContentHits = (payload.data && payload.data.contentHits) || [];
+            diag = (payload.data && payload.data.diag) || "";
+          }
+          ndDone = true;
+          lastResults = { docResults, ndNameHits, ndContentHits, query, diag };
+          ndPath = [];
+          commitRender();
+        } catch (err) {
+          if (err?.name === "AbortError") return;
+          if (mySeq !== searchSeq) return;
+          ndDone = true;
+          commitRender();
+        }
+      };
+
+      docTask();
+      ndTask();
     };
 
-    const renderResults = (results, query) => {
-      if (!results.length) {
-        resultsEl.innerHTML = '<div class="kb-search-empty">没有找到结果</div>';
+    const renderResults = (docResults, ndNameHits, ndContentHits, query, diag, ndPending) => {
+      const base = getBasePath();
+      if (diag) {
+        // 诊断信息仅输出到浏览器控制台，不显示在结果区
+        console.info("[share-search] " + diag);
+      }
+      if (!docResults.length && !ndNameHits.length && !ndContentHits.length) {
+        if (ndPending) {
+          resultsEl.innerHTML = '<div class="kb-search-empty">正在检索网盘…</div>';
+        } else {
+          resultsEl.innerHTML = '<div class="kb-search-empty">没有找到结果</div>';
+        }
         resultsEl.hidden = false;
         hideTabsAndPanels(true);
         return;
       }
-      const base = getBasePath();
-      let html = '<ul class="kb-search-list">';
-      results.forEach((r) => {
-        const titleHtml = highlightText(r.title, query);
-        const snippetHtml = highlightText(r.snippet, query);
-        const pathHtml = r.hpath ? escapeHtml(r.hpath) : '';
-        const href = base + "/s/" + encodeURIComponent(slug) + "/" + encodeURIComponent(r.docId) + "?highlight=" + encodeURIComponent(query);
-        html += '<li class="kb-search-item">';
-        html += '<a class="kb-search-link" href="' + escapeHtml(href) + '" target="_blank" rel="noopener">';
-        html += '<div class="kb-search-title">' + titleHtml + '</div>';
-        if (pathHtml) {
-          html += '<div class="kb-search-path">' + pathHtml + '</div>';
-        }
-        html += '<div class="kb-search-snippet">' + snippetHtml + '</div>';
-        html += '</a></li>';
+      // 三个结果分组，按标签页展示：笔记检索 / 文件检索 / 内容检索
+      const tabs = [];
+      if (docResults.length) tabs.push({ key: "doc", label: "笔记检索", count: docResults.length });
+      if (ndNameHits.length) tabs.push({ key: "file", label: "文件检索", count: ndNameHits.length });
+      if (ndContentHits.length) tabs.push({ key: "content", label: "内容检索", count: ndContentHits.length });
+
+      let html = '<div class="kb-search-tabs" role="tablist">';
+      tabs.forEach((t, idx) => {
+        html += '<button type="button" class="kb-search-tab' + (idx === 0 ? " is-active" : "") + '" data-search-tab="' + t.key + '" role="tab">' +
+          escapeHtml(t.label) + '<span class="kb-search-tab-count">' + t.count + "</span></button>";
       });
-      html += '</ul>';
+      html += "</div>";
+
+      const buildPanel = (key, body) =>
+        '<div class="kb-search-panel" data-search-panel="' + key + '"' + (key === tabs[0].key ? "" : " hidden") + ">" + body + "</div>";
+
+      // 笔记检索面板
+      if (docResults.length) {
+        let b = '<ul class="kb-search-list">';
+        docResults.forEach((r) => {
+          const titleHtml = highlightText(r.title, query);
+          const pathHtml = r.hpath ? '路径：笔记/' + escapeHtml(String(r.hpath).replace(/^\/+/, '')) : '';
+          const href = base + "/s/" + encodeURIComponent(slug) + "/" + encodeURIComponent(r.docId) + "?highlight=" + encodeURIComponent(query);
+          // 支持多段 snippet：默认显示第一处，其余折叠可展开
+          const snips = (r.snippets && r.snippets.length ? r.snippets : (r.snippet ? [{ offset: 0, text: r.snippet }] : []));
+          b += '<li class="kb-search-item">';
+          b += '<a class="kb-search-link" href="' + escapeHtml(href) + '" target="_blank" rel="noopener">';
+          b += '<div class="kb-search-title">' + titleHtml + '</div>';
+          if (pathHtml) {
+            b += '<div class="kb-search-path">' + pathHtml + '</div>';
+          }
+          if (snips.length) {
+            const firstSnip = String(snips[0].text || "").length > 200 ? String(snips[0].text).slice(0, 200) + "…" : String(snips[0].text || "");
+            b += '<div class="kb-search-snippet">' + highlightText(firstSnip, query, snips[0].fuzzy_terms || []) + '</div>';
+            if (snips.length > 1) {
+              b += '<div class="kb-search-snippet-fold" data-nd-snip-fold>' +
+                '<button type="button" class="nd-snip-toggle" data-nd-snip-toggle style="border:none;background:none;color:var(--primary,#4a6ee0);cursor:pointer;padding:0;font-size:0.72rem">展开全部 ' + snips.length + " 处匹配</button>" +
+                '<div class="nd-snip-more" data-nd-snip-more hidden>';
+              snips.slice(1).forEach((sn) => {
+                const snText = String(sn.text || "").length > 200 ? String(sn.text).slice(0, 200) + "…" : String(sn.text || "");
+                b += '<div class="kb-search-snippet">' + highlightText(snText, query, sn.fuzzy_terms || []) + '</div>';
+              });
+              b += "</div></div>";
+            }
+          }
+          b += '</a></li>';
+        });
+        b += "</ul>";
+        html += buildPanel("doc", b);
+      }
+      // 文件检索面板
+      if (ndNameHits.length) {
+        let b = '<ul class="netdisk-files">';
+        ndNameHits.forEach((r) => { b += ndHitHtml(r, query, false); });
+        b += "</ul>";
+        html += buildPanel("file", b);
+      }
+      // 内容检索面板
+      if (ndContentHits.length) {
+        let b = '<ul class="netdisk-files">';
+        ndContentHits.forEach((r) => { b += ndHitHtml(r, query, true); });
+        b += "</ul>";
+        html += buildPanel("content", b);
+      }
       resultsEl.innerHTML = html;
       resultsEl.hidden = false;
       hideTabsAndPanels(true);
+      bindNdRows(resultsEl);
+      // 标签页切换
+      resultsEl.querySelectorAll("[data-search-tab]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          resultsEl.querySelectorAll("[data-search-tab]").forEach((x) => x.classList.remove("is-active"));
+          resultsEl.querySelectorAll("[data-search-panel]").forEach((x) => (x.hidden = true));
+          btn.classList.add("is-active");
+          const panel = resultsEl.querySelector('[data-search-panel="' + btn.getAttribute("data-search-tab") + '"]');
+          if (panel) panel.hidden = false;
+        });
+      });
     };
 
     const clearSearch = () => {
+      searchSeq++; // 使在途检索结果作废，避免延迟返回覆盖已恢复的网盘列表
+      clearTimeout(debounceTimer); // 同时取消挂起的防抖检索，防止其稍后再次渲染
+      if (abortController) {
+        abortController.abort();
+        abortController = null;
+      }
       input.value = "";
       if (clearBtn) clearBtn.hidden = true;
       resultsEl.hidden = true;
       resultsEl.innerHTML = "";
+      lastResults = null;
+      ndPath = [];
       hideTabsAndPanels(false);
     };
 
@@ -6275,7 +8001,20 @@ const initImageViewer = () => {
       const val = input.value.trim();
       if (clearBtn) clearBtn.hidden = val.length === 0;
       clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => doSearch(val), 300);
+      if (val.length === 0) {
+        // 关键词清空：立即取消在途检索并恢复网盘面板
+        clearSearch();
+        return;
+      }
+      // 仅回车触发检索（不再输入即自动搜索）
+    });
+
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        clearTimeout(debounceTimer);
+        doSearch(input.value.trim());
+      }
     });
 
     if (clearBtn) {
@@ -6801,6 +8540,14 @@ const initImageViewer = () => {
   initShareSidebarTabs();
   initShareColumnResize();
   initShareAnnounce();
+  initNetdisk();
+  initNetdiskRootPicker();
+  initNetdiskFormToggles();
+  initNetdiskInlineEdit();
+  initNetdiskDownloadRules();
+  initNetdiskAdminTest();
+  initNetdiskCfgReindex();
+  initNetdiskReindexStatus();
   initShareDrawer();
   initShareDocNavigation();
   initImageViewer();

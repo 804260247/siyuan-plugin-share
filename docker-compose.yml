@@ -17,8 +17,15 @@ services:
       - ./php-site/config.php:/var/www/html/config.php:ro
       # nginx 主配置（只读挂载）：改完 `docker compose up -d` 即生效，无需重建镜像
       - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+      # OCR 临时图片共享卷（与 ocr 服务共用）
+      - ocr-data:/ocr
     environment:
       - TZ=Asia/Shanghai
+      # ---- 网盘 OCR sidecar 开关（可选）----
+      # 打开后全文索引/搜索优先走 ocr 服务的 PaddleX serving（高精度中文 OCR）；
+      # 注释掉（关闭）即自动回退镜像内置 tesseract，功能不中断、精度略低。
+      # - NETDISK_OCR_SIDECAR=1
+      # - NETDISK_OCR_SIDECAR_URL=http://ocr:8080
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/"]
@@ -27,6 +34,52 @@ services:
       retries: 3
       start_period: 40s
 
+  # ---- 网盘全文索引 OCR sidecar（PaddleX serving，可选）----
+  # 首次启动会 pip 安装 paddlex 并下载/转换 OCR 模型（约 1-3 GB 磁盘、10-30 分钟，
+  # 视网速而定；模型缓存在 ./ocr/models，重建容器不重复下载）。
+  # 不启用时删掉本节即可，web 会自动回退 tesseract。
+  ocr:
+    image: python:3.11-slim
+    container_name: siyuan-share-ocr
+    command: ["bash", "/opt/ocr/init.sh"]
+    volumes:
+      # 启动脚本（仓库内维护，只读挂载）
+      - ./deploy/ocr/init.sh:/opt/ocr/init.sh:ro
+      # 模型/配置缓存（PADDLEX_HOME），持久化避免重建容器重复下载
+      - ./ocr/models:/root/.paddlex
+      # 与 web 共用的 OCR 临时图片卷（PHP 写入 /ocr，serving 侧可读）
+      - ocr-data:/ocr
+    environment:
+      - TZ=Asia/Shanghai
+      # 推理引擎：onnxruntime（默认，CPU 内存占用低）| paddle
+      - OCR_ENGINE=${OCR_ENGINE:-onnxruntime}
+      # 推理设备：cpu（默认）| gpu:0
+      - OCR_DEVICE=${OCR_DEVICE:-cpu}
+      # 监听端口（与 web 侧 NETDISK_OCR_SIDECAR_URL 统一为 8080）
+      - OCR_PORT=${OCR_PORT:-8080}
+      # 资源预设：low（默认，2 线程+关内存竞技场，防低配 OOM）| high（4 线程，吞吐优先）
+      - OCR_PROFILE=${OCR_PROFILE:-low}
+      # 推理线程数：留空按 profile 取 2/4；显式设置则优先生效；0=引擎默认
+      - OCR_THREADS=${OCR_THREADS:-}
+      # 可选：pip 国内镜像源（加速首次安装/避开官方 CDN 慢速），完整 URL 带 scheme 与 /simple/，
+      # 如 https://mirrors.aliyun.com/pypi/simple/
+      - OCR_PIP_INDEX=${OCR_PIP_INDEX:-}
+      # pip 网络超时秒数与重试次数（官方 CDN 慢导致 ReadTimeoutError 时可调大）
+      - OCR_PIP_TIMEOUT=${OCR_PIP_TIMEOUT:-120}
+      - OCR_PIP_RETRIES=${OCR_PIP_RETRIES:-5}
+      # 可选：Debian apt 镜像主机名（官方源不可达时设置），如 mirrors.aliyun.com
+      - OCR_APT_MIRROR=${OCR_APT_MIRROR:-}
+    # ---- 资源限制（低配 NAS 默认值；建议按机器调整）----
+    # 建议档位：
+    #   2GB 内存机器   : OCR_PROFILE=low , OCR_MEM_LIMIT=1500m, OCR_MEM_RESERVATION=768m, OCR_CPUS=1.0
+    #   4GB 内存机器   : OCR_PROFILE=low , OCR_MEM_LIMIT=2500m, OCR_MEM_RESERVATION=1g,   OCR_CPUS=1.5
+    #   8GB+ 内存机器  : OCR_PROFILE=high, OCR_MEM_LIMIT=4g,    OCR_MEM_RESERVATION=1500m, OCR_CPUS=2.0
+    mem_limit: ${OCR_MEM_LIMIT:-1500m}
+    mem_reservation: ${OCR_MEM_RESERVATION:-768m}
+    cpus: ${OCR_CPUS:-1.0}
+    restart: unless-stopped
+
 volumes:
   storage:
   uploads:
+  ocr-data:

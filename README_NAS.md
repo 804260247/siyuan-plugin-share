@@ -138,6 +138,64 @@ docker-compose -f docker-compose.nas.yml restart
 2. 添加任务
 3. 脚本: `cd /share/Container/siyuan-plugin-share && ./backup-volumes.sh`
 
+## OCR 启用（可选，网盘全文索引高精度识别）
+
+网盘全文索引默认使用镜像内置的 `tesseract`（开箱即用，无需额外配置）。如需更高精度的中文 OCR（PaddleX serving），按以下步骤启用：
+
+### 1. 打开 web 侧开关
+
+编辑 `docker-compose.nas.yml`（或 `docker-compose.yml`），取消 `web` 服务中这两行的注释：
+
+```yaml
+      - NETDISK_OCR_SIDECAR=1
+      - NETDISK_OCR_SIDECAR_URL=http://ocr:8080
+```
+
+> 注释掉（关闭）即自动回退 tesseract，功能不中断、精度略低。
+
+### 2. 按需调整 ocr 服务资源参数
+
+`ocr` 服务段支持以下环境变量（都有默认值，可在 `.env` 或 compose 里覆盖）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `OCR_ENGINE` | `onnxruntime` | 推理引擎，`onnxruntime` CPU 内存占用更低；可选 `paddle` |
+| `OCR_DEVICE` | `cpu` | 推理设备，GPU 填 `gpu:0` |
+| `OCR_PORT` | `8080` | 监听端口，与 web 侧 `NETDISK_OCR_SIDECAR_URL` 保持一致 |
+| `OCR_PROFILE` | `low` | `low`=2 线程+关内存竞技场（防低配 OOM）；`high`=4 线程吞吐优先 |
+| `OCR_THREADS` | （空） | 显式线程数，优先生效；`0`=引擎默认 |
+| `OCR_PIP_INDEX` | （空） | pip 国内镜像源，如 `https://pypi.tuna.tsinghua.edu.cn/simple` |
+| `OCR_MEM_LIMIT` | `1500m` | 容器内存上限 |
+| `OCR_MEM_RESERVATION` | `768m` | 内存软限制 |
+| `OCR_CPUS` | `1.0` | CPU 上限 |
+
+各档建议值：
+
+| 机器规格 | 建议配置 |
+|---|---|
+| 2GB 内存 | `OCR_PROFILE=low`、`OCR_MEM_LIMIT=1500m`、`OCR_MEM_RESERVATION=768m`、`OCR_CPUS=1.0` |
+| 4GB 内存 | `OCR_PROFILE=low`、`OCR_MEM_LIMIT=2500m`、`OCR_MEM_RESERVATION=1g`、`OCR_CPUS=1.5` |
+| 8GB+ 内存 | `OCR_PROFILE=high`、`OCR_MEM_LIMIT=4g`、`OCR_MEM_RESERVATION=1500m`、`OCR_CPUS=2.0` |
+
+### 3. 启动
+
+```bash
+docker compose -f docker-compose.nas.yml up -d
+# 观察首次安装/建模进度（首次约 10-30 分钟，视网速）
+docker compose -f docker-compose.nas.yml logs -f ocr
+```
+
+首次启动 `init.sh` 会：安装 paddlex/onnxruntime → 下载官方 OCR 模型 → 按 `OCR_ENGINE` 转换并缓存到模型卷（NAS 版为 named volume `ocr-models`）→ 拉起 serving。重建容器不会重复下载。
+
+### 4. 验证
+
+```bash
+# 健康探测（PHP 侧同款检查）
+docker compose -f docker-compose.nas.yml exec web curl -sf http://ocr:8080/openapi.json | head -c 100
+```
+
+返回 JSON 即 sidecar 存活；web 端在管理后台触发「重建索引」后，扫描件/图片应能搜到内容。若 ocr 容器不可用，web 自动回退 tesseract，不影响使用。
+
 ## 快速部署步骤
 
 ```bash
