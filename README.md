@@ -140,6 +140,63 @@
 
 ---
 
+## 🌐 自建 Cloudreve + Collabora 部署排障（同局域网场景）
+
+> 本节只记录**实测踩过的坑与判定方法**，不是 Cloudreve / Collabora 的安装教程。
+> 文中一律使用占位符，请替换为你自己的实际值：`<反代主机IP>` 指反向代理（Nginx Proxy Manager 等）所在的内网主机 IP，`<内网主机IP>` 指 Cloudreve / Collabora 各自所在部署机的内网 IP（与反代主机不一定是同一台），`<Cloudreve域名>` / `<分享域名>` / `<Collabora域名>` 指各自的公网域名，`:4344` / `:5212` / `:9980` 仅为示例端口。
+
+### 一、思源分享控制台配置
+
+1. **Cloudreve 连接的「站点地址」推荐填外网 `https://<Cloudreve域名>:4344`**，前提是插件容器**能解析并回流到该域名**（见第二类第 1 条）。改填内网地址（如 `http://<内网主机IP>:5212`）只有当「容器能直连该地址」**且**「Cloudreve 返回的直链主机同样容器可达」时才成立：Cloudreve 4.19.1 的直链按面板「主站点 URL」生成，未必等于这一项配置（见第二类第 4 条），所以内网地址不是稳妥选项；最稳的是容器可达的公网 https + `extra_hosts`。
+2. **Office / Collabora 应用地址必须使用 `https`**（Collabora 官方要求 `ssl.enable=true`）。填内网 `http://<内网主机IP>:9980` 会直接报「校验失败：无法访问 …/hosting/discovery」。内网 http 单轨不可用，对外分享与预览应统一走外网 https 单轨。
+3. **报错文案与真实原因往往不一一对应**，先按下面这张映射表判断，不要急着查端口：
+
+   | 控制台 / 页面表现 | 更常见的真实原因 |
+   | --- | --- |
+   | 「连接被拒绝（端口未监听或被防火墙拦截）」 | 容器到该域名不可达（多为回流失败），通常不是端口问题 |
+   | 分享页 `GET /s/<分享码>/netdisk/list` 返回 502 | web 容器取不到 Cloudreve API，同上 |
+   | 「未授权的WOPI主机」 | Collabora 容器回连不到 WOPI 主机，或 `aliasgroup1` 不匹配（见第二类第 2 条） |
+   | `Refused to frame … frame-ancestors …` | `aliasgroup1` 未包含实际访问分享页的 Origin（见第二类第 3 条） |
+
+### 二、三件套部署（Cloudreve / 思源分享 / Collabora 同局域网）
+
+1. **内网回流（hairpin NAT）是本场景的头号坑。**
+   - 现象：容器把公网域名解析成路由器的公网 IP，出站报文绕到公网口后回不到内网反代。表现为分享页取列表/取直链 502、Collabora discovery 直接被拒、WebSocket 握手中断。
+   - 解法：给**插件容器**和 **Collabora 容器**都加 `extra_hosts`，把这些公网域名钉回内网反代所在主机：
+
+     ```yaml
+     extra_hosts:
+       - "<Cloudreve域名>:<反代主机IP>"
+       - "<分享域名>:<反代主机IP>"
+       - "<Collabora域名>:<反代主机IP>"
+     ```
+
+   - 浏览器侧仍按公网域名访问，两者不冲突。
+   - ⚠️ 该配置属**部署层**，不进入仓库；插件不会对直链做落点改写（那会掩盖配置问题）。
+2. **Collabora 收到 WOPISrc 后会从容器内主动回连该主机**做 CheckFileInfo。缺 `extra_hosts` 时报「未授权的WOPI主机」——这个文案同时掩盖了「连不上」和「alias 不匹配」两种原因，别被字面误导。
+3. **`aliasgroup1` 必须包含实际访问分享页的 Origin（含端口）**，否则 iframe 被 CSP `frame-ancestors` 拒嵌，浏览器控制台报 `Refused to frame …`。
+4. **Cloudreve Pro 4.19.1 的直链主机由面板「主站点 URL」与直链缓存决定**，可能与插件里配置的站点地址不一致（实测：配置内网 `:5212`，返回外网 `:4344` 直链）。这属预期行为，不是插件 bug——插件只做诊断透传，不替换直链主机。
+5. **OCR sidecar 首次启动要 pip 装包并下载/转换模型（约 1–3 GB，10–30 分钟）**，日志前缀为 `[ocr-init]`，此时不是卡死。若日志出现 `paddlex` 的 `EOFError: EOF when reading a line`，说明初始化脚本在无 TTY 环境下触发了交互提示，请升级到已修复版本。
+6. **`php-site/config.php` 必须外部挂载**，镜像不会生成该文件；不挂载站点起不来。
+
+### 三、NPM / nginx 反代
+
+1. **反代 Collabora 的 scheme 必须选 `https`**（Collabora 侧为自签证书），并配 `proxy_ssl_verify off;`。用 `http` 会遇到 `Mixed Content` 与 `An insecure WebSocket connection may not be initiated from a page loaded over HTTPS`。
+2. **不要盲目给 Collabora 站点加 `location /cool/` 的 WebSocket 补丁。** 本项目实测：加上后会连带打断同域其它应用（如 Cloudreve）的外网预览，标准补法在本环境证伪。已确认可用的基线是「HTTP/2 开启 + Custom configuration 留空 + Custom Nginx Configuration 仅 `proxy_ssl_verify off;`」。
+3. **测 WebSocket 透传要用 `curl --http1.1`**：HTTP/2 不承载裸 `Upgrade` 握手，默认 curl 拿不到响应不代表反代有问题。
+
+   ```bash
+   curl -sk --http1.1 -o /dev/null -D - "https://<Collabora域名>:4344/cool/ws" \
+     -H "Connection: Upgrade" -H "Upgrade: websocket" \
+     -H "Sec-WebSocket-Version: 13" \
+     -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="
+   ```
+
+   返回任意状态行（101 最佳，400/404 也能说明 Upgrade 已透传）即表示握手到达了 Collabora；一个字都没返回才说明代理吃掉了握手。
+4. **排查阶段先关掉会改写响应的选项**（Cacheable Assets、压缩等），避免干扰定位。
+
+---
+
 ## 📖 功能演示（动图源自 GitHub，加载可能需“魔法”）
 
 ### ① 生成 API Key 并填入插件
