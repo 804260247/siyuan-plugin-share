@@ -19,8 +19,12 @@
 #                    high = 4 线程，吞吐优先
 #                  显式设置 OCR_THREADS 时以 OCR_THREADS 为准
 #   OCR_THREADS    推理线程数，默认按 OCR_PROFILE 取 2/4；0 = 引擎默认
-#   OCR_PIP_INDEX  可选 pip 国内镜像源，如：
-#                  https://pypi.tuna.tsinghua.edu.cn/simple
+#   OCR_PIP_INDEX  可选 pip 国内镜像源，必须是完整 URL（带 scheme 与 /simple/），如：
+#                  https://mirrors.aliyun.com/pypi/simple/
+#                  与 OCR_APT_MIRROR 写法不同（后者只写主机名）
+#   OCR_PIP_TIMEOUT pip 单次网络操作超时秒数，默认 120（pip 自带默认 15s，
+#                  官方 CDN 慢时容易 ReadTimeoutError，可再调大）
+#   OCR_PIP_RETRIES pip 网络重试次数，默认 5
 #   OCR_APT_MIRROR 可选 Debian apt 镜像主机名，如：mirrors.aliyun.com
 #                  官方源 deb.debian.org 在容器网络不可达时设置（留空 = 用镜像默认源）
 #
@@ -35,6 +39,8 @@ OCR_PORT="${OCR_PORT:-8080}"
 OCR_PROFILE="${OCR_PROFILE:-low}"
 OCR_THREADS="${OCR_THREADS:-}"
 OCR_PIP_INDEX="${OCR_PIP_INDEX:-}"
+OCR_PIP_TIMEOUT="${OCR_PIP_TIMEOUT:-120}"
+OCR_PIP_RETRIES="${OCR_PIP_RETRIES:-5}"
 OCR_APT_MIRROR="${OCR_APT_MIRROR:-}"
 export OCR_ENGINE OCR_DEVICE OCR_PORT OCR_PROFILE OCR_THREADS
 
@@ -51,9 +57,22 @@ if [ -z "$OCR_THREADS" ]; then
     export OCR_THREADS
 fi
 
-PIP_ARGS=()
+# ---- pip 源/超时/重试：统一用 PIP_* 环境变量导出，不走命令行参数 ----
+# 为什么不用 -i/--trusted-host 传参：paddlex --install serving 内部会自行调起
+# pip 子进程，子进程只继承环境变量、不接受我们拼在 paddlex 命令上的 pip 参数；
+# 统一走 PIP_* 后，直接 pip install 与 paddlex 间接调起的 pip 共用同一份源配置。
+export PIP_DEFAULT_TIMEOUT="$OCR_PIP_TIMEOUT"
+export PIP_RETRIES="$OCR_PIP_RETRIES"
+export PIP_DISABLE_PIP_VERSION_CHECK=1
+# 持久 pip 缓存：放在 PADDLEX_HOME（compose 挂载卷）内，docker compose up -d
+# --build 重建容器后已下载的 wheel 直接命中本地缓存，不再重下
+# （paddlepaddle 单包 192 MB，官方 CDN 慢时每次重建都从头下载）。
+export PIP_CACHE_DIR="$PADDLEX_HOME/pip-cache"
+mkdir -p "$PIP_CACHE_DIR"
 if [ -n "$OCR_PIP_INDEX" ]; then
-    PIP_ARGS+=(-i "$OCR_PIP_INDEX" --trusted-host "$(echo "$OCR_PIP_INDEX" | awk -F/ '{print $3}')")
+    export PIP_INDEX_URL="$OCR_PIP_INDEX"
+    export PIP_TRUSTED_HOST="$(echo "$OCR_PIP_INDEX" | awk -F/ '{print $3}')"
+    echo "[ocr-init] pip index -> ${PIP_INDEX_URL} (trusted-host ${PIP_TRUSTED_HOST})"
 fi
 
 echo "[ocr-init] engine=${OCR_ENGINE} device=${OCR_DEVICE} port=${OCR_PORT} profile=${OCR_PROFILE} threads=${OCR_THREADS}"
@@ -132,8 +151,9 @@ fi
 #   顺序：先 pip 装产线 extras，再 paddlex --install serving（后者只补 uvicorn/
 #   fastapi 等服务层包，不提供产线依赖）。
 # </dev/null：sidecar 无 TTY/无 stdin，任何工具意外读交互输入时立即 EOF 而非挂起
-python3 -m pip install --no-cache-dir "${PIP_ARGS[@]}" \
-    paddlepaddle==3.0.0 "paddlex[ocr]==3.0.3" paddle2onnx onnxruntime </dev/null
+python3 -m pip install \
+    paddlepaddle==3.0.0 "paddlex[ocr]==3.0.3" paddle2onnx onnxruntime </dev/null \
+    || { echo "[ocr-init] FATAL: pip install failed (slow or unreachable index? set OCR_PIP_INDEX to a domestic mirror)"; exit 1; }
 
 # ---- fail-fast 预检：确认 cv2 native 库就位 ----
 # 缺系统库时让日志一句话讲清根因，而不是 exec 阶段甩 40 行 traceback。
@@ -144,7 +164,8 @@ python3 -c 'import cv2' </dev/null 2>/dev/null \
 echo "[ocr-init] cv2 import ok"
 
 # serving 插件（uvicorn/fastapi 等，提供 /ocr、/openapi.json HTTP 服务）
-paddlex --install serving "${PIP_ARGS[@]}" </dev/null
+paddlex --install serving </dev/null \
+    || { echo "[ocr-init] FATAL: paddlex --install serving failed (slow or unreachable index? set OCR_PIP_INDEX to a domestic mirror)"; exit 1; }
 
 # ---- 导出 OCR 产线默认配置并注入引擎/资源参数 ----
 # 必须带 --save_path：PaddleX 3.0.3 在 save_path 缺省时会 input() 要求手输保存

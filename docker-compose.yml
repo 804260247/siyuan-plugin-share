@@ -61,8 +61,12 @@ services:
       - OCR_PROFILE=${OCR_PROFILE:-low}
       # 推理线程数：留空按 profile 取 2/4；显式设置则优先生效；0=引擎默认
       - OCR_THREADS=${OCR_THREADS:-}
-      # 可选：pip 国内镜像源（加速首次安装），如 https://pypi.tuna.tsinghua.edu.cn/simple
+      # 可选：pip 国内镜像源（加速首次安装/避开官方 CDN 慢速），完整 URL 带 scheme 与 /simple/，
+      # 如 https://mirrors.aliyun.com/pypi/simple/
       - OCR_PIP_INDEX=${OCR_PIP_INDEX:-}
+      # pip 网络超时秒数与重试次数（官方 CDN 慢导致 ReadTimeoutError 时可调大）
+      - OCR_PIP_TIMEOUT=${OCR_PIP_TIMEOUT:-120}
+      - OCR_PIP_RETRIES=${OCR_PIP_RETRIES:-5}
       # 可选：Debian apt 镜像主机名（官方源不可达时设置），如 mirrors.aliyun.com
       - OCR_APT_MIRROR=${OCR_APT_MIRROR:-}
     # ---- 资源限制（低配 NAS 默认值；建议按机器调整）----
