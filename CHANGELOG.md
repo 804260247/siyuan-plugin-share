@@ -52,6 +52,7 @@
 - [x] php-fpm 错误可见性加固：`display_errors=Off`、`log_errors=On`，配合 `catch_workers_output=yes` 导入 supervisor 日志，生产页面不再泄露堆栈与绝对路径
 - [x] 「网盘标签为何没出现」可诊断：控制台「分享绑定」表格新增「网盘标签」列，按与分享页完全同口径的 `netdisk_tab_state()` 输出「可显示 / 不可显示：原因」（未开启、无可用连接、绑定连接停用/缺少地址或邮箱、连接不存在、单文档分享页等原因逐项区分），不再需要打开分享页猜
 - [x] 修 OCR sidecar 启动时 paddlex CLI 交互提示导致容器崩溃：`deploy/ocr/init.sh` 的 `paddlex --get_pipeline_config OCR` 缺 `--save_path` 参数，PaddleX 3.0.3 会 `input()` 要求手输保存路径，而 sidecar 无 TTY/无 stdin，直接 `EOFError: EOF when reading a line` 退出；补齐 `--save_path "$PADDLEX_HOME"` 并加「OCR.yaml 已存在则跳过导出」的幂等保护（否则重启时它还会 `input()` 问「Is it covered? (y/N)」同样 EOF 崩）；pip install / `--install serving` 等全部命令统一 `</dev/null` 兜底，杜绝任何残留交互点在无 stdin 环境挂起
+- [x] 补装 `paddlex[ocr]` 产线依赖，修 OCR sidecar 启动时 `RuntimeError: OCR requires additional dependencies`：`init.sh` 原来只装 `paddlex==3.0.3` 基础包 + `--install serving`（仅补 uvicorn/fastapi 等服务层包），未装 OCR 产线自身的 pip extras；PaddleX 在 `create_pipeline("OCR")` 时经 `require_extra` 校验该依赖组，缺失即抛 RuntimeError。改为 `"paddlex[ocr]==3.0.3"`（extra 名经 PyPI 3.0.3 元数据核实），顺序保持「先 pip 装 extras、再 `--install serving`」
 
 ### 部署
 

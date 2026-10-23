@@ -57,9 +57,16 @@ echo "[ocr-init] engine=${OCR_ENGINE} device=${OCR_DEVICE} port=${OCR_PORT} prof
 
 # ---- 依赖安装（容器重建后若已安装则 pip 秒过）----
 # paddlepaddle 提供官方模型格式支持；onnxruntime 引擎首次运行需 paddle2onnx 做格式转换
+# paddlex[ocr]：OCR 产线自身依赖组（opencv-contrib/pypdfium2/pyclipper/shapely/
+#   scikit-learn 等）。create_pipeline("OCR") 时 PaddleX 经 require_extra 校验该
+#   extra，缺失即抛 RuntimeError: OCR requires additional dependencies（用户 NAS
+#   实测）。extra 名 "ocr" 已按 PyPI paddlex 3.0.3 元数据核实（requires_dist 中
+#   15 条 extra == "ocr"）。[] 必须加引号，否则 bash/zsh 会当 glob 展开。
+#   顺序：先 pip 装产线 extras，再 paddlex --install serving（后者只补 uvicorn/
+#   fastapi 等服务层包，不提供产线依赖）。
 # </dev/null：sidecar 无 TTY/无 stdin，任何工具意外读交互输入时立即 EOF 而非挂起
 python3 -m pip install --no-cache-dir "${PIP_ARGS[@]}" \
-    paddlepaddle==3.0.0 paddlex==3.0.3 paddle2onnx onnxruntime </dev/null
+    paddlepaddle==3.0.0 "paddlex[ocr]==3.0.3" paddle2onnx onnxruntime </dev/null
 
 # serving 插件（uvicorn/fastapi 等，提供 /ocr、/openapi.json HTTP 服务）
 paddlex --install serving "${PIP_ARGS[@]}" </dev/null
