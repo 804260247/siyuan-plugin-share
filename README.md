@@ -177,7 +177,8 @@
 3. **`aliasgroup1` 必须包含实际访问分享页的 Origin（含端口）**，否则 iframe 被 CSP `frame-ancestors` 拒嵌，浏览器控制台报 `Refused to frame …`。
 4. **Cloudreve Pro 4.19.1 的直链主机由面板「主站点 URL」与直链缓存决定**，可能与插件里配置的站点地址不一致（实测：配置内网 `:5212`，返回外网 `:4344` 直链）。这属预期行为，不是插件 bug——插件只做诊断透传，不替换直链主机。
 5. **OCR sidecar 首次启动要 pip 装包并下载/转换模型（约 1–3 GB，10–30 分钟）**，日志前缀为 `[ocr-init]`，此时不是卡死。若日志出现 `paddlex` 的 `EOFError: EOF when reading a line`，说明初始化脚本在无 TTY 环境下触发了交互提示，请升级到已修复版本。
-6. **`php-site/config.php` 必须外部挂载**，镜像不会生成该文件；不挂载站点起不来。
+6. **OCR sidecar 装系统库时若 `apt-get update` 超时**（日志大量 `Err: Unable to connect to deb.debian.org`，末行 `[ocr-init] FATAL: apt-get update failed`），说明容器到 Debian 官方源 80 端口不通（pip 走 443 通常仍可达）。给 `ocr` 服务设置环境变量 `OCR_APT_MIRROR` 指向一个容器可达的镜像主机名（如 `mirrors.aliyun.com`；连通性可用 `docker run --rm python:3.11-slim bash -c 'timeout 5 bash -c "</dev/tcp/<镜像主机>/80" && echo OK'` 探测，5 秒内打出 OK 即可达），脚本会自动把 `deb.debian.org` / `security.debian.org` 替换为该镜像，且 `apt-get update` 单独判错快速失败，不再刷两百行超时日志。
+7. **`php-site/config.php` 必须外部挂载**，镜像不会生成该文件；不挂载站点起不来。
 
 ### 三、NPM / nginx 反代
 

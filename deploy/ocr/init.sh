@@ -21,6 +21,8 @@
 #   OCR_THREADS    推理线程数，默认按 OCR_PROFILE 取 2/4；0 = 引擎默认
 #   OCR_PIP_INDEX  可选 pip 国内镜像源，如：
 #                  https://pypi.tuna.tsinghua.edu.cn/simple
+#   OCR_APT_MIRROR 可选 Debian apt 镜像主机名，如：mirrors.aliyun.com
+#                  官方源 deb.debian.org 在容器网络不可达时设置（留空 = 用镜像默认源）
 #
 # 模型缓存：/root/.paddlex（compose 里挂 ./ocr/models:/root/.paddlex 持久化，
 #           重建容器不重复下载/转换模型）
@@ -33,6 +35,7 @@ OCR_PORT="${OCR_PORT:-8080}"
 OCR_PROFILE="${OCR_PROFILE:-low}"
 OCR_THREADS="${OCR_THREADS:-}"
 OCR_PIP_INDEX="${OCR_PIP_INDEX:-}"
+OCR_APT_MIRROR="${OCR_APT_MIRROR:-}"
 export OCR_ENGINE OCR_DEVICE OCR_PORT OCR_PROFILE OCR_THREADS
 
 # 模型/配置缓存目录（与 compose 卷挂载点对应）
@@ -60,20 +63,61 @@ echo "[ocr-init] engine=${OCR_ENGINE} device=${OCR_DEVICE} port=${OCR_PORT} prof
 # 模块 cv2 加载时需要 libGL.so.1 与 glib；python:3.11-slim 基础镜像默认没有，
 # 缺失时 import cv2 直接崩：ImportError: libGL.so.1: cannot open shared object
 # file（用户 NAS 实测，栈在 paddlex/modules/.../visualizer.py import cv2）。
-# libglib2.0-0 在 trixie 因 64-bit time_t 迁移改名 libglib2.0-0t64，用 || 回退。
-# libgomp1 是 onnxruntime CPU EP 的运行时依赖，slim 不保证自带，装了无害。
-# 幂等守卫：libGL.so.1 已存在则不再走 apt（重启不重复耗 apt update 索引时间）。
+# libgl1 会连带整套 mesa 依赖（约 38 包 / 48 MB），这是 libGL.so.1 的最小依赖
+# 闭包，省不掉；--no-install-recommends 已经只装必需项，不要试图换小包顶替。
+# 幂等守卫：libGL.so.1 已存在则整个 apt 段（含 update）全部跳过。
 if [ ! -e /usr/lib/x86_64-linux-gnu/libGL.so.1 ]; then
-    echo "[ocr-init] installing system libs (libgl1/libglib2.0-0/libgomp1) ..."
-    apt-get update -qq </dev/null \
-        || { echo "[ocr-init] FATAL: apt-get update failed"; exit 1; }
-    apt-get install -y --no-install-recommends libgl1 </dev/null \
-        || { echo "[ocr-init] FATAL: apt-get install libgl1 failed"; exit 1; }
-    apt-get install -y --no-install-recommends libglib2.0-0 </dev/null \
-        || apt-get install -y --no-install-recommends libglib2.0-0t64 </dev/null \
-        || { echo "[ocr-init] FATAL: apt-get install libglib2.0-0(-t64) failed"; exit 1; }
-    apt-get install -y --no-install-recommends libgomp1 </dev/null \
-        || { echo "[ocr-init] FATAL: apt-get install libgomp1 failed"; exit 1; }
+    echo "[ocr-init] installing system libs (libgl1/glib/libgomp1) ..."
+
+    # apt 源可配：官方源 deb.debian.org:80 在部分网络不可达（用户 NAS 实测
+    # pip 通、apt 全部 connection timed out）。OCR_APT_MIRROR 填镜像主机名
+    # （如 mirrors.aliyun.com），替换 deb.debian.org / security.debian.org。
+    # aliyun/tuna 的 debian 与 debian-security 路径都在镜像根下，只换主机名、
+    # 保留原 scheme 与路径即可。trixie 用 deb822 格式的
+    # /etc/apt/sources.list.d/debian.sources，旧版用 /etc/apt/sources.list，
+    # 两者都存在则都改；重写前备份为 <原文件>.bak-ocr。
+    if [ -n "$OCR_APT_MIRROR" ]; then
+        mirror_host="${OCR_APT_MIRROR#http://}"
+        mirror_host="${mirror_host#https://}"
+        mirror_host="${mirror_host%%/*}"
+        echo "[ocr-init] apt mirror -> ${mirror_host}"
+        for src_file in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; do
+            [ -f "$src_file" ] || continue
+            cp "$src_file" "${src_file}.bak-ocr"
+            # </dev/null 统一兜底：全脚本任何外部命令都不允许挂起等 stdin
+            sed -i -e "s|deb\.debian\.org|${mirror_host}|g" \
+                   -e "s|security\.debian\.org|${mirror_host}|g" "$src_file" </dev/null
+        done
+    fi
+
+    # 超时/重试：源不可达时 apt 默认每条连接干等约 2 分钟、日志刷两百多行，
+    # 收紧为单连接 15s、重试 3 次，快速失败快速报因
+    APT_OPTS=(-o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 -o Acquire::Retries=3)
+
+    # update 单独判 rc：源不可达时在这里就报根因并提示 OCR_APT_MIRROR，
+    # 不留到 install 阶段被几百行 Ign/Err 掩盖（用户 NAS 实测教训）
+    apt-get update -qq "${APT_OPTS[@]}" </dev/null \
+        || { echo "[ocr-init] FATAL: apt-get update failed (mirror unreachable? set OCR_APT_MIRROR)"; exit 1; }
+
+    # glib 包名自适应：trixie 因 64-bit time_t 迁移把 libglib2.0-0 改名
+    # libglib2.0-0t64。apt-cache policy 对未知包也返回 rc=0（Candidate: (none)），
+    # 故按 Candidate 行判定，取第一个有真实候选的包名，一条 install 装齐，
+    # 不再"先装旧名失败再回退新名"多跑一轮；两者都无候选时按当前基础镜像
+    # （trixie）取 t64。
+    GLIB_PKG=""
+    for cand in libglib2.0-0 libglib2.0-0t64; do
+        if apt-cache policy "$cand" </dev/null 2>/dev/null | grep -qE '^[[:space:]]*Candidate:[[:space:]]+[^[:space:](]'; then
+            GLIB_PKG="$cand"
+            break
+        fi
+    done
+    [ -n "$GLIB_PKG" ] || GLIB_PKG=libglib2.0-0t64
+    echo "[ocr-init] glib package resolved: ${GLIB_PKG}"
+
+    # libgomp1 是 onnxruntime CPU EP 的运行时依赖，slim 不保证自带，装了无害
+    apt-get install -y --no-install-recommends "${APT_OPTS[@]}" \
+        libgl1 "$GLIB_PKG" libgomp1 </dev/null \
+        || { echo "[ocr-init] FATAL: apt-get install libgl1/${GLIB_PKG}/libgomp1 failed"; exit 1; }
 else
     echo "[ocr-init] system libs already present, skip apt (idempotent)"
 fi

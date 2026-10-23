@@ -63,6 +63,8 @@ services:
       - OCR_THREADS=${OCR_THREADS:-}
       # 可选：pip 国内镜像源（加速首次安装），如 https://pypi.tuna.tsinghua.edu.cn/simple
       - OCR_PIP_INDEX=${OCR_PIP_INDEX:-}
+      # 可选：Debian apt 镜像主机名（官方源不可达时设置），如 mirrors.aliyun.com
+      - OCR_APT_MIRROR=${OCR_APT_MIRROR:-}
     # ---- 资源限制（低配 NAS 默认值；建议按机器调整）----
     # 建议档位：
     #   2GB 内存机器   : OCR_PROFILE=low , OCR_MEM_LIMIT=1500m, OCR_MEM_RESERVATION=768m, OCR_CPUS=1.0
