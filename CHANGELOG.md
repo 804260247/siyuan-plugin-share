@@ -51,6 +51,7 @@
 - [x] 网盘代理拉取诊断增强（重定向链透传）：`netdisk_proxy_fetch()` 改为 curl 实现，失败时错误 msg 拼出**完整脱敏重定向链**（每一跳剥 query 防签名 token 泄露），Cloudreve 拉文件 302 到容器内不可达的站点地址时能一眼看出被拒的是哪一跳；失败跳主机 ≠ 配置地址主机时追加「请检查 Cloudreve 站点 URL / 存储节点直链配置」提示；重定向协议白名单仅 http/https（防 `file://` 等落点穿越）；「自签证书降级重试仍失败」后缀仅在确属证书类失败时出现，明文端口误配 https 时改为准确报「TLS 握手失败：目标端口可能并不是 HTTPS 服务」；五分类口径、https 降级重试只关证书校验不改协议、thumb 20s / content 30s 均不变（注：curl 的超时为整次请求含重定向链的总时长上限）
 - [x] php-fpm 错误可见性加固：`display_errors=Off`、`log_errors=On`，配合 `catch_workers_output=yes` 导入 supervisor 日志，生产页面不再泄露堆栈与绝对路径
 - [x] 「网盘标签为何没出现」可诊断：控制台「分享绑定」表格新增「网盘标签」列，按与分享页完全同口径的 `netdisk_tab_state()` 输出「可显示 / 不可显示：原因」（未开启、无可用连接、绑定连接停用/缺少地址或邮箱、连接不存在、单文档分享页等原因逐项区分），不再需要打开分享页猜
+- [x] 修 OCR sidecar 启动时 paddlex CLI 交互提示导致容器崩溃：`deploy/ocr/init.sh` 的 `paddlex --get_pipeline_config OCR` 缺 `--save_path` 参数，PaddleX 3.0.3 会 `input()` 要求手输保存路径，而 sidecar 无 TTY/无 stdin，直接 `EOFError: EOF when reading a line` 退出；补齐 `--save_path "$PADDLEX_HOME"` 并加「OCR.yaml 已存在则跳过导出」的幂等保护（否则重启时它还会 `input()` 问「Is it covered? (y/N)」同样 EOF 崩）；pip install / `--install serving` 等全部命令统一 `</dev/null` 兜底，杜绝任何残留交互点在无 stdin 环境挂起
 
 ### 部署
 

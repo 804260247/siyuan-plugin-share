@@ -57,15 +57,24 @@ echo "[ocr-init] engine=${OCR_ENGINE} device=${OCR_DEVICE} port=${OCR_PORT} prof
 
 # ---- 依赖安装（容器重建后若已安装则 pip 秒过）----
 # paddlepaddle 提供官方模型格式支持；onnxruntime 引擎首次运行需 paddle2onnx 做格式转换
+# </dev/null：sidecar 无 TTY/无 stdin，任何工具意外读交互输入时立即 EOF 而非挂起
 python3 -m pip install --no-cache-dir "${PIP_ARGS[@]}" \
-    paddlepaddle==3.0.0 paddlex==3.0.3 paddle2onnx onnxruntime
+    paddlepaddle==3.0.0 paddlex==3.0.3 paddle2onnx onnxruntime </dev/null
 
 # serving 插件（uvicorn/fastapi 等，提供 /ocr、/openapi.json HTTP 服务）
-paddlex --install serving "${PIP_ARGS[@]}"
+paddlex --install serving "${PIP_ARGS[@]}" </dev/null
 
 # ---- 导出 OCR 产线默认配置并注入引擎/资源参数 ----
+# 必须带 --save_path：PaddleX 3.0.3 在 save_path 缺省时会 input() 要求手输保存
+# 路径（interactive_get_pipeline），无 stdin 的 sidecar 里直接 EOFError 崩溃；
+# 目标文件已存在时它还会再 input() 问「Is it covered? (y/N)」，同样 EOF 崩，
+# 故用「已存在则跳过」保证重启幂等（下游 python3 -c 读取的正是此路径）
 cd "$PADDLEX_HOME"
-paddlex --get_pipeline_config OCR
+if [ ! -f "$PADDLEX_HOME/OCR.yaml" ]; then
+    paddlex --get_pipeline_config OCR --save_path "$PADDLEX_HOME" </dev/null
+else
+    echo "[ocr-init] OCR.yaml already present, skip export (idempotent)"
+fi
 
 # 按环境变量生成引擎配置 JSON（onnxruntime/paddle 两种后端的字段名不同）
 ENGINE_JSON=$(python3 -c '
