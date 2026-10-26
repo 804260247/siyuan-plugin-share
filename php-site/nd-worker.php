@@ -67,7 +67,7 @@ while (true) {
                 WHERE status="failed" AND error="下载失败" AND attempts<3')->execute();
         } catch (Throwable $e) {}
 
-        $stmt = db()->query('SELECT id, share_id FROM netdisk_index_jobs WHERE status = "pending" ORDER BY id ASC LIMIT 1');
+        $stmt = db()->query('SELECT id, share_id, force_ocr FROM netdisk_index_jobs WHERE status = "pending" ORDER BY id ASC LIMIT 1');
         $job = $stmt->fetch(PDO::FETCH_ASSOC);
         $stmt->closeCursor(); // 释放 db() 连接的活动语句，避免后续 job_update 同连接 bad parameter
 
@@ -95,7 +95,8 @@ while (true) {
 
         $jobId = (int)$job['id'];
         $shareId = (int)$job['share_id'];
-        nd_worker_log("start job=$jobId share=$shareId");
+        $forceOcr = (int)($job['force_ocr'] ?? 0) === 1; // 0018: 强制重跑 OCR（重建入口勾选）
+        nd_worker_log("start job=$jobId share=$shareId" . ($forceOcr ? " force_ocr=1" : ""));
 
         // 抢占（幂等：仅当仍为 pending 时置 running）
         $up = db()->prepare('UPDATE netdisk_index_jobs SET status="running", started_at=:t WHERE id=:id AND status="pending"');
@@ -123,7 +124,7 @@ while (true) {
         $root = netdisk_normalize_root($base['root']);
         $allowOcr = netdisk_index_ocr_enabled((int)($base['config_id'] ?? 0));
 
-        $res = netdisk_build_index_share($shareRow, $base, $root, $allowOcr, $jobId);
+        $res = netdisk_build_index_share($shareRow, $base, $root, $allowOcr, $jobId, $forceOcr);
         nd_worker_log("done job=$jobId files=" . $res['files'] . " folders=" . $res['folders']
             . " texts=" . $res['texts'] . " errors=" . $res['errors'] . " skipped=" . $res['skipped']
             . " ocrDone=" . $res['ocr_done'] . " ocrQueued=" . $res['ocr_queued']);

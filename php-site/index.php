@@ -652,6 +652,7 @@ function migrate(PDO $pdo): void {
         'ocr_files_total' => 'INTEGER NOT NULL DEFAULT 0',
         'ocr_files_done' => 'INTEGER NOT NULL DEFAULT 0',
         'heartbeat_at' => 'INTEGER NOT NULL DEFAULT 0',
+        'force_ocr' => 'INTEGER NOT NULL DEFAULT 0',
     ];
     foreach ($extraJobCols as $col => $def) {
         if (!in_array($col, $jobColNames, true)) {
@@ -682,6 +683,39 @@ function migrate(PDO $pdo): void {
     if (!in_array('config_id', array_column($ocrQCols, 'name'), true)) {
         $pdo->exec('ALTER TABLE netdisk_ocr_queue ADD COLUMN config_id INTEGER NOT NULL DEFAULT 0');
         $pdo->exec('UPDATE netdisk_ocr_queue SET config_id = (SELECT netdisk_config_id FROM shares WHERE shares.id = netdisk_ocr_queue.share_id) WHERE config_id = 0');
+    }
+
+    // OCR 文件级状态表（增量索引）：记录每个 OCR 候选文件的最近一次识别结果，
+    // 重建时据此跳过已达标文件（status=done 且 quality>=0.6 且 chars>=20 且云端未更新），
+    // 失败/无效文件 attempts>=3 后不再重试；强制重跑（force_ocr=1）忽略全部跳过判定。
+    $pdo->exec('CREATE TABLE IF NOT EXISTS netdisk_ocr_files (
+        share_id INTEGER NOT NULL,
+        uri TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT "",
+        size INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT "pending",
+        quality REAL NOT NULL DEFAULT 0,
+        chars INTEGER NOT NULL DEFAULT 0,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT "",
+        dpi INTEGER NOT NULL DEFAULT 0,
+        pages_total INTEGER NOT NULL DEFAULT 0,
+        pages_done INTEGER NOT NULL DEFAULT 0,
+        engine TEXT NOT NULL DEFAULT "",
+        elapsed_ms INTEGER NOT NULL DEFAULT 0,
+        pages_per_min REAL NOT NULL DEFAULT 0,
+        first_at INTEGER NOT NULL DEFAULT 0,
+        finished_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (share_id, uri)
+    );');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ocr_files_status ON netdisk_ocr_files(share_id, status)');
+    // 0018: 旧库补列（CREATE IF NOT EXISTS 不给已存在表加列）
+    $ocrFCols = array_column($pdo->query('PRAGMA table_info(netdisk_ocr_files)')->fetchAll(PDO::FETCH_ASSOC), 'name');
+    if (!in_array('elapsed_ms', $ocrFCols, true)) {
+        $pdo->exec('ALTER TABLE netdisk_ocr_files ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!in_array('pages_per_min', $ocrFCols, true)) {
+        $pdo->exec('ALTER TABLE netdisk_ocr_files ADD COLUMN pages_per_min REAL NOT NULL DEFAULT 0');
     }
 
     // 迁移旧版每配置的 office 引擎地址到全局 office_apps（去重）
@@ -3980,7 +4014,11 @@ function netdisk_ocr_finalize_results(array $jobs, array $results): array {
     $tess = trim((string)shell_exec('command -v tesseract 2>/dev/null'));
     $ppm = trim((string)shell_exec('command -v pdftoppm 2>/dev/null'));
     $final = [];
+    // 0018: 逐文件耗时经 GLOBALS 透出（uri => ms），供状态表 elapsed_ms/pages_per_min 落库（0021 自动定档样本）。
+    // 不改函数签名：调用方读 $GLOBALS['ND_OCR_FINALIZE_TIMINGS']，缺失时退回池累计计时。
+    $GLOBALS['ND_OCR_FINALIZE_TIMINGS'] = [];
     foreach ($jobs as $j) {
+        $fT0 = microtime(true);
         $uri = (string)($j['uri'] ?? '');
         $tmp = (string)($j['tmp'] ?? '');
         $ext = strtolower(ltrim((string)($j['ext'] ?? ''), '.'));
@@ -4098,6 +4136,7 @@ function netdisk_ocr_finalize_results(array $jobs, array $results): array {
         if ($tmp !== '' && is_file($tmp)) {
             @unlink($tmp);
         }
+        $GLOBALS['ND_OCR_FINALIZE_TIMINGS'][$uri] = (int)round((microtime(true) - $fT0) * 1000);
     }
     return $final;
 }
@@ -4226,17 +4265,21 @@ function netdisk_index_skip_exts(?int $configId = 0): array {
 }
 
 // 创建/追加一个后台重建 job。若该分享已有 running 或 pending 任务则复用返回其 id。
-function netdisk_index_job_create(int $shareId): int {
+function netdisk_index_job_create(int $shareId, bool $forceOcr = false): int {
     $pdo = db();
     $ex = $pdo->prepare('SELECT id FROM netdisk_index_jobs WHERE share_id=:s AND status IN ("pending","running") ORDER BY id DESC LIMIT 1');
     $ex->execute([':s' => $shareId]);
     $existing = (int)($ex->fetchColumn() ?: 0);
     $ex->closeCursor();
     if ($existing > 0) {
+        // 0018: 复用未开始/进行中的 job 时，本次请求带强制重跑则升级标记（worker 拾取时读取）
+        if ($forceOcr) {
+            $pdo->prepare('UPDATE netdisk_index_jobs SET force_ocr=1 WHERE id=:id AND status="pending"')->execute([':id' => $existing]);
+        }
         return $existing;
     }
-    $pdo->prepare('INSERT INTO netdisk_index_jobs (share_id, status, created_at) VALUES (:s, "pending", :t)')
-        ->execute([':s' => $shareId, ':t' => time()]);
+    $pdo->prepare('INSERT INTO netdisk_index_jobs (share_id, status, created_at, force_ocr) VALUES (:s, "pending", :t, :f)')
+        ->execute([':s' => $shareId, ':t' => time(), ':f' => $forceOcr ? 1 : 0]);
     return (int)$pdo->lastInsertId();
 }
 
@@ -4376,7 +4419,7 @@ function netdisk_scan_share_tree(array $cfg, string $root): array {
 // 重建/刷新某分享的网盘本地全文索引（增量：按 Cloudreve updated_at 跳过未变化文件，不重复下载）
 // 返回 ['files'=>int, 'folders'=>int, 'texts'=>int, 'errors'=>int, 'skipped'=>int, 'notes'=>string,
 //        'ocr_done'=>int, 'ocr_queued'=>int, 'ocr_oversize'=>int]
-function netdisk_build_index_share(array $share, array $cfg, string $root, bool $allowOcr, int $jobId = 0): array {
+function netdisk_build_index_share(array $share, array $cfg, string $root, bool $allowOcr, int $jobId = 0, bool $forceOcr = false): array {
     // 独立连接：避免与 db() 静态 PDO / web 端并发语句冲突（SQLite 同连接仅允许一个活动语句）
     $pdo = new PDO('sqlite:' . $GLOBALS['config']['db_path']);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -4407,14 +4450,21 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
             'current_detail' => '预扫描目录',
         ], $pdo);
     }
-    // 清除该分享的低优先级 OCR 队列（重建时重新生成）
-    netdisk_exec_retry(fn() => $pdo->prepare('DELETE FROM netdisk_ocr_queue WHERE share_id = :sid')->execute([':sid' => $shareId]));
+    // 0018: 不再整表清空低优先级 OCR 队列——改在遍历结束后仅清理 uri 已消失的行，
+    // 保留 pending/failed 任务可续跑，避免"改并发→重建→队列重排"导致已完成/排队任务重复下载。
     $ocrMaxBytes = $allowOcr ? (netdisk_index_ocr_max_mb($configId) * 1048576) : 0;
     $ocrLowBytes = $allowOcr ? (netdisk_index_ocr_low_max_mb($configId) * 1048576) : 0;
     $ocrTasks = [];       // 高优先级（≤max_mb）：重建时入池
     $ocrQueued = 0;       // 低优先级（>max_mb ≤low_max_mb）：入队空闲 OCR
     $ocrOversize = 0;     // >low_max_mb：跳过 OCR
     $ocrDone = 0;         // 高优先级池实际 OCR 完成的文件数
+    $ocrSkipInc = 0;      // 0018: 状态表达标、增量跳过的 OCR 文件数
+    $ocrGaveUp = 0;       // 0018: failed/invalid 且 attempts>=3、放弃重试的 OCR 文件数
+    $ocrBackfilled = 0;   // 0018: 旧索引 text 已达标、回填状态行的文件数
+    $ocrFailedNow = 0;    // 0018: 本轮 OCR 失败（结果为空）的文件数
+    $ocrStarvedMark = 0;  // 0018: 本轮新入低优队列、状态标记 starved 的文件数
+    $ocrSkipQueued = 0;   // 0018 必改: 已在低优队列（pending/running）且 updated_at 未变、按增量跳过的文件数（不再重复下载）
+    $ocrQueueDup = 0;     // 0018 必改: 队列已有 pending/running 行时抑制的重复入队次数
     $insQueue = $pdo->prepare('INSERT INTO netdisk_ocr_queue (share_id, config_id, uri, name, ext, size, status, created_at)
         VALUES (:s, :c, :u, :n, :e, :z, "pending", :t)');
 
@@ -4430,6 +4480,36 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
         ];
     }
     $seenUris = [];
+
+    // 0018: 载入 OCR 文件级状态（uri => 行），增量判定与 attempts 计数依据
+    $ocrState = [];
+    $selOcr = $pdo->prepare('SELECT uri, updated_at, status, quality, chars, attempts, first_at, elapsed_ms, pages_per_min FROM netdisk_ocr_files WHERE share_id = :s');
+    $selOcr->execute([':s' => $shareId]);
+    foreach ($selOcr->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $ocrState[(string)$row['uri']] = $row;
+    }
+    $selOcr->closeCursor();
+    // 0018 必改: 载入「已排队」集合——队列中 pending/running 行的 uri；
+    // updated_at 未变时按增量跳过（$isUnchanged=true、复用旧正文、不下载），
+    // 避免大文件每轮重建都完整重新下载再排队。
+    $ocrQueueMap = [];
+    try {
+        $selQm = $pdo->prepare('SELECT uri FROM netdisk_ocr_queue WHERE share_id = :s AND status IN ("pending","running")');
+        $selQm->execute([':s' => $shareId]);
+        foreach ($selQm->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $ocrQueueMap[(string)$row['uri']] = true;
+        }
+        $selQm->closeCursor();
+    } catch (Throwable $ign) {
+        // 队列映射读取失败不影响本轮索引（退化为原下载路径）
+    }
+    // 状态行 upsert：冲突时保留 first_at，其余字段覆盖为本轮结果
+    $upOcrFile = $pdo->prepare('INSERT INTO netdisk_ocr_files (share_id, uri, updated_at, size, status, quality, chars, attempts, last_error, dpi, pages_total, pages_done, engine, elapsed_ms, pages_per_min, first_at, finished_at)
+        VALUES (:sid, :uri, :u, :z, :st, :q, :c, :a, :e, :dpi, :pt, :pd, :eng, :ems, :ppm, :first, :t)
+        ON CONFLICT(share_id, uri) DO UPDATE SET updated_at=excluded.updated_at, size=excluded.size, status=excluded.status,
+            quality=excluded.quality, chars=excluded.chars, attempts=excluded.attempts, last_error=excluded.last_error,
+            dpi=excluded.dpi, pages_total=excluded.pages_total, pages_done=excluded.pages_done, engine=excluded.engine,
+            elapsed_ms=excluded.elapsed_ms, pages_per_min=excluded.pages_per_min, finished_at=excluded.finished_at');
 
     $ins = $pdo->prepare('INSERT INTO netdisk_index (share_id, uri, name, is_folder, ext, size, parent_path, text, indexed_at, updated_at)
         VALUES (:sid, :uri, :name, :isf, :ext, :size, :parent, :text, :t, :u)
@@ -4475,26 +4555,82 @@ $text = '';
                 $isSkipExt = !$isFolder && isset($skipExts[$ext]);
 
                 // 增量判定：已索引且 uri/更新标记一致 → 复用旧正文，不下载。
-                // 但正文为空（上次 OCR 未完成/失败）的文件不跳过，本次重试；
-                // OCR 候选文件中正文含"汉字+空格+汉字"（旧版未规范化）的也重跑，修复匹配。
+                // 但正文为空（上次 OCR 未完成/失败）的文件不跳过，本次重试。
                 $prev = $existing[$navigateUri] ?? null;
-                // OCR 候选（PDF/图片）始终重扫：文本质量无法可靠判定（错别字仍是 CJK，quality 误判达标，
-                // 且旧版本低 DPI 建的 text 无汉字空格也不会触发 needs_reocr），只有实际重新 OCR 才能保证正确检索。
-                $isOcrCandidate = !$isFolder && !is_null($prev)
-                    && !isset($skipExts[$ext])
-                    && netdisk_is_ocr_candidate($ext)
-                    && !netdisk_ocr_index_quality_ok((string)($prev['text'] ?? ''));
+                // 0018: OCR 候选不再"始终重扫"，改按 netdisk_ocr_files 状态表增量判定：
+                //  - status=done 且 quality>=0.6、chars>=20、updated_at 与云端一致 → 跳过（计入增量）；
+                //  - status IN (failed,invalid) 且 attempts>=3 → 跳过（不再无限重试坏文件）；
+                //  - 无状态行但旧 netdisk_index.text 已达标且 updated_at 一致 → 回填 done 行，不送 OCR（老索引平滑升级）；
+                //  - 已在低优队列（pending/running）且 updated_at 未变（无状态行或状态为 starved）→ 按增量跳过，不再重复下载；
+                //  - 其余（无记录 / updated_at 变化 / 质量不达标且未达重试上限）→ 照旧下载、入池。
+                // force_ocr=1（强制重跑）忽略上述全部跳过判定。netdisk_ocr_index_quality_ok() 仍作达标门槛。
+                $isOcrCandFile = !$isFolder && !$isSkipExt && netdisk_is_ocr_candidate($ext);
+                $ocrSkipDone = false;
+                $ocrSkipGaveUp = false;
+                $ocrBackfillRow = false;
+                $ocrSkipQueuedRow = false;
+                if ($isOcrCandFile && !$forceOcr) {
+                    $st = $ocrState[$navigateUri] ?? null;
+                    if ($st !== null) {
+                        $stUpdatedOk = ((string)$st['updated_at'] === $cloudUpdatedAt)
+                            || ((string)$st['updated_at'] === '' && $prev !== null && (string)$prev['updated_at'] === $cloudUpdatedAt);
+                        if ((string)$st['status'] === 'done' && (float)$st['quality'] >= 0.6 && (int)$st['chars'] >= 20 && $stUpdatedOk) {
+                            $ocrSkipDone = true;
+                        } elseif (in_array((string)$st['status'], ['failed', 'invalid'], true) && (int)$st['attempts'] >= 3) {
+                            $ocrSkipGaveUp = true;
+                        }
+                    } elseif ($prev !== null && (string)$prev['updated_at'] !== '' && (string)$prev['updated_at'] === $cloudUpdatedAt
+                        && netdisk_ocr_index_quality_ok((string)($prev['text'] ?? ''))) {
+                        $ocrBackfillRow = true;
+                    }
+                    // 0018 必改: 已排队（pending/running）且 updated_at 未变 → 按增量跳过，不再重复下载。
+                    // 仅在无状态行或状态为 starved 时生效：done-不达标 / failed-未熔断的文件仍需重扫，
+                    // 不能被遗留队列行掩盖（否则质量不达标的文件永远等不到重扫）。
+                    if (!$ocrSkipDone && !$ocrSkipGaveUp && !$ocrBackfillRow
+                        && isset($ocrQueueMap[$navigateUri])
+                        && ($st === null || (string)$st['status'] === 'starved')
+                        && $prev !== null && (string)$prev['updated_at'] !== '' && (string)$prev['updated_at'] === $cloudUpdatedAt) {
+                        $ocrSkipQueuedRow = true;
+                    }
+                }
+                $ocrSkipAny = $ocrSkipDone || $ocrSkipGaveUp || $ocrBackfillRow || $ocrSkipQueuedRow;
+                // OCR 候选：有状态行时完全以状态表为准（done+达标才跳，quality 不达标即使 text 看似达标也重扫）；
+                // 无状态行时才用 netdisk_ocr_index_quality_ok 判定旧 text 是否可回填。
                 $isUnchanged = !$isFolder && $prev !== null
                     && $prev['updated_at'] !== '' && $prev['updated_at'] === $cloudUpdatedAt
                     && (int)$prev['is_folder'] === 0
-                    && (netdisk_is_ocr_candidate($ext) ? netdisk_ocr_index_quality_ok((string)($prev['text'] ?? '')) : $prev['text'] !== '')
-                    && !$isOcrCandidate;
+                    && (netdisk_is_ocr_candidate($ext)
+                        ? (!$forceOcr && $ocrSkipAny)
+                        : $prev['text'] !== '');
 
                 if ($isFolder) {
                     $text = '';
                 } elseif ($isUnchanged) {
                     $text = $prev['text'];
                     $skipped++;
+                    if ($isOcrCandFile) {
+                        // 0018: OCR 候选被增量跳过 → 分类计数；回填场景补写状态行（下次直接命中）
+                        if ($ocrSkipGaveUp) {
+                            $ocrGaveUp++;
+                        } elseif ($ocrSkipQueuedRow) {
+                            $ocrSkipQueued++;
+                        } else {
+                            $ocrSkipInc++;
+                        }
+                        if ($ocrBackfillRow) {
+                            $bfQ = netdisk_ocr_quality((string)$prev['text']);
+                            $bfChars = string_len((string)$prev['text']);
+                            $bfNow = time();
+                            netdisk_exec_retry(fn() => $upOcrFile->execute([
+                                ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
+                                ':st' => 'done', ':q' => $bfQ, ':c' => $bfChars, ':a' => 0, ':e' => '',
+                                ':dpi' => 0, ':pt' => 0, ':pd' => 0, ':eng' => '', ':ems' => 0, ':ppm' => 0.0, ':first' => $bfNow, ':t' => $bfNow,
+                            ]));
+                            $ocrState[$navigateUri] = ['uri' => $navigateUri, 'updated_at' => $cloudUpdatedAt, 'status' => 'done',
+                                'quality' => $bfQ, 'chars' => $bfChars, 'attempts' => 0, 'first_at' => $bfNow];
+                            $ocrBackfilled++;
+                        }
+                    }
                 } elseif ($isSkipExt) {
                     // 黑名单扩展名：跳过下载正文/OCR，仅索引文件名
                     $skippedByExt++;
@@ -4511,13 +4647,36 @@ $text = '';
                                 $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
                                 if ($tmp !== false) {
                                     @file_put_contents($tmp, $raw);
-                                    $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId];
+                                    $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId, 'updated_at' => $cloudUpdatedAt, 'size' => $size];
                                 } else {
                                     $errors++;
                                 }
                             } else {
-                                netdisk_exec_retry(fn() => $insQueue->execute([':s' => $shareId, ':c' => $configId, ':u' => $navigateUri, ':n' => $name, ':e' => $ext, ':z' => $size, ':t' => time()]));
-                                $ocrQueued++;
+                                // 0018 必改: 已有 pending/running 队列行则不重复入队（多轮重建不再堆积重复行、同一文件不被 OCR 多遍）
+                                $qDup = false;
+                                try {
+                                    $qDupSt = $pdo->prepare('SELECT COUNT(*) FROM netdisk_ocr_queue WHERE share_id=:s AND uri=:u AND status IN ("pending","running")');
+                                    $qDupSt->execute([':s' => $shareId, ':u' => $navigateUri]);
+                                    $qDup = (int)$qDupSt->fetchColumn() > 0;
+                                    $qDupSt->closeCursor();
+                                } catch (Throwable $ign) {}
+                                if (!$qDup) {
+                                    netdisk_exec_retry(fn() => $insQueue->execute([':s' => $shareId, ':c' => $configId, ':u' => $navigateUri, ':n' => $name, ':e' => $ext, ':z' => $size, ':t' => time()]));
+                                    $ocrQueued++;
+                                } else {
+                                    $ocrQueueDup++;
+                                }
+                                // 0018: 低优队列文件标记 starved（排队待空闲处理；让位/排队不计失败、不计入 attempts>=3 永久跳过）
+                                $qNow = time();
+                                $qPrev = $ocrState[$navigateUri] ?? null;
+                                netdisk_exec_retry(fn() => $upOcrFile->execute([
+                                    ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
+                                    ':st' => 'starved', ':q' => 0, ':c' => 0, ':a' => (int)($qPrev['attempts'] ?? 0), ':e' => 'starved',
+                                    ':dpi' => 0, ':pt' => 0, ':pd' => 0, ':eng' => '', ':ems' => 0, ':ppm' => 0.0, ':first' => $qNow, ':t' => $qNow,
+                                ]));
+                                $ocrState[$navigateUri] = ['uri' => $navigateUri, 'updated_at' => $cloudUpdatedAt, 'status' => 'starved',
+                                    'quality' => 0, 'chars' => 0, 'attempts' => (int)($qPrev['attempts'] ?? 0), 'first_at' => $qNow];
+                                $ocrStarvedMark++;
                             }
                         }
                         if ($text !== '') {
@@ -4537,14 +4696,37 @@ $text = '';
                             $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
                             if ($tmp !== false) {
                                 @file_put_contents($tmp, $raw);
-                                $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId];
+                                $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId, 'updated_at' => $cloudUpdatedAt, 'size' => $size];
                             } else {
                                 $errors++;
                             }
                         }
                     } elseif ($isOcr) {
-                        netdisk_exec_retry(fn() => $insQueue->execute([':s' => $shareId, ':c' => $configId, ':u' => $navigateUri, ':n' => $name, ':e' => $ext, ':z' => $size, ':t' => time()]));
-                        $ocrQueued++;
+                        // 0018 必改: 已有 pending/running 队列行则不重复入队（多轮重建不再堆积重复行、同一文件不被 OCR 多遍）
+                        $qDup = false;
+                        try {
+                            $qDupSt = $pdo->prepare('SELECT COUNT(*) FROM netdisk_ocr_queue WHERE share_id=:s AND uri=:u AND status IN ("pending","running")');
+                            $qDupSt->execute([':s' => $shareId, ':u' => $navigateUri]);
+                            $qDup = (int)$qDupSt->fetchColumn() > 0;
+                            $qDupSt->closeCursor();
+                        } catch (Throwable $ign) {}
+                        if (!$qDup) {
+                            netdisk_exec_retry(fn() => $insQueue->execute([':s' => $shareId, ':c' => $configId, ':u' => $navigateUri, ':n' => $name, ':e' => $ext, ':z' => $size, ':t' => time()]));
+                            $ocrQueued++;
+                        } else {
+                            $ocrQueueDup++;
+                        }
+                        // 0018: 低优队列文件标记 starved（排队待空闲处理；让位/排队不计失败、不计入 attempts>=3 永久跳过）
+                        $qNow = time();
+                        $qPrev = $ocrState[$navigateUri] ?? null;
+                        netdisk_exec_retry(fn() => $upOcrFile->execute([
+                            ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
+                            ':st' => 'starved', ':q' => 0, ':c' => 0, ':a' => (int)($qPrev['attempts'] ?? 0), ':e' => 'starved',
+                            ':dpi' => 0, ':pt' => 0, ':pd' => 0, ':eng' => '', ':ems' => 0, ':ppm' => 0.0, ':first' => $qNow, ':t' => $qNow,
+                        ]));
+                        $ocrState[$navigateUri] = ['uri' => $navigateUri, 'updated_at' => $cloudUpdatedAt, 'status' => 'starved',
+                            'quality' => 0, 'chars' => 0, 'attempts' => (int)($qPrev['attempts'] ?? 0), 'first_at' => $qNow];
+                        $ocrStarvedMark++;
                     }
                 }
                 $now = time();
@@ -4606,6 +4788,20 @@ $text = '';
             netdisk_index_job_update($jobId, ['ocr_files_total' => count($ocrTasks), 'ocr_files_done' => 0], $pdo);
         }
         $poolRes = netdisk_ocr_run_pool($ocrTasks, netdisk_index_ocr_concurrency($configId), $jobId, $pdo);
+        // 0018: finalize 会删除 tmp，先抓 PDF 总页数供状态表落库（尽力而为，取不到记 0）
+        $pdfPages = [];
+        foreach ($ocrTasks as $task) {
+            if (strtolower(ltrim((string)($task['ext'] ?? ''), '.')) === 'pdf' && isset($task['tmp']) && is_file($task['tmp'])) {
+                $pi = @shell_exec('pdfinfo ' . escapeshellarg($task['tmp']) . ' 2>/dev/null');
+                if (is_string($pi) && preg_match('/Pages:\s+(\d+)/', $pi, $pm)) {
+                    $pdfPages[(string)$task['uri']] = (int)$pm[1];
+                }
+            }
+        }
+        $stEngine = (netdisk_ocr_sidecar_enabled() && netdisk_ocr_sidecar_available()) ? 'paddleocr-sidecar'
+            : (trim((string)shell_exec('command -v tesseract 2>/dev/null')) !== '' ? 'tesseract' : '');
+        // 0018: 池起点计时——elapsed_ms/pages_per_min 供 0021 自动定档做历史样本
+        $poolT0 = microtime(true);
         // 统一后处理：规范化 + 自适应 DPI 重试（质量不足自动提升）+ 清理 tmp
         $finalResults = netdisk_ocr_finalize_results($ocrTasks, $poolRes['results']);
         foreach ($ocrTasks as $task) {
@@ -4620,6 +4816,37 @@ $text = '';
                 if ($prevText !== '') {
                     netdisk_exec_retry(fn() => $updText->execute([':text' => $prevText, ':sid' => $shareId, ':uri' => $uri]));
                 }
+            }
+            // 0018: 无论成败都落状态行——下轮重建的增量判定据此进行；
+            // 失败仅 attempts++ 并计入 notes，不中断整轮（连续 3 次失败后不再重试）。
+            $stQ = $txt !== '' ? netdisk_ocr_quality($txt) : 0.0;
+            $stChars = $txt !== '' ? string_len($txt) : 0;
+            $prevSt = $ocrState[$uri] ?? null;
+            // 0018 必改: attempts = 连续失败计数——成功归零；失败 +1；force_ocr 轮失败从 1 重计（不被 3 次上限挡住）。
+            // 否则成功多轮的文件累计 attempts>=3 后，一次偶发失败即被永久放弃。
+            $stAtt = ($txt !== '') ? 0 : ($forceOcr ? 1 : ((int)($prevSt['attempts'] ?? 0) + 1));
+            $stFirst = (int)($prevSt['first_at'] ?? 0) > 0 ? (int)$prevSt['first_at'] : time();
+            $stPages = (int)($pdfPages[$uri] ?? 0);
+            $stStatus = $txt !== '' ? 'done' : 'failed';
+            $stErr = $txt !== '' ? '' : 'OCR 返回空文本（图片损坏/格式不支持/OCR 服务异常）';
+            // 0018: 耗时指标——优先 finalize 逐文件真实耗时；桩/异常缺失时退回池累计。
+            // pages_per_min 仅 PDF（页数>0）有意义，图片记 0。
+            $stElapsed = (int)($GLOBALS['ND_OCR_FINALIZE_TIMINGS'][$uri] ?? 0);
+            if ($stElapsed <= 0) {
+                $stElapsed = (int)round((microtime(true) - $poolT0) * 1000);
+            }
+            $stPpm = ($stPages > 0 && $stElapsed > 0) ? round($stPages / ($stElapsed / 60000.0), 2) : 0.0;
+            netdisk_exec_retry(fn() => $upOcrFile->execute([
+                ':sid' => $shareId, ':uri' => $uri, ':u' => (string)($task['updated_at'] ?? ''), ':z' => (int)($task['size'] ?? 0),
+                ':st' => $stStatus, ':q' => $stQ, ':c' => $stChars, ':a' => $stAtt, ':e' => $stErr,
+                ':dpi' => $txt !== '' ? netdisk_index_ocr_dpi_start($configId) : 0,
+                ':pt' => $stPages, ':pd' => $txt !== '' ? $stPages : 0,
+                ':eng' => $stEngine, ':ems' => $stElapsed, ':ppm' => $stPpm, ':first' => $stFirst, ':t' => time(),
+            ]));
+            $ocrState[$uri] = ['uri' => $uri, 'updated_at' => (string)($task['updated_at'] ?? ''), 'status' => $stStatus,
+                'quality' => $stQ, 'chars' => $stChars, 'attempts' => $stAtt, 'first_at' => $stFirst];
+            if ($txt === '') {
+                $ocrFailedNow++;
             }
             // 每个文件完成（含页级 + 自适应 DPI 重试）后递增文件级 OCR 进度
             if ($jobId > 0) {
@@ -4645,6 +4872,22 @@ $text = '';
             netdisk_exec_retry(fn() => $del->execute([':s' => $shareId, ':u' => $uri]));
         }
     }
+    // 0018: 替代原"重建开头整表清空"——仅删除本轮遍历中已消失（云端删除/移出 root）的队列行，
+    // pending/failed 任务保留续跑；与 netdisk_index 的清理同处执行。
+    try {
+        $qSel = $pdo->prepare('SELECT id, uri FROM netdisk_ocr_queue WHERE share_id = :s');
+        $qSel->execute([':s' => $shareId]);
+        $qRows = $qSel->fetchAll(PDO::FETCH_ASSOC);
+        $qSel->closeCursor();
+        $delQ = $pdo->prepare('DELETE FROM netdisk_ocr_queue WHERE id = :id');
+        foreach ($qRows as $qr) {
+            if (!isset($seenUris[(string)$qr['uri']])) {
+                netdisk_exec_retry(fn() => $delQ->execute([':id' => (int)$qr['id']]));
+            }
+        }
+    } catch (Throwable $ign) {
+        // 队列清理失败不影响本轮索引结果
+    }
     if ($visited >= 300) {
         $notes[] = '达到目录上限(300)，大目录可能未完整索引';
     }
@@ -4660,8 +4903,26 @@ $text = '';
     if ($ocrQueued > 0) {
         $notes[] = $ocrQueued . ' 个较大文件（>' . netdisk_index_ocr_max_mb() . 'MB）已加入低优先级 OCR 队列，将后台空闲时处理';
     }
+    if ($ocrStarvedMark > 0) {
+        $notes[] = $ocrStarvedMark . ' 个低优队列文件标记为待处理（starved）——排队/让位不计入失败次数，不会触发≥3 次永久跳过';
+    }
     if ($ocrOversize > 0) {
         $notes[] = $ocrOversize . ' 个超大文件（>' . netdisk_index_ocr_low_max_mb() . 'MB）跳过 OCR，仍按文件名索引';
+    }
+    if ($ocrSkipInc > 0) {
+        $notes[] = $ocrSkipInc . ' 个 OCR 文件已跳过（增量：结果达标未重扫' . ($ocrBackfilled > 0 ? '，含 ' . $ocrBackfilled . ' 个旧索引回填' : '') . '）';
+    }
+    if ($ocrSkipQueued > 0) {
+        $notes[] = $ocrSkipQueued . ' 个 OCR 文件已跳过（已在低优先级队列排队，未重复下载）';
+    }
+    if ($ocrQueueDup > 0) {
+        $notes[] = $ocrQueueDup . ' 个文件已在低优先级队列中，本轮抑制重复入队';
+    }
+    if ($ocrGaveUp > 0) {
+        $notes[] = $ocrGaveUp . ' 个文件 OCR 失败≥3 次不再重试（可在重建时勾选「强制重跑 OCR」重试）';
+    }
+    if ($ocrFailedNow > 0) {
+        $notes[] = $ocrFailedNow . ' 个文件 OCR 失败已跳过（状态已记录，下轮重建自动重试）';
     }
     if ($jobId > 0) {
         $cancelled = netdisk_index_job_cancelled($jobId, $pdo);
@@ -4700,12 +4961,20 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
     $markFailed = $pdo->prepare('UPDATE netdisk_ocr_queue SET status="failed", error=:e, finished_at=:t WHERE id=:id');
     $markDone = $pdo->prepare('UPDATE netdisk_ocr_queue SET status="done", finished_at=:t, error="" WHERE id=:id');
     $updIndex = $pdo->prepare('UPDATE netdisk_index SET text=:t WHERE share_id=:s AND uri=:u');
+    // 0018: 队列批处理的结果同样落 netdisk_ocr_files 状态表（否则队列完成的重建仍会重扫）
+    $upOcrFileQ = $pdo->prepare('INSERT INTO netdisk_ocr_files (share_id, uri, updated_at, size, status, quality, chars, attempts, last_error, dpi, pages_total, pages_done, engine, elapsed_ms, pages_per_min, first_at, finished_at)
+        VALUES (:sid, :uri, :u, :z, :st, :q, :c, :a, :e, :dpi, :pt, :pd, :eng, :ems, :ppm, :first, :t)
+        ON CONFLICT(share_id, uri) DO UPDATE SET updated_at=excluded.updated_at, size=excluded.size, status=excluded.status,
+            quality=excluded.quality, chars=excluded.chars, attempts=excluded.attempts, last_error=excluded.last_error,
+            dpi=excluded.dpi, pages_total=excluded.pages_total, pages_done=excluded.pages_done, engine=excluded.engine,
+            elapsed_ms=excluded.elapsed_ms, pages_per_min=excluded.pages_per_min, finished_at=excluded.finished_at');
     $shareStmt = $pdo->prepare('SELECT * FROM shares WHERE id=:id AND deleted_at IS NULL');
     // 自愈：回收 running 超时（>10 分钟）的队列项——worker 崩溃/卡死后遗留，避免永久卡住
     $pdo->prepare('UPDATE netdisk_ocr_queue SET status="failed", error="处理超时已重置", finished_at=:now
         WHERE status="running" AND started_at>0 AND started_at<:cut')
         ->execute([':now' => time(), ':cut' => time() - 600]);
 
+    $qYielded = false; // 0018: 是否因 pending 重建 job 让位（让位时把仍 pending 的队列项标记 starved）
     while (time() - $start < $maxSeconds) {
         $rows = netdisk_exec_retry(function () use ($pdo): array {
             $stmt = $pdo->query('SELECT id, share_id, config_id, uri, ext, size FROM netdisk_ocr_queue WHERE status="pending" ORDER BY id ASC LIMIT 1');
@@ -4772,6 +5041,36 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
         if (empty($jobs)) {
             break;
         }
+        // 0018: finalize 会删除 tmp，先抓 PDF 总页数供状态表落库
+        $pdfPagesQ = [];
+        foreach ($jobs as $j) {
+            if (strtolower(ltrim((string)($j['ext'] ?? ''), '.')) === 'pdf' && isset($j['tmp']) && is_file($j['tmp'])) {
+                $pi = @shell_exec('pdfinfo ' . escapeshellarg($j['tmp']) . ' 2>/dev/null');
+                if (is_string($pi) && preg_match('/Pages:\s+(\d+)/', $pi, $pm)) {
+                    $pdfPagesQ[(string)$j['uri']] = (int)$pm[1];
+                }
+            }
+        }
+        $stEngineQ = (netdisk_ocr_sidecar_enabled() && netdisk_ocr_sidecar_available()) ? 'paddleocr-sidecar'
+            : (trim((string)shell_exec('command -v tesseract 2>/dev/null')) !== '' ? 'tesseract' : '');
+        // 0018: 批处理计时起点（elapsed_ms/pages_per_min 供 0021 自动定档）
+        $qT0 = microtime(true);
+        // 0018: 载入既有状态行——attempts 跨轮累计（真实失败 3 次才熔断，starved 轮不计数）
+        $qUris = array_map(fn($j) => (string)$j['uri'], $jobs);
+        $qPrevState = [];
+        if (!empty($qUris)) {
+            $qSelSt = $pdo->prepare('SELECT share_id, uri, attempts, first_at FROM netdisk_ocr_files WHERE (share_id, uri) IN (VALUES ' . implode(',', array_fill(0, count($qUris), '(?,?)')) . ')');
+            $qSelParams = [];
+            foreach ($jobs as $j) {
+                $qSelParams[] = (int)$meta[(string)$j['uri']]['share_id'];
+                $qSelParams[] = (string)$j['uri'];
+            }
+            $qSelSt->execute($qSelParams);
+            foreach ($qSelSt->fetchAll(PDO::FETCH_ASSOC) as $r) {
+                $qPrevState[(int)$r['share_id'] . '|' . (string)$r['uri']] = $r;
+            }
+            $qSelSt->closeCursor();
+        }
         $res = netdisk_ocr_run_pool($jobs, $concurrency, 0, $pdo);
         // 统一后处理：规范化 + 自适应 DPI 重试 + 清理 tmp
         $finalResults = netdisk_ocr_finalize_results($jobs, $res['results']);
@@ -4781,12 +5080,72 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
             $txt = trim((string)($finalResults[$uri] ?? ''));
             netdisk_exec_retry(fn() => $updIndex->execute([':t' => $txt, ':s' => $m['share_id'], ':u' => $uri]));
             netdisk_exec_retry(fn() => $markDone->execute([':t' => time(), ':id' => $m['qid']]));
+            // 0018: 落状态行（updated_at 队列不存，写空串——重建侧判定允许空串回退比对 netdisk_index.updated_at）
+            $qQ = $txt !== '' ? netdisk_ocr_quality($txt) : 0.0;
+            $qChars = $txt !== '' ? string_len($txt) : 0;
+            $qPages = (int)($pdfPagesQ[$uri] ?? 0);
+            $qNow = time();
+            // 0018 必改: attempts = 连续失败计数——成功归零；失败跨轮累计 +1（此前恒写 1，熔断永远触发不了）；starved 轮不加计数
+            $qPrev = $qPrevState[(int)$m['share_id'] . '|' . $uri] ?? null;
+            $qAtt = $txt !== '' ? 0 : ((int)($qPrev['attempts'] ?? 0) + 1);
+            $qFirst = (int)($qPrev['first_at'] ?? 0) > 0 ? (int)$qPrev['first_at'] : $qNow;
+            // 0018: 耗时指标——优先 finalize 逐文件真实耗时，缺失退回批累计（PDF 记 pages_per_min，图片记 0）
+            $qElapsed = (int)($GLOBALS['ND_OCR_FINALIZE_TIMINGS'][$uri] ?? 0);
+            if ($qElapsed <= 0) {
+                $qElapsed = (int)round((microtime(true) - $qT0) * 1000);
+            }
+            $qPpm = ($qPages > 0 && $qElapsed > 0) ? round($qPages / ($qElapsed / 60000.0), 2) : 0.0;
+            netdisk_exec_retry(fn() => $upOcrFileQ->execute([
+                ':sid' => (int)$m['share_id'], ':uri' => $uri, ':u' => '', ':z' => 0,
+                ':st' => $txt !== '' ? 'done' : 'failed', ':q' => $qQ, ':c' => $qChars, ':a' => $qAtt,
+                ':e' => $txt !== '' ? '' : 'OCR 返回空文本（图片损坏/格式不支持/OCR 服务异常）',
+                ':dpi' => 0, ':pt' => $qPages, ':pd' => $txt !== '' ? $qPages : 0,
+                ':eng' => $stEngineQ, ':ems' => $qElapsed, ':ppm' => $qPpm, ':first' => $qFirst, ':t' => $qNow,
+            ]));
             $totalDone++;
         }
         // 出现新的 pending 重建 job → 让位（重建优先）
         $pendingJob = (int)$pdo->query('SELECT COUNT(*) FROM netdisk_index_jobs WHERE status="pending"')->fetchColumn();
         if ($pendingJob > 0) {
+            $qYielded = true;
             break;
+        }
+    }
+    // 0018: 让位（starved）与失败区分——仍 pending 的队列项在状态表标记 starved（attempts 原样保留、不加计数），
+    // 不计入 attempts>=3 的永久跳过，避免大文件因反复让位被判死。
+    if ($qYielded) {
+        try {
+            $qNowY = time();
+            $starvedSel = $pdo->query('SELECT share_id, uri, size FROM netdisk_ocr_queue WHERE status="pending"');
+            $starvedRows = $starvedSel->fetchAll(PDO::FETCH_ASSOC);
+            $starvedSel->closeCursor();
+            $upStarved = $pdo->prepare('INSERT INTO netdisk_ocr_files (share_id, uri, updated_at, size, status, quality, chars, attempts, last_error, dpi, pages_total, pages_done, engine, elapsed_ms, pages_per_min, first_at, finished_at)
+                VALUES (:sid, :uri, "", :z, "starved", 0, 0, :a, "starved", 0, 0, 0, "", 0, 0, :first, :t)
+                ON CONFLICT(share_id, uri) DO UPDATE SET status=CASE WHEN netdisk_ocr_files.status IN ("done", "failed", "invalid") THEN netdisk_ocr_files.status ELSE "starved" END,
+                    last_error=CASE WHEN netdisk_ocr_files.status IN ("done", "failed", "invalid") THEN netdisk_ocr_files.last_error ELSE "starved" END,
+                    size=excluded.size');
+            foreach ($starvedRows as $sr) {
+                $srSid = (int)$sr['share_id'];
+                $srUri = (string)$sr['uri'];
+                $srAtt = 0;
+                $srFirst = $qNowY;
+                try {
+                    $pv = $pdo->prepare('SELECT attempts, first_at FROM netdisk_ocr_files WHERE share_id=? AND uri=?');
+                    $pv->execute([$srSid, $srUri]);
+                    $pvr = $pv->fetch(PDO::FETCH_ASSOC);
+                    $pv->closeCursor();
+                    if ($pvr !== false) {
+                        $srAtt = (int)$pvr['attempts'];
+                        $srFirst = (int)$pvr['first_at'] > 0 ? (int)$pvr['first_at'] : $qNowY;
+                    }
+                } catch (Throwable $ign) {}
+                netdisk_exec_retry(fn() => $upStarved->execute([
+                    ':sid' => $srSid, ':uri' => $srUri, ':z' => (int)($sr['size'] ?? 0),
+                    ':a' => $srAtt, ':first' => $srFirst, ':t' => $qNowY,
+                ]));
+            }
+        } catch (Throwable $ign) {
+            // starved 标记失败不影响队列处理结果
         }
     }
     return $totalDone;
@@ -16896,6 +17255,8 @@ if ($path === '/admin') {
             $content .= '<button class="button" type="button" data-netdisk-icfg-toggle data-cfg-id="' . $icfgId . '">配置</button>';
             // 重建/终止二合一：初始显示"重建索引"，运行时报状态由前端根据 configs[].job_status 切换
             $content .= '<button class="button" type="button" data-netdisk-cfg-action data-config-id="' . $icfgId . '" data-config-name="' . $icfgName . '" data-running="0">重建索引</button>';
+            // 0018: 强制重跑 OCR 勾选框（默认不勾；勾选后重建请求附带 force_ocr=1，忽略已有高质量结果）
+            $content .= '<label class="checkbox" style="display:inline-flex;align-items:center;gap:4px;margin-left:8px;font-size:0.78rem;white-space:nowrap" title="忽略已有高质量 OCR 结果，全部重新识别"><input type="checkbox" data-nd-force-ocr data-config-id="' . $icfgId . '"> 强制重跑 OCR（忽略已有高质量结果）</label>';
             $content .= '</td>';
             $content .= '</tr>';
             // 展开的配置编辑表单（默认隐藏）
@@ -18174,6 +18535,8 @@ if ($path === '/admin/netdisk/reindex' && $_SERVER['REQUEST_METHOD'] === 'POST')
     require_admin();
     check_csrf();
     $scopeConfigId = (int)($_POST['config_id'] ?? 0);
+    // 0018: 强制重跑 OCR——忽略 netdisk_ocr_files 状态表的全部跳过判定（前端勾选框传入）
+    $forceOcr = !empty($_POST['force_ocr']) || !empty($_GET['force_ocr']);
     set_setting('netdisk_index_ocr', !empty($_POST['index_ocr']) ? '1' : '0');
     set_setting('netdisk_index_ocr_concurrency', (string)max(1, (int)($_POST['ocr_concurrency'] ?? 4)));
     set_setting('netdisk_index_ocr_max_mb', (string)max(1, (int)($_POST['ocr_max_mb'] ?? 10)));
@@ -18206,7 +18569,7 @@ if ($path === '/admin/netdisk/reindex' && $_SERVER['REQUEST_METHOD'] === 'POST')
             $skipped++;
             continue;
         }
-        $jobId = netdisk_index_job_create((int)$s['id']);
+        $jobId = netdisk_index_job_create((int)$s['id'], $forceOcr);
         if ($jobId > 0) {
             $queued++;
         }

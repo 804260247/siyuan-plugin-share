@@ -3835,6 +3835,9 @@
           fd.append("csrf", csrfValue());
           fd.append("config_id", cfgId);
           const isRetry = btn.getAttribute("data-retry") === "1";
+          // 0018: 勾选「强制重跑 OCR」时附带 force_ocr=1（仅重建请求；终止/续跑不带）
+          const forceBox = document.querySelector('[data-nd-force-ocr][data-config-id="' + cfgId + '"]');
+          if (!running && !isRetry && forceBox && forceBox.checked) fd.append("force_ocr", "1");
           const url = running ? "/admin/netdisk/reindex/cancel" : (isRetry ? "/admin/netdisk/reindex/retry" : "/admin/netdisk/reindex");
           const resp = await fetch(url, { method: "POST", credentials: "same-origin", body: fd });
           const payload = await resp.json().catch(() => null);
