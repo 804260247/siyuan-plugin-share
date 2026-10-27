@@ -180,6 +180,7 @@
 6. **OCR sidecar 装系统库时若 `apt-get update` 超时**（日志大量 `Err: Unable to connect to deb.debian.org`，末行 `[ocr-init] FATAL: apt-get update failed`），说明容器到 Debian 官方源 80 端口不通（pip 走 443 通常仍可达）。给 `ocr` 服务设置环境变量 `OCR_APT_MIRROR` 指向一个容器可达的镜像主机名（如 `mirrors.aliyun.com`；连通性可用 `docker run --rm python:3.11-slim bash -c 'timeout 5 bash -c "</dev/tcp/<镜像主机>/80" && echo OK'` 探测，5 秒内打出 OK 即可达），脚本会自动把 `deb.debian.org` / `security.debian.org` 替换为该镜像，且 `apt-get update` 单独判错快速失败，不再刷两百行超时日志。
 7. **OCR sidecar 装 pip 依赖时若下载卡住或 `ReadTimeoutError`**（日志见 `pip._vendor.urllib3.exceptions.ReadTimeoutError`、下载速率只有几 kB/s，如 `paddlepaddle` 192 MB 下到一半超时），说明容器到 `files.pythonhosted.org` 链路慢，不是脚本 bug。给 `ocr` 服务设置环境变量 `OCR_PIP_INDEX=https://mirrors.aliyun.com/pypi/simple/`（注意：与 `OCR_APT_MIRROR` 写法不同，这个要带 `https://` 前缀、以 `/simple/` 结尾），超时与重试可用 `OCR_PIP_TIMEOUT`（默认 120 秒）/`OCR_PIP_RETRIES`（默认 5 次）调整；已下载的包会缓存进模型卷（`$PADDLEX_HOME/pip-cache`），重建容器不再重下。
 8. **`php-site/config.php` 必须外部挂载**，镜像不会生成该文件；不挂载站点起不来。
+9. **不想手动估档位：`OCR_PROFILE=auto`**。OCR sidecar 启动脚本会读容器内存上限（cgroup v2 `memory.max` / v1 `limit_in_bytes`；未设 `mem_limit` 或值为 `max`/哨兵值时回退 `/proc/meminfo` 的 MemTotal）与核数（`nproc`，不可用回退 `getconf`，仍不可用按 2），**可用内存 ≥ 4 GiB 且核数 ≥ 6 自动选 high（4 线程），其余选 low（2 线程 + 关 ONNX 内存竞技场）**；内存依据完全不可知时保守选 low。判定依据在启动日志一行打全：`[ocr-init] profile=auto resolved=high (mem_limit=8192MB mem_total=16384MB nproc=8)`。显式 `OCR_THREADS` 仍最高优先；显式 `low`/`high` 不经过 auto 判定；未知档位值打 WARN 后按 low 处理，不会挡住容器启动。
 
 ### 三、NPM / nginx 反代
 

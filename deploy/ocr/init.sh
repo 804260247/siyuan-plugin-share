@@ -14,9 +14,13 @@
 #                  低配 NAS 更稳（首次启动会把官方 Paddle 模型转成 ONNX 并缓存）
 #   OCR_DEVICE     推理设备，默认 cpu；GPU 环境可填 gpu:0
 #   OCR_PORT       监听端口，默认 8080（与 web 侧 NETDISK_OCR_SIDECAR_URL 统一）
-#   OCR_PROFILE    low（默认）| high 资源预设：
+#   OCR_PROFILE    low（默认）| high | auto 资源预设：
 #                    low  = 2 线程 + 关闭 ONNX 内存竞技场，防低配机 OOM
 #                    high = 4 线程，吞吐优先
+#                    auto = 按容器内存上限与核数自动选 high/low（内存≥4GiB 且
+#                           核数≥6 → high，其余及内存不可知 → low），
+#                           判定依据打一行 profile=auto resolved=... 日志
+#                  未知取值打 WARN 后按 low 处理（不 FATAL、不挡容器启动）
 #                  显式设置 OCR_THREADS 时以 OCR_THREADS 为准
 #   OCR_THREADS    推理线程数，默认按 OCR_PROFILE 取 2/4；0 = 引擎默认
 #   OCR_PIP_INDEX  可选 pip 国内镜像源，必须是完整 URL（带 scheme 与 /simple/），如：
@@ -47,6 +51,65 @@ export OCR_ENGINE OCR_DEVICE OCR_PORT OCR_PROFILE OCR_THREADS
 # 模型/配置缓存目录（与 compose 卷挂载点对应）
 export PADDLEX_HOME="/root/.paddlex"
 mkdir -p "$PADDLEX_HOME"
+
+# ---- 档位解析（0022）：OCR_PROFILE = low | high | auto ----
+# auto 面向不想手动估机器规格的用户：按容器可用内存与核数自动选线程档。
+# 内存依据 = min(cgroup 上限, /proc/meminfo MemTotal)：
+#   cgroup 先读 v2 memory.max，不可读再回退 v1 memory.limit_in_bytes；
+#   'max'、空文件、非纯数字、≥2^50（v1 无限制哨兵 9223372036854771712）
+#   一律视为该来源不可知；两个来源都不可知 → 内存依据缺失。
+# 核数依据 = nproc，不可用回退 getconf _NPROCESSORS_ONLN，仍不可用按 2。
+# 判定：可用内存 ≥ 4 GiB 且核数 ≥ 6 → high；否则 low；内存完全不可知 → low
+# （证不出内存充足就保守取低档，宁可慢、不 OOM）。
+# 解析后 OCR_PROFILE 被改写为 low/high（变量在上方已 export，改写即生效）：
+# 下方线程预设与 engine_json 生成段（enable_cpu_mem_arena 开关按
+# profile != "high" 判断）看到的都是解析后的档位，PY 段零改动。
+# 未知取值只 WARN 不 FATAL：档位名写错一个字母容器也必须能起来，行为等同 low。
+ocr_mem_source_bytes() {
+    # $1=候选文件路径。可读且为纯数字且 <2^50 → stdout 输出字节数；
+    # 其余（不可读/'max'/空/非数字/哨兵值）不输出任何内容 = 该来源不可知。
+    # 恒返回 0，set -e 下安全。
+    local f="$1" v
+    [ -r "$f" ] || return 0
+    v="$(tr -d '[:space:]' < "$f" 2>/dev/null)" || return 0
+    case "$v" in '' | max | *[!0-9]*) return 0 ;; esac
+    if [ "$v" -lt 1125899906842624 ]; then echo "$v"; fi
+    return 0
+}
+ocr_mb_or_unknown() {
+    # 字节数 → 整除 MB 供日志；空/非纯数字打 unknown
+    case "$1" in '' | *[!0-9]*) echo "unknown" ;; *) echo "$(( $1 / 1048576 ))MB" ;; esac
+}
+if [ "$OCR_PROFILE" = "auto" ]; then
+    nd_mem_cg=""
+    for nd_f in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+        nd_mem_cg="$(ocr_mem_source_bytes "$nd_f")"
+        if [ -n "$nd_mem_cg" ]; then break; fi
+    done
+    nd_mem_total=""
+    if [ -r /proc/meminfo ]; then
+        nd_mem_total="$(awk '/^MemTotal:/{printf "%d", $2 * 1024; exit}' /proc/meminfo 2>/dev/null)"
+        case "$nd_mem_total" in '' | *[!0-9]*) nd_mem_total="" ;; esac
+    fi
+    # 可用内存 = 已知来源取 min（缺一个用另一个，全缺 → 空 = 不可知）
+    nd_mem=""
+    for nd_v in "$nd_mem_cg" "$nd_mem_total"; do
+        [ -n "$nd_v" ] || continue
+        if [ -z "$nd_mem" ] || [ "$nd_v" -lt "$nd_mem" ]; then nd_mem="$nd_v"; fi
+    done
+    nd_nproc="$(nproc 2>/dev/null || true)"
+    case "$nd_nproc" in '' | *[!0-9]*) nd_nproc="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)" ;; esac
+    case "$nd_nproc" in '' | *[!0-9]*) nd_nproc=2 ;; esac
+    if [ -n "$nd_mem" ] && [ "$nd_mem" -ge 4294967296 ] && [ "$nd_nproc" -ge 6 ]; then
+        OCR_PROFILE=high
+    else
+        OCR_PROFILE=low
+    fi
+    echo "[ocr-init] profile=auto resolved=${OCR_PROFILE} (mem_limit=$(ocr_mb_or_unknown "$nd_mem_cg") mem_total=$(ocr_mb_or_unknown "$nd_mem_total") nproc=${nd_nproc})"
+elif [ "$OCR_PROFILE" != "low" ] && [ "$OCR_PROFILE" != "high" ]; then
+    echo "[ocr-init] WARN unknown OCR_PROFILE=${OCR_PROFILE}, fall back to low"
+    OCR_PROFILE=low
+fi
 
 # ---- 线程数：profile 预设，显式 OCR_THREADS 优先 ----
 if [ -z "$OCR_THREADS" ]; then
