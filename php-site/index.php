@@ -4529,8 +4529,14 @@ function netdisk_index_job_create(int $shareId, bool $forceOcr = false): int {
     $ex->closeCursor();
     if ($existing > 0) {
         // 0018: 复用未开始/进行中的 job 时，本次请求带强制重跑则升级标记（worker 拾取时读取）
+        // 0023: 复用 pending 行时一并刷新 created_at——其口径为「最后一次被触发的时间」，
+        //       worker 的「pending 超 6 小时判死」即「触发后 6 小时仍未被拾取」。旧实现不刷新，
+        //       隔日重触发会复用昨天的 created_at，worker 一进回收循环就误判「队列等待超时」。
+        //       running 行有心跳、语义是已开跑，不得刷新（仅 status="pending" 的行会被本 UPDATE 命中）。
         if ($forceOcr) {
-            $pdo->prepare('UPDATE netdisk_index_jobs SET force_ocr=1 WHERE id=:id AND status="pending"')->execute([':id' => $existing]);
+            $pdo->prepare('UPDATE netdisk_index_jobs SET created_at=:t, force_ocr=1 WHERE id=:id AND status="pending"')->execute([':t' => time(), ':id' => $existing]);
+        } else {
+            $pdo->prepare('UPDATE netdisk_index_jobs SET created_at=:t WHERE id=:id AND status="pending"')->execute([':t' => time(), ':id' => $existing]);
         }
         return $existing;
     }
@@ -18992,7 +18998,9 @@ if ($path === '/admin/netdisk/reindex/retry' && $_SERVER['REQUEST_METHOD'] === '
     } else {
         api_response(400, null, '缺少参数');
     }
-    $upd = $pdo->prepare('UPDATE netdisk_index_jobs SET status="pending", started_at=0, finished_at=0, error="", cancel_requested=0, crash_count=0, heartbeat_at=:now WHERE id=:id');
+    // 0023: 续跑同样刷新 created_at（口径=最后一次被触发的时间，防 6 小时回收误杀）；
+    //       清 current_detail 残留展示，进度字段 ocr_files_done/ocr_files_total 保留以续跑。
+    $upd = $pdo->prepare('UPDATE netdisk_index_jobs SET status="pending", started_at=0, finished_at=0, error="", cancel_requested=0, crash_count=0, heartbeat_at=:now, created_at=:now, current_detail="" WHERE id=:id');
     $n = 0;
     foreach ($rows as $jid) {
         $upd->execute([':now' => time(), ':id' => (int)$jid]);

@@ -96,31 +96,41 @@ function nd_worker_reap_stuck(): void {
         $hbCutoff = $now - 300;   // 5 分钟无心跳视为 worker 中断
         $noHbStart = $now - 600;  // 无心跳且启动超 10 分钟视为遗留卡死
         $stCutoff = $now - 86400; // 24h 兜底
-        db()->prepare('UPDATE netdisk_index_jobs SET status="pending", started_at=0, finished_at=0
-            WHERE status="running" AND error LIKE "%锁%" AND heartbeat_at>0 AND heartbeat_at<:lock')
-            ->execute([':lock' => $lockCutoff]);
-        db()->prepare('UPDATE netdisk_index_jobs SET status="failed", error="worker 心跳超时，重建已中断，请重新触发", finished_at=:now
-            WHERE status="running" AND heartbeat_at>0 AND heartbeat_at<:hb')
-            ->execute([':now' => $now, ':hb' => $hbCutoff]);
+        // 0023：五条回收 UPDATE 各补一行 affected-rows 日志（仅 rowCount()>0 才打），
+        // 否则回收判定在日志里零痕迹，排障只能靠猜（真机 job id=6 被 6h 回收判死时日志一行都没有）。
+        $st = db()->prepare('UPDATE netdisk_index_jobs SET status="pending", started_at=0, finished_at=0
+            WHERE status="running" AND error LIKE "%锁%" AND heartbeat_at>0 AND heartbeat_at<:lock');
+        $st->execute([':lock' => $lockCutoff]);
+        if (($n = $st->rowCount()) > 0) nd_worker_log("reap lock-reset killed=$n");
+        $st = db()->prepare('UPDATE netdisk_index_jobs SET status="failed", error="worker 心跳超时，重建已中断，请重新触发", finished_at=:now
+            WHERE status="running" AND heartbeat_at>0 AND heartbeat_at<:hb');
+        $st->execute([':now' => $now, ':hb' => $hbCutoff]);
+        if (($n = $st->rowCount()) > 0) nd_worker_log("reap hb-timeout killed=$n");
         // pending 超时自愈：创建超 30 分钟却始终 pending（worker 死/未拾取），
         // 且该分享当前无 running job 在真正处理 → 标 failed 提示重新触发，避免无限"排队中"
         $pendingCutoff = $now - 21600; // 6 小时（大文件 OCR 需长时，避免误杀）
-        db()->prepare('UPDATE netdisk_index_jobs SET status="failed", error="队列等待超时，重建未开始，请重新触发", finished_at=:now
+        $st = db()->prepare('UPDATE netdisk_index_jobs SET status="failed", error="队列等待超时，重建未开始，请重新触发", finished_at=:now
             WHERE status="pending" AND created_at>0 AND created_at<:pc
-              AND NOT EXISTS (SELECT 1 FROM netdisk_index_jobs AS j2 WHERE j2.share_id = netdisk_index_jobs.share_id AND j2.status="running")')
-            ->execute([':now' => $now, ':pc' => $pendingCutoff]);
-        db()->prepare('UPDATE netdisk_index_jobs SET status="failed", error="worker 中断遗留，重建已重置，请重新触发", finished_at=:now
-            WHERE status="running" AND heartbeat_at=0 AND started_at>0 AND started_at<:ns')
-            ->execute([':now' => $now, ':ns' => $noHbStart]);
-        db()->prepare('UPDATE netdisk_index_jobs SET status="failed", error="超时未完成，已重置", finished_at=:now
-            WHERE status="running" AND started_at>0 AND started_at<:st')
-            ->execute([':now' => $now, ':st' => $stCutoff]);
+              AND NOT EXISTS (SELECT 1 FROM netdisk_index_jobs AS j2 WHERE j2.share_id = netdisk_index_jobs.share_id AND j2.status="running")');
+        $st->execute([':now' => $now, ':pc' => $pendingCutoff]);
+        if (($n = $st->rowCount()) > 0) nd_worker_log("reap pending-timeout killed=$n");
+        $st = db()->prepare('UPDATE netdisk_index_jobs SET status="failed", error="worker 中断遗留，重建已重置，请重新触发", finished_at=:now
+            WHERE status="running" AND heartbeat_at=0 AND started_at>0 AND started_at<:ns');
+        $st->execute([':now' => $now, ':ns' => $noHbStart]);
+        if (($n = $st->rowCount()) > 0) nd_worker_log("reap nohb-stale killed=$n");
+        $st = db()->prepare('UPDATE netdisk_index_jobs SET status="failed", error="超时未完成，已重置", finished_at=:now
+            WHERE status="running" AND started_at>0 AND started_at<:st');
+        $st->execute([':now' => $now, ':st' => $stCutoff]);
+        if (($n = $st->rowCount()) > 0) nd_worker_log("reap started-timeout killed=$n");
     } catch (Throwable $e) {
         // 瞬时锁/写冲突：跳过本轮，下轮重试
     }
 }
 
 nd_worker_log('worker started ' . $__ndMem);
+
+// 0023: 主循环心跳节流游标——每 30s 至多一行 poll pending=N，避免 sleep(5) 空转刷爆 supervisor 日志。
+$__ndLastPoll = time();
 
 while (true) {
     try {
@@ -130,6 +140,20 @@ while (true) {
             db()->prepare('UPDATE netdisk_ocr_queue SET status="pending", started_at=0, error=""
                 WHERE status="failed" AND error="下载失败" AND attempts<3')->execute();
         } catch (Throwable $e) {}
+
+        // 0023: 主循环心跳——每 30s 一行 poll pending=N（N=待拾取的索引重建任务数）。
+        // 此前空闲轮询零日志，「worker 到底有没有在拾取」只能靠 DB 反推；有了这行，
+        // 日志能直接证明 worker 存活且在轮询，pending 数还能与用户点击重建的时刻对齐。
+        // 放在 job SELECT 之前，空闲/OCR 批处理/拾取三条路径每轮都会经过；30s 节流防刷屏。
+        if (time() - $__ndLastPoll >= 30) {
+            $__ndLastPoll = time();
+            try {
+                $__ndPending = (int)db()->query('SELECT COUNT(*) FROM netdisk_index_jobs WHERE status="pending"')->fetchColumn();
+            } catch (Throwable $e) {
+                $__ndPending = -1; // 瞬时锁等查询失败不致命，打 -1 标记本轮
+            }
+            nd_worker_log("poll pending=$__ndPending");
+        }
 
         $stmt = db()->query('SELECT id, share_id, force_ocr FROM netdisk_index_jobs WHERE status = "pending" ORDER BY id ASC LIMIT 1');
         $job = $stmt->fetch(PDO::FETCH_ASSOC);
