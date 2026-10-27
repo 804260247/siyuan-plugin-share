@@ -653,6 +653,8 @@ function migrate(PDO $pdo): void {
         'ocr_files_done' => 'INTEGER NOT NULL DEFAULT 0',
         'heartbeat_at' => 'INTEGER NOT NULL DEFAULT 0',
         'force_ocr' => 'INTEGER NOT NULL DEFAULT 0',
+        // 0019: worker 崩溃循环保护计数（fatal 退出 +1，成功完成清零；≥2 → job 标 failed 不再自动重拾）
+        'crash_count' => 'INTEGER NOT NULL DEFAULT 0',
     ];
     foreach ($extraJobCols as $col => $def) {
         if (!in_array($col, $jobColNames, true)) {
@@ -3052,31 +3054,187 @@ function netdisk_ocr_sidecar_available(): bool {
     return $ok;
 }
 
+// ===== 0019: OCR 内存预算守卫 =====
+// 背景：worker 在真机三次 `Allowed memory size of 1073741824 bytes exhausted`——
+// 旧 netdisk_ocr_image_resize_b64() 的"超预算图先降采样"分支会先把整幅图 imagecreatefromstring，
+// 巨图（≈1.23 亿像素、真彩解码 ≈470MB）恰好在"防 OOM"那一步触发 PHP Fatal。
+// GD 没有流式解码，唯一安全做法：解码前先算解码需求，超预算拒绝解码并记 invalid。
+
+// 解析 php.ini 简写字节（"1G"/"256M"/"-1"）；-1/0 返回 -1（不限语义），空/非法返回 0。
+function netdisk_ocr_parse_bytes(string $v): int {
+    $v = trim($v);
+    if ($v === '') {
+        return 0;
+    }
+    $n = (int)$v;
+    if ($n <= 0 && !is_numeric($v)) {
+        return 0;
+    }
+    if ($n < 0) {
+        return -1;
+    }
+    $unit = strtolower(substr($v, -1));
+    if ($unit === 'g') {
+        $n *= 1024 * 1024 * 1024;
+    } elseif ($unit === 'm') {
+        $n *= 1024 * 1024;
+    } elseif ($unit === 'k') {
+        $n *= 1024;
+    }
+    return $n;
+}
+
+// 读 cgroup 内存上限（字节）；0 = 未知或不限。v2 优先，v1 兜底（v1 无限制时为近 2^63 哨兵值）。
+function netdisk_ocr_cgroup_limit(): int {
+    if (isset($GLOBALS['ND_OCR_CGROUP_LIMIT'])) { // 桩测钩子：生产环境不设该 GLOBALS
+        return (int)$GLOBALS['ND_OCR_CGROUP_LIMIT'];
+    }
+    foreach (['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes'] as $f) {
+        if (is_readable($f)) {
+            $s = trim((string)@file_get_contents($f));
+            if ($s === 'max' || $s === '') {
+                continue;
+            }
+            $n = (int)$s;
+            if ($n > 0 && $n < (1 << 50)) {
+                return $n;
+            }
+        }
+    }
+    return 0;
+}
+
+// 读 cgroup 当前内存用量（字节）；0 = 未知。
+function netdisk_ocr_cgroup_current(): int {
+    if (isset($GLOBALS['ND_OCR_CGROUP_CURRENT'])) { // 桩测钩子：生产环境不设该 GLOBALS
+        return (int)$GLOBALS['ND_OCR_CGROUP_CURRENT'];
+    }
+    foreach (['/sys/fs/cgroup/memory.current', '/sys/fs/cgroup/memory/memory.usage_in_bytes'] as $f) {
+        if (is_readable($f)) {
+            $n = (int)trim((string)@file_get_contents($f));
+            if ($n > 0) {
+                return $n;
+            }
+        }
+    }
+    return 0;
+}
+
+// OCR 解码可用内存预算（字节）：
+//  - memory_limit > 0  → limit − 当前进程已用；
+//  - memory_limit = -1 → cgroup 上限 − max(进程已用, cgroup 用量)（worker 解除 1G 上限后
+//    容器仍受 compose mem_limit 约束，不能再按"无限"或 256MB 兜底乱算）；
+//  - 两者都拿不到 → 保守 256MB 兜底。
+// 最后乘 60% 安全系数：imagecopyresampled 目标副本、JPEG 编码与 base64 峰值都要留余量。
+function netdisk_ocr_memory_budget(): int {
+    $lim = netdisk_ocr_parse_bytes((string)ini_get('memory_limit'));
+    $used = memory_get_usage(true);
+    $avail = 0;
+    if ($lim > 0) {
+        $avail = $lim - $used;
+    } elseif ($lim < 0) {
+        $cg = netdisk_ocr_cgroup_limit();
+        if ($cg > 0) {
+            $avail = $cg - max($used, netdisk_ocr_cgroup_current());
+        }
+    }
+    if ($avail <= 0) {
+        $avail = 268435456;
+    }
+    return (int)max(1048576, floor($avail * 0.6));
+}
+
+// 记录"该图片无法安全解码"的原因（按文件路径为键；文件删除后仍可查）。
+// 状态行落库时读取：status='invalid' + last_error=原因，不再笼统记 failed。
+function netdisk_ocr_invalid_mark(string $path, string $reason): void {
+    if (!isset($GLOBALS['ND_OCR_INVALID']) || !is_array($GLOBALS['ND_OCR_INVALID'])) {
+        $GLOBALS['ND_OCR_INVALID'] = [];
+    }
+    $GLOBALS['ND_OCR_INVALID'][$path] = $reason;
+}
+
+function netdisk_ocr_invalid_reason(string $path): string {
+    return (string)($GLOBALS['ND_OCR_INVALID'][$path] ?? '');
+}
+
+// 0019: pdftoppm 栅格化 DPI 源头夹取——按 pdfinfo 页面尺寸(pts)估算单页真彩解码需求
+// （像素×4 字节），超预算则按 50 步长下调 DPI，下限 150（再低识别率显著下降，宁可交给
+// 预算守卫跳过）。不让 GD 事后处理超预算数据；同时是 0021 DPI 自动定档的实现基础。
+function netdisk_ocr_pdf_clamp_dpi(string $pdfPath, int $dpi): int {
+    $req = max(1, (int)$dpi);
+    $wPt = 595.0;
+    $hPt = 842.0; // pdfinfo 缺失/不可解析时按 A4 兜底
+    $info = @shell_exec('pdfinfo ' . escapeshellarg($pdfPath) . ' 2>/dev/null');
+    if (is_string($info) && preg_match('/Page size:\s+([\d.]+)\s+x\s+([\d.]+)/', $info, $m)) {
+        $wPt = max(1.0, (float)$m[1]);
+        $hPt = max(1.0, (float)$m[2]);
+    }
+    $budget = netdisk_ocr_memory_budget();
+    $out = $req;
+    while ($out > 150) {
+        $pxW = $wPt / 72.0 * $out;
+        $pxH = $hPt / 72.0 * $out;
+        if ($pxW * $pxH * 4 <= $budget) {
+            break;
+        }
+        $out -= 50;
+    }
+    $out = max(150, $out);
+    if ($out !== $req) {
+        @error_log('[nd-ocr] pdf page dpi clamped ' . $req . '->' . $out . ' (' . basename($pdfPath) . ')');
+    }
+    return $out;
+}
+
+// 0019: 统一的 pdftoppm 栅格化入口：DPI 源头夹取 + 超时保护 + 超时删除半截产物。
+// 超时（旧实现直接 glob 半截 PNG 送 sidecar，触发 libpng "PNG input buffer is incomplete"
+// → serving 500）后本轮所有页 PNG 一律删除并返回 false，绝不把半截文件喂给下游。
+// $timeoutSec<=0 时按页数自适应：max(NETDISK_OCR_CMD_TIMEOUT, 页数×2s)（整本大 PDF 60s 不够）。
+function netdisk_ocr_pdf_render(string $ppm, string $pdfPath, string $outPrefix, int $dpi, string $pageOpt = '', int $timeoutSec = 0): bool {
+    $dpi = netdisk_ocr_pdf_clamp_dpi($pdfPath, $dpi);
+    $timeout = $timeoutSec;
+    if ($timeout <= 0) {
+        $timeout = NETDISK_OCR_CMD_TIMEOUT;
+        $info = @shell_exec('pdfinfo ' . escapeshellarg($pdfPath) . ' 2>/dev/null');
+        if (is_string($info) && preg_match('/Pages:\s+(\d+)/', $info, $m)) {
+            $timeout = max(NETDISK_OCR_CMD_TIMEOUT, ((int)$m[1]) * 2);
+        }
+    }
+    $ok = netdisk_run_cmd_timeout(escapeshellarg($ppm) . $pageOpt . ' -r ' . (int)$dpi . ' -png ' . escapeshellarg($pdfPath) . ' ' . escapeshellarg($outPrefix) . ' 2>/dev/null', $timeout);
+    if (!$ok) {
+        foreach (glob($outPrefix . '-*.png') ?: [] as $part) {
+            @unlink($part);
+        }
+    }
+    return $ok;
+}
+
 // 将图片缩放(长边≤阈值)并返回 base64：PDF 页 200DPI 大图(1654×2339)直接传 serving 会触发
 // onnxruntime 内存峰值崩溃，缩放后体积/边长下降，识别精度几乎不损。
 function netdisk_ocr_image_resize_b64(string $imgPath, int $maxSide = 960, int $quality = 85): string {
+    // 0019: 解码前预算守卫——先算"整幅真彩解码需要多少字节"，超预算直接拒绝并记 invalid。
+    // 旧实现在"超预算先降采样"分支里先整幅 imagecreatefromstring（巨图 ≈470MB 解码需求），
+    // 恰好在防 OOM 的保护代码处触发 Allowed memory exhausted，worker 三连崩。
+    $budget = netdisk_ocr_memory_budget();
+    $fsize = (int)@filesize($imgPath);
+    if ($fsize > $budget) {
+        netdisk_ocr_invalid_mark($imgPath, 'file too large: ' . round($fsize / 1048576, 1) . 'MB (budget ' . round($budget / 1048576, 1) . 'MB)');
+        return '';
+    }
+    $imgSz = @getimagesize($imgPath);
+    $sw = $imgSz ? (int)$imgSz[0] : 0;
+    $sh = $imgSz ? (int)$imgSz[1] : 0;
+    if ($sw > 0 && $sh > 0 && ($sw * $sh * 4) > $budget) {
+        netdisk_ocr_invalid_mark($imgPath, 'image too large: ' . $sw . 'x' . $sh . ' (~' . round($sw * $sh * 4 / 1048576) . 'MB needed, budget ' . round($budget / 1048576, 1) . 'MB)');
+        return '';
+    }
     if (function_exists('imagecreatefromstring')) {
-        // 自适应内存：先预读尺寸，超像素预算则降采样后再 GD，避免 OOM 拖死 worker
-        $memMax = (int)ini_get('memory_limit');
-        $memMax = $memMax > 0 ? $memMax : 268435456;
-        $pxBudget = (int)max(100000, floor($memMax / 3 / 4));
-        $imgSz = @getimagesize($imgPath);
-        $sw = $imgSz ? (int)$imgSz[0] : 0;
-        $sh = $imgSz ? (int)$imgSz[1] : 0;
-        $decoded = (string)@file_get_contents($imgPath);
-        if ($sw > 0 && $sh > 0 && ($sw * $sh) > $pxBudget) {
-            $rs = sqrt($pxBudget / ($sw * $sh));
-            $pw = (int)max(1, round($sw * $rs));
-            $ph = (int)max(1, round($sh * $rs));
-            $pre = @imagecreatefromstring($decoded);
-            if ($pre !== false) {
-                $tm = imagecreatetruecolor($pw, $ph);
-                imagecopyresampled($tm, $pre, 0, 0, 0, 0, $pw, $ph, $sw, $sh);
-                ob_start(); imagejpeg($tm, null, $quality); $decoded = (string)ob_get_clean();
-                imagedestroy($tm); imagedestroy($pre);
-            }
+        $decoded = @file_get_contents($imgPath);
+        if (!is_string($decoded) || $decoded === '') {
+            return '';
         }
         $src = @imagecreatefromstring($decoded);
+        unset($decoded); // 0019: 解码后立即释放原始字节，降低峰值
         if ($src !== false) {
             $w = imagesx($src);
             $h = imagesy($src);
@@ -3117,6 +3275,11 @@ function netdisk_ocr_sidecar_recognize(string $imgPath, int $dpi = 0): ?array {
         return null;
     }
     if ($b64 === '') {
+        // 0019: 入参为空（预算守卫拒绝解码/文件不可读）→ 绝不把空串发给 sidecar；
+        // 记录原因供调用方状态行归因 invalid（HTTP/解析逻辑不动）
+        if (is_file($imgPath) && netdisk_ocr_invalid_reason($imgPath) === '') {
+            netdisk_ocr_invalid_mark($imgPath, 'empty image payload (unreadable or zero-length)');
+        }
         return null;
     }
     $payload = json_encode(['file' => $b64, 'fileType' => 1], JSON_UNESCAPED_UNICODE);
@@ -3267,9 +3430,12 @@ function netdisk_ocr_recognize_pdf(string $pdfPath, int $dpi = 300, int $f = 1, 
         @copy($pdfPath, $tmpPdf);
     }
     $pageOpt = ($f > 1 || $l > 0) ? (' -f ' . max(1, (int)$f) . ' -l ' . (($l > 0) ? (int)$l : 9999)) : '';
-    netdisk_run_cmd_timeout(escapeshellarg($ppm) . $pageOpt . ' -r ' . (int)$dpi . ' -png ' . escapeshellarg($tmpPdf) . ' ' . escapeshellarg($tmpPdf . '_pg') . ' 2>/dev/null', NETDISK_OCR_CMD_TIMEOUT);
-    $pages = glob($tmpPdf . '_pg-*.png') ?: [];
+    // 0019: DPI 源头夹取 + 超时删半截产物；超时返回 false 时 glob 必为空（旧实现会把半截 PNG 送 sidecar）
+    $renderOk = netdisk_ocr_pdf_render($ppm, $tmpPdf, $tmpPdf . '_pg', $dpi, $pageOpt);
+    $pages = $renderOk ? (glob($tmpPdf . '_pg-*.png') ?: []) : [];
     @unlink($tmpPdf);
+    // 0019: 页级进度（成功识别页数）按原始路径记入 GLOBALS，供状态行 pages_done 落库（0021 定档/断点观测）
+    $pagesDone = 0;
     $sidecarActive = netdisk_ocr_sidecar_enabled() && netdisk_ocr_sidecar_available();
     $text = '';
     $tsvAll = '';
@@ -3286,6 +3452,7 @@ function netdisk_ocr_recognize_pdf(string $pdfPath, int $dpi = 300, int $f = 1, 
                 $res = netdisk_ocr_sidecar_recognize($pg, $dpi);
             }
             if ($res !== null) {
+                $pagesDone++;
                 $text .= ' ' . $res['text'];
                 $nAcc += $res['n'];
                 $avgAcc += $res['avg_conf'] * $res['n'];
@@ -3311,8 +3478,15 @@ function netdisk_ocr_recognize_pdf(string $pdfPath, int $dpi = 300, int $f = 1, 
             }
             @unlink($outTxt);
         }
+        if ($text !== '') {
+            $pagesDone++;
+        }
         @unlink($pg);
     }
+    if (!isset($GLOBALS['ND_OCR_PAGES_DONE']) || !is_array($GLOBALS['ND_OCR_PAGES_DONE'])) {
+        $GLOBALS['ND_OCR_PAGES_DONE'] = [];
+    }
+    $GLOBALS['ND_OCR_PAGES_DONE'][$pdfPath] = max((int)($GLOBALS['ND_OCR_PAGES_DONE'][$pdfPath] ?? 0), $pagesDone);
     if ($sidecarActive && $nAcc > 0) {
         $stats = netdisk_ocr_tsv_parse($tsvAll); // 仅占位（空）；用 sidecar 聚合统计
         return [
@@ -3321,6 +3495,7 @@ function netdisk_ocr_recognize_pdf(string $pdfPath, int $dpi = 300, int $f = 1, 
             'low_pct' => round($lowAcc * 100 / $nAcc, 1),
             'n' => $nAcc,
             'pages' => count($pages),
+            'pages_done' => $pagesDone,
         ];
     }
     $stats = netdisk_ocr_tsv_parse($tsvAll);
@@ -3330,6 +3505,7 @@ function netdisk_ocr_recognize_pdf(string $pdfPath, int $dpi = 300, int $f = 1, 
         'low_pct' => $stats['low_pct'],
         'n' => $stats['n'],
         'pages' => count($pages),
+        'pages_done' => $pagesDone,
     ];
 }
 
@@ -3608,7 +3784,8 @@ function netdisk_ocr_retry_upgrade(string $ext, string $tmpIn, int $dpi): string
         if ($ppm === '') {
             return '';
         }
-        netdisk_run_cmd_timeout(escapeshellarg($ppm) . ' -r ' . (int)$dpi . ' -png ' . escapeshellarg($tmpIn) . ' ' . escapeshellarg($tmpIn . '_pg' . $dpi) . ' 2>/dev/null', NETDISK_OCR_CMD_TIMEOUT);
+        // 0019: 统一渲染入口（夹 DPI + 超时删半截产物）
+        netdisk_ocr_pdf_render($ppm, $tmpIn, $tmpIn . '_pg' . $dpi, $dpi);
         foreach (glob($tmpIn . '_pg' . $dpi . '-*.png') ?: [] as $png) {
             $doOcr($png);
             @unlink($png);
@@ -3639,8 +3816,8 @@ function netdisk_ocr_extract_file(string $ext, string $tmpIn): string {
         if ($ppm === '') {
             return '';
         }
-        // 超时保护：防止 pdftoppm 对异常/超大 PDF 挂起
-        netdisk_run_cmd_timeout(escapeshellarg($ppm) . ' -r ' . NETDISK_OCR_DPI . ' -png ' . escapeshellarg($tmpIn) . ' ' . escapeshellarg($tmpIn . '_pg') . ' 2>/dev/null', NETDISK_OCR_CMD_TIMEOUT);
+        // 超时保护：防止 pdftoppm 对异常/超大 PDF 挂起；0019: 统一渲染入口（夹 DPI + 超时删半截产物）
+        netdisk_ocr_pdf_render($ppm, $tmpIn, $tmpIn . '_pg', NETDISK_OCR_DPI);
         foreach (glob($tmpIn . '_pg-*.png') ?: [] as $png) {
             $doOcr($png);
             @unlink($png);
@@ -3782,7 +3959,8 @@ function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PD
                     @copy($tmp, $tmpPdf);
                 }
                 // 首次仅栅格化前 5 页作质量样本（页数不足自动截断）；最终 DPI 由 finalize 预判后整本重扫
-                netdisk_run_cmd_timeout(escapeshellarg($ppm) . ' -f 1 -l 5 -r ' . (int)$curDpi . ' -png ' . escapeshellarg($tmpPdf) . ' ' . escapeshellarg($tmpPdf . '_pg') . ' 2>/dev/null', NETDISK_OCR_CMD_TIMEOUT);
+                // 0019: 统一渲染入口（夹 DPI + 超时删半截产物）
+                netdisk_ocr_pdf_render($ppm, $tmpPdf, $tmpPdf . '_pg', $curDpi, ' -f 1 -l 5');
                 $pages = glob($tmpPdf . '_pg-*.png') ?: [];
                 // 只删栅格化副本；原始 PDF 字节保留（$toClean），供 finalize 用最终 DPI 整本重扫
                 @unlink($tmpPdf);
@@ -3968,7 +4146,8 @@ function netdisk_ocr_pdf_scan(string $tmp, int $dpi, ?int $maxPages = null, ?arr
         @copy($tmp, $tmpPdf);
     }
     $pageOpt = ($maxPages !== null && $maxPages > 0) ? (' -f 1 -l ' . (int)$maxPages) : '';
-    netdisk_run_cmd_timeout(escapeshellarg($ppm) . $pageOpt . ' -r ' . (int)$dpi . ' -png ' . escapeshellarg($tmpPdf) . ' ' . escapeshellarg($tmpPdf . '_pg') . ' 2>/dev/null', NETDISK_OCR_CMD_TIMEOUT);
+    // 0019: 统一渲染入口（夹 DPI + 超时删半截产物）
+    netdisk_ocr_pdf_render($ppm, $tmpPdf, $tmpPdf . '_pg', $dpi, $pageOpt);
     $pages = glob($tmpPdf . '_pg-*.png') ?: [];
     @unlink($tmpPdf);
     $out = '';
@@ -4311,7 +4490,7 @@ function netdisk_index_job_update(int $jobId, array $patch, ?PDO $pdo = null): v
     if ($jobId <= 0) {
         return;
     }
-    $allowed = ['status', 'files', 'folders', 'texts', 'errors', 'ocr_skipped', 'ocr_done', 'ocr_queued', 'processed_dirs', 'total_dirs', 'total_files', 'current_dir', 'current_uri', 'current_name', 'current_detail', 'ocr_done_count', 'ocr_total', 'queue_remaining', 'heartbeat_at', 'notes', 'error', 'started_at', 'finished_at', 'attempts', 'cancel_requested', 'ocr_files_total', 'ocr_files_done'];
+    $allowed = ['status', 'files', 'folders', 'texts', 'errors', 'ocr_skipped', 'ocr_done', 'ocr_queued', 'processed_dirs', 'total_dirs', 'total_files', 'current_dir', 'current_uri', 'current_name', 'current_detail', 'ocr_done_count', 'ocr_total', 'queue_remaining', 'heartbeat_at', 'notes', 'error', 'started_at', 'finished_at', 'attempts', 'cancel_requested', 'ocr_files_total', 'ocr_files_done', 'crash_count'];
     $sets = [];
     $params = [':id' => $jobId];
     foreach ($patch as $k => $v) {
@@ -4788,25 +4967,38 @@ $text = '';
             netdisk_index_job_update($jobId, ['ocr_files_total' => count($ocrTasks), 'ocr_files_done' => 0], $pdo);
         }
         $poolRes = netdisk_ocr_run_pool($ocrTasks, netdisk_index_ocr_concurrency($configId), $jobId, $pdo);
-        // 0018: finalize 会删除 tmp，先抓 PDF 总页数供状态表落库（尽力而为，取不到记 0）
-        $pdfPages = [];
-        foreach ($ocrTasks as $task) {
-            if (strtolower(ltrim((string)($task['ext'] ?? ''), '.')) === 'pdf' && isset($task['tmp']) && is_file($task['tmp'])) {
-                $pi = @shell_exec('pdfinfo ' . escapeshellarg($task['tmp']) . ' 2>/dev/null');
-                if (is_string($pi) && preg_match('/Pages:\s+(\d+)/', $pi, $pm)) {
-                    $pdfPages[(string)$task['uri']] = (int)$pm[1];
-                }
-            }
-        }
         $stEngine = (netdisk_ocr_sidecar_enabled() && netdisk_ocr_sidecar_available()) ? 'paddleocr-sidecar'
             : (trim((string)shell_exec('command -v tesseract 2>/dev/null')) !== '' ? 'tesseract' : '');
         // 0018: 池起点计时——elapsed_ms/pages_per_min 供 0021 自动定档做历史样本
         $poolT0 = microtime(true);
-        // 统一后处理：规范化 + 自适应 DPI 重试（质量不足自动提升）+ 清理 tmp
-        $finalResults = netdisk_ocr_finalize_results($ocrTasks, $poolRes['results']);
+        // 0019: 逐文件 finalize（旧实现对全部任务一次性 netdisk_ocr_finalize_results，
+        // 整本重扫+逐级升 DPI 期间零心跳（前端 300s 判死），一次 Fatal 全部结果尽丢）。
+        // 现在每文件独立 finalize：完成即写正文+状态行+心跳；中途崩溃时已完成文件全部保留，
+        // 配合 0018 增量判定，重启后天然按文件粒度续跑。
+        $finTotal = count($ocrTasks);
+        $finIdx = 0;
         foreach ($ocrTasks as $task) {
             $uri = $task['uri'];
-            $txt = trim((string)($finalResults[$uri] ?? ''));
+            $finIdx++;
+            // 0018: finalize 会删除 tmp，先抓该文件 PDF 总页数供状态表落库（尽力而为，取不到记 0）
+            $stPages = 0;
+            if (strtolower(ltrim((string)($task['ext'] ?? ''), '.')) === 'pdf' && isset($task['tmp']) && is_file($task['tmp'])) {
+                $pi = @shell_exec('pdfinfo ' . escapeshellarg($task['tmp']) . ' 2>/dev/null');
+                if (is_string($pi) && preg_match('/Pages:\s+(\d+)/', $pi, $pm)) {
+                    $stPages = (int)$pm[1];
+                }
+            }
+            // 该文件的池内原始结果单独交给 finalize（签名不变，单元素数组即逐文件模式）
+            $oneRaw = isset($poolRes['results'][$uri]) ? [$uri => $poolRes['results'][$uri]] : [];
+            $oneFinal = netdisk_ocr_finalize_results([$task], $oneRaw);
+            // 0019: 每文件 finalize 完成即写心跳——长 PDF 后处理期间前端不再误判 worker 已死
+            if ($jobId > 0) {
+                netdisk_index_job_update($jobId, [
+                    'heartbeat_at' => time(),
+                    'current_detail' => 'OCR 后处理 ' . $finIdx . '/' . $finTotal . '：' . (string)($task['name'] ?? ''),
+                ], $pdo);
+            }
+            $txt = trim((string)($oneFinal[$uri] ?? ''));
             if ($txt !== '') {
                 netdisk_exec_retry(fn() => $updText->execute([':text' => $txt, ':sid' => $shareId, ':uri' => $uri]));
                 $texts++;
@@ -4826,9 +5018,13 @@ $text = '';
             // 否则成功多轮的文件累计 attempts>=3 后，一次偶发失败即被永久放弃。
             $stAtt = ($txt !== '') ? 0 : ($forceOcr ? 1 : ((int)($prevSt['attempts'] ?? 0) + 1));
             $stFirst = (int)($prevSt['first_at'] ?? 0) > 0 ? (int)$prevSt['first_at'] : time();
-            $stPages = (int)($pdfPages[$uri] ?? 0);
-            $stStatus = $txt !== '' ? 'done' : 'failed';
-            $stErr = $txt !== '' ? '' : 'OCR 返回空文本（图片损坏/格式不支持/OCR 服务异常）';
+            // 0019: 失败归因——预算守卫标记过的文件（巨图/超大文件）落 invalid + 具体原因，
+            // 不再笼统记 failed；invalid 同样计入 attempts>=3 熔断（巨图重试三次也不会变小）。
+            $invReason = isset($task['tmp']) ? netdisk_ocr_invalid_reason((string)$task['tmp']) : '';
+            $stStatus = $txt !== '' ? 'done' : ($invReason !== '' ? 'invalid' : 'failed');
+            $stErr = $txt !== '' ? '' : ($invReason !== '' ? $invReason : 'OCR 返回空文本（图片损坏/格式不支持/OCR 服务异常）');
+            // 0019: 页级进度——成功记总页数；失败记已成功识别页数（GLOBALS 由 recognize_pdf 维护）
+            $stPagesDone = $txt !== '' ? $stPages : (int)($GLOBALS['ND_OCR_PAGES_DONE'][(string)($task['tmp'] ?? '')] ?? 0);
             // 0018: 耗时指标——优先 finalize 逐文件真实耗时；桩/异常缺失时退回池累计。
             // pages_per_min 仅 PDF（页数>0）有意义，图片记 0。
             $stElapsed = (int)($GLOBALS['ND_OCR_FINALIZE_TIMINGS'][$uri] ?? 0);
@@ -4840,7 +5036,7 @@ $text = '';
                 ':sid' => $shareId, ':uri' => $uri, ':u' => (string)($task['updated_at'] ?? ''), ':z' => (int)($task['size'] ?? 0),
                 ':st' => $stStatus, ':q' => $stQ, ':c' => $stChars, ':a' => $stAtt, ':e' => $stErr,
                 ':dpi' => $txt !== '' ? netdisk_index_ocr_dpi_start($configId) : 0,
-                ':pt' => $stPages, ':pd' => $txt !== '' ? $stPages : 0,
+                ':pt' => $stPages, ':pd' => $stPagesDone,
                 ':eng' => $stEngine, ':ems' => $stElapsed, ':ppm' => $stPpm, ':first' => $stFirst, ':t' => time(),
             ]));
             $ocrState[$uri] = ['uri' => $uri, 'updated_at' => (string)($task['updated_at'] ?? ''), 'status' => $stStatus,
@@ -5088,6 +5284,11 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
             // 0018 必改: attempts = 连续失败计数——成功归零；失败跨轮累计 +1（此前恒写 1，熔断永远触发不了）；starved 轮不加计数
             $qPrev = $qPrevState[(int)$m['share_id'] . '|' . $uri] ?? null;
             $qAtt = $txt !== '' ? 0 : ((int)($qPrev['attempts'] ?? 0) + 1);
+            // 0019: 失败归因（预算守卫标记 → invalid + 原因）与页级进度
+            $qInv = netdisk_ocr_invalid_reason((string)($j['tmp'] ?? ''));
+            $qSt = $txt !== '' ? 'done' : ($qInv !== '' ? 'invalid' : 'failed');
+            $qErr = $txt !== '' ? '' : ($qInv !== '' ? $qInv : 'OCR 返回空文本（图片损坏/格式不支持/OCR 服务异常）');
+            $qPagesDone = $txt !== '' ? $qPages : (int)($GLOBALS['ND_OCR_PAGES_DONE'][(string)($j['tmp'] ?? '')] ?? 0);
             $qFirst = (int)($qPrev['first_at'] ?? 0) > 0 ? (int)$qPrev['first_at'] : $qNow;
             // 0018: 耗时指标——优先 finalize 逐文件真实耗时，缺失退回批累计（PDF 记 pages_per_min，图片记 0）
             $qElapsed = (int)($GLOBALS['ND_OCR_FINALIZE_TIMINGS'][$uri] ?? 0);
@@ -5097,9 +5298,9 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
             $qPpm = ($qPages > 0 && $qElapsed > 0) ? round($qPages / ($qElapsed / 60000.0), 2) : 0.0;
             netdisk_exec_retry(fn() => $upOcrFileQ->execute([
                 ':sid' => (int)$m['share_id'], ':uri' => $uri, ':u' => '', ':z' => 0,
-                ':st' => $txt !== '' ? 'done' : 'failed', ':q' => $qQ, ':c' => $qChars, ':a' => $qAtt,
-                ':e' => $txt !== '' ? '' : 'OCR 返回空文本（图片损坏/格式不支持/OCR 服务异常）',
-                ':dpi' => 0, ':pt' => $qPages, ':pd' => $txt !== '' ? $qPages : 0,
+                ':st' => $qSt, ':q' => $qQ, ':c' => $qChars, ':a' => $qAtt,
+                ':e' => $qErr,
+                ':dpi' => 0, ':pt' => $qPages, ':pd' => $qPagesDone,
                 ':eng' => $stEngineQ, ':ems' => $qElapsed, ':ppm' => $qPpm, ':first' => $qFirst, ':t' => $qNow,
             ]));
             $totalDone++;
@@ -18682,7 +18883,7 @@ if ($path === '/admin/netdisk/reindex/retry' && $_SERVER['REQUEST_METHOD'] === '
     } else {
         api_response(400, null, '缺少参数');
     }
-    $upd = $pdo->prepare('UPDATE netdisk_index_jobs SET status="pending", started_at=0, finished_at=0, error="", cancel_requested=0, heartbeat_at=:now WHERE id=:id');
+    $upd = $pdo->prepare('UPDATE netdisk_index_jobs SET status="pending", started_at=0, finished_at=0, error="", cancel_requested=0, crash_count=0, heartbeat_at=:now WHERE id=:id');
     $n = 0;
     foreach ($rows as $jid) {
         $upd->execute([':now' => time(), ':id' => (int)$jid]);

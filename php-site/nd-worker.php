@@ -14,10 +14,61 @@ if (PHP_SAPI !== 'cli') {
 
 set_time_limit(0);
 error_reporting(E_ALL & ~E_DEPRECATED);
+// 0019: worker 为 CLI 单作业串行进程，解除 php.ini 的 1G 上限（真机三连崩根因：
+// Allowed memory size of 1073741824 bytes exhausted）。安全边界不靠该上限，
+// 靠 netdisk_ocr_memory_budget()：cgroup 上限 − 已用，再乘 60% 安全系数做解码预算守卫。
+ini_set('memory_limit', '-1');
 
+// 0019: 所有日志行加时间戳（supervisord 只给自己的行打时间，child 行没有——
+// 排障时无法与 supervisord.log 的崩溃时刻对齐）。
 function nd_worker_log(string $msg): void {
-    @error_log('[nd-worker] ' . $msg);
+    @error_log(date('Y-m-d H:i:s') . ' [nd-worker] ' . $msg);
 }
+
+// 0019: Fatal 归因与崩溃循环保护：同一 job 连续 crash 2 次即标 failed，不再自动重拾
+// （旧行为：fatal → supervisord 拉起 → 重拾同一 job → 同一文件再 fatal，无限循环）。
+// 单独成函数供 shutdown 注册与桩测直调。
+function nd_worker_handle_fatal(array $err): void {
+    $peak = memory_get_peak_usage(true);
+    $msg = sprintf('%s @%s:%d peak=%dMB', (string)($err['message'] ?? ''), (string)($err['file'] ?? ''), (int)($err['line'] ?? 0), (int)($peak / 1048576));
+    nd_worker_log('FATAL ' . $msg);
+    $jobId = (int)($GLOBALS['ND_WORKER_JOB'] ?? 0);
+    if ($jobId <= 0 || !isset($GLOBALS['config']['db_path'])) {
+        return;
+    }
+    // 独立连接：崩溃现场 db() 静态连接可能已不可用
+    try {
+        $pdo = new PDO('sqlite:' . $GLOBALS['config']['db_path']);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $pdo->exec('PRAGMA busy_timeout = 5000;');
+        $crash = (int)$pdo->query('SELECT crash_count FROM netdisk_index_jobs WHERE id=' . $jobId)->fetchColumn() + 1;
+        if ($crash >= 2) {
+            $pdo->prepare('UPDATE netdisk_index_jobs SET status="failed", crash_count=:c, error=:e, finished_at=:t, heartbeat_at=:t WHERE id=:id')
+                ->execute([':c' => $crash, ':e' => 'worker 连续崩溃 ' . $crash . ' 次，已停止自动重试：' . substr($msg, 0, 200), ':t' => time(), ':id' => $jobId]);
+            nd_worker_log("job=$jobId crash=$crash (>=2) marked failed, stop auto-retry");
+        } else {
+            $pdo->prepare('UPDATE netdisk_index_jobs SET status="pending", crash_count=:c, started_at=0, finished_at=0, error=:e, heartbeat_at=:t WHERE id=:id')
+                ->execute([':c' => $crash, ':e' => 'worker 崩溃已重置待重试（第 ' . $crash . ' 次，连续 2 次即放弃）：' . substr($msg, 0, 150), ':t' => time(), ':id' => $jobId]);
+            nd_worker_log("job=$jobId crash=$crash reset to pending");
+        }
+    } catch (Throwable $e) {
+        nd_worker_log('fatal handler db error: ' . $e->getMessage());
+    }
+}
+
+register_shutdown_function(function (): void {
+    $err = error_get_last();
+    if ($err === null) {
+        return;
+    }
+    if (!in_array((int)$err['type'], [E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_PARSE, E_USER_ERROR], true)) {
+        return;
+    }
+    nd_worker_handle_fatal($err);
+});
+
+// 0019: 启动首行打内存三件套，确证运行期上限口径（memory_limit/cgroup 上限/当前用量）
+$__ndMem = sprintf('memory_limit=%s cgroup_max=%d cgroup_current=%d usage=%d', (string)ini_get('memory_limit'), netdisk_ocr_cgroup_limit(), netdisk_ocr_cgroup_current(), memory_get_usage(true));
 
 // 卡住的 running 任务超时回收（清理 worker 崩溃遗留的任务）。
 // 0) 锁错误自愈：running 且 error 含“锁”且心跳超 180s → 重置为 pending（保留 attempts 计数），
@@ -56,7 +107,7 @@ function nd_worker_reap_stuck(): void {
     }
 }
 
-nd_worker_log('worker started');
+nd_worker_log('worker started ' . $__ndMem);
 
 while (true) {
     try {
@@ -97,6 +148,7 @@ while (true) {
         $shareId = (int)$job['share_id'];
         $forceOcr = (int)($job['force_ocr'] ?? 0) === 1; // 0018: 强制重跑 OCR（重建入口勾选）
         nd_worker_log("start job=$jobId share=$shareId" . ($forceOcr ? " force_ocr=1" : ""));
+        $GLOBALS['ND_WORKER_JOB'] = $jobId; // 0019: fatal 归因用——shutdown handler 据此落 job 行
 
         // 抢占（幂等：仅当仍为 pending 时置 running）
         $up = db()->prepare('UPDATE netdisk_index_jobs SET status="running", started_at=:t WHERE id=:id AND status="pending"');
@@ -128,6 +180,12 @@ while (true) {
         nd_worker_log("done job=$jobId files=" . $res['files'] . " folders=" . $res['folders']
             . " texts=" . $res['texts'] . " errors=" . $res['errors'] . " skipped=" . $res['skipped']
             . " ocrDone=" . $res['ocr_done'] . " ocrQueued=" . $res['ocr_queued']);
+        // 0019: 成功完成 → 崩溃循环计数清零（下次偶发 fatal 仍有一次自动重试机会）
+        try {
+            netdisk_index_job_update($jobId, ['crash_count' => 0]);
+        } catch (Throwable $ign) {
+        }
+        $GLOBALS['ND_WORKER_JOB'] = 0;
     } catch (Throwable $e) {
         nd_worker_log("loop error: " . $e->getMessage());
         nd_worker_log("trace: " . str_replace("\n", " | ", $e->getTraceAsString()));
