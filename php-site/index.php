@@ -3157,6 +3157,34 @@ function netdisk_ocr_invalid_reason(string $path): string {
     return (string)($GLOBALS['ND_OCR_INVALID'][$path] ?? '');
 }
 
+// ===== 0020: sidecar 服务端失败归因 =====
+// 与 ND_OCR_INVALID（文件自身问题 → status='invalid'）区分：sidecar 5xx/超时/连接失败/解析失败
+// 是服务端问题，文件本身不坏 → 状态行仍落 failed（交 0018 的连续失败计数管，≥3 熔断），
+// last_error 记具体原因（状态码 + body 摘要）替代笼统的「OCR 返回空文本」。
+function netdisk_ocr_fail_mark(string $path, string $reason): void {
+    if (!isset($GLOBALS['ND_OCR_FAIL']) || !is_array($GLOBALS['ND_OCR_FAIL'])) {
+        $GLOBALS['ND_OCR_FAIL'] = [];
+    }
+    $GLOBALS['ND_OCR_FAIL'][$path] = $reason;
+}
+
+function netdisk_ocr_fail_reason(string $path): string {
+    return (string)($GLOBALS['ND_OCR_FAIL'][$path] ?? '');
+}
+
+// 0020: body/异常信息单行化 + 按字符截断——防日志注入（body 里的 \r\n 会伪造日志行）
+// 与超长 body 刷爆状态表。口径比任务书的「\r\n→\n」更严：\n 同样断行，一律换成空格。
+function netdisk_ocr_log_oneline(string $s, int $maxChars = 200): string {
+    $s = str_replace(["\r\n", "\r", "\n", "\t"], ' ', $s);
+    $s = trim((string)preg_replace('/ {2,}/', ' ', $s));
+    if (function_exists('mb_substr')) {
+        $s = mb_substr($s, 0, max(1, $maxChars), 'UTF-8');
+    } else {
+        $s = substr($s, 0, max(1, $maxChars) * 3);
+    }
+    return $s;
+}
+
 // 0019: pdftoppm 栅格化 DPI 源头夹取——按 pdfinfo 页面尺寸(pts)估算单页真彩解码需求
 // （像素×4 字节），超预算则按 50 步长下调 DPI，下限 150（再低识别率显著下降，宁可交给
 // 预算守卫跳过）。不让 GD 事后处理超预算数据；同时是 0021 DPI 自动定档的实现基础。
@@ -3283,27 +3311,62 @@ function netdisk_ocr_sidecar_recognize(string $imgPath, int $dpi = 0): ?array {
         return null;
     }
     $payload = json_encode(['file' => $b64, 'fileType' => 1], JSON_UNESCAPED_UNICODE);
-    $ch = curl_init(netdisk_ocr_sidecar_base() . '/ocr');
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => $payload,
-        // 显式禁用 Expect: 100-continue：PHP curl 对大 body 默认发 100-continue，
-        // 与 uvicorn/FastAPI 处理大 base64 时握手异常，导致 Empty reply from server。
-        CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Expect:'],
-        CURLOPT_CONNECTTIMEOUT => 5,
-        CURLOPT_TIMEOUT => 300,
-        CURLOPT_LOW_SPEED_LIMIT => 1,
-        CURLOPT_LOW_SPEED_TIME => 120,
-    ]);
-    $raw = @curl_exec($ch);
-    $err = curl_error($ch);
-    curl_close($ch);
-    if ($raw === false || $raw === '') {
+    // 0020: sidecar 5xx 与 curl 超时/连接失败自动重试 1 次（间隔 2s，桩测经 GLOBALS 缩短）；
+    // 4xx、空 body、JSON 解析失败不重试（客户端/协议侧问题，重试无益）。
+    // 任何异常一律就地捕获 → 记 last_error 并 return null，绝不外泄到池循环/逐文件 finalize。
+    // 请求构造（curl_setopt_array 各项）保持原样，只改响应处理。
+    $raw = false;
+    $err = '';
+    $httpCode = 0;
+    try {
+        for ($attempt = 0; $attempt < 2; $attempt++) {
+            if ($attempt > 0) {
+                usleep((int)($GLOBALS['ND_OCR_SIDECAR_RETRY_DELAY_US'] ?? 2000000));
+            }
+            $ch = curl_init(netdisk_ocr_sidecar_base() . '/ocr');
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => $payload,
+                // 显式禁用 Expect: 100-continue：PHP curl 对大 body 默认发 100-continue，
+                // 与 uvicorn/FastAPI 处理大 base64 时握手异常，导致 Empty reply from server。
+                CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Expect:'],
+                CURLOPT_CONNECTTIMEOUT => 5,
+                CURLOPT_TIMEOUT => 300,
+                CURLOPT_LOW_SPEED_LIMIT => 1,
+                CURLOPT_LOW_SPEED_TIME => 120,
+            ]);
+            $raw = @curl_exec($ch);
+            $err = curl_error($ch);
+            $httpCode = (int)@curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            // 传输层拿到响应且非 5xx → 结束重试（4xx 属客户端问题同样不重试）
+            if ($raw !== false && $httpCode > 0 && $httpCode < 500) {
+                break;
+            }
+        }
+    } catch (Throwable $e) {
+        netdisk_ocr_fail_mark($imgPath, 'sidecar exception: ' . netdisk_ocr_log_oneline($e->getMessage(), 200));
+        return null;
+    }
+    if ($raw === false) {
+        // curl 超时/连接失败（含重试后仍失败）
+        netdisk_ocr_fail_mark($imgPath, 'sidecar transport error: ' . netdisk_ocr_log_oneline($err !== '' ? $err : 'curl exec failed (timeout or connection refused)', 200));
+        return null;
+    }
+    if ($httpCode >= 400) {
+        // 4xx/5xx 最终失败：状态码 + body 摘要（单行化截断，防日志注入）
+        netdisk_ocr_fail_mark($imgPath, 'sidecar HTTP ' . $httpCode . ': ' . netdisk_ocr_log_oneline((string)$raw, 200));
+        return null;
+    }
+    if ($raw === '') {
+        netdisk_ocr_fail_mark($imgPath, 'sidecar HTTP ' . $httpCode . ': (empty body)');
         return null;
     }
     $j = json_decode($raw, true);
     if (!is_array($j) || (int)($j['errorCode'] ?? 0) !== 0) {
+        // JSON 解析失败 / 业务错误码非 0：不重试（循环已保证 2xx 才会走到这里）
+        netdisk_ocr_fail_mark($imgPath, 'sidecar HTTP ' . $httpCode . ': ' . netdisk_ocr_log_oneline((string)$raw, 200));
         return null;
     }
     // 官方 serving 响应：result.ocrResults[i].prunedResult.{rec_texts[], rec_scores[]}
@@ -3461,15 +3524,23 @@ function netdisk_ocr_recognize_pdf(string $pdfPath, int $dpi = 300, int $f = 1, 
                 usleep(150000); // 页间 150ms 喘息
                 continue;
             }
+            // 0020: 本页 sidecar 两次均失败 → 失败原因上移到原始 PDF 路径
+            //（页 PNG 随即删除，状态行 last_error 按 tmp/pdf 路径读取）
+            $pgFail = netdisk_ocr_fail_reason($pg);
+            if ($pgFail !== '') {
+                netdisk_ocr_fail_mark($pdfPath, $pgFail);
+            }
         }
         // tesseract fallback：TSV 每页
+        $pageText = ''; // 0020: 本页文本（增量计数用，不再拿累计 $text 判空）
         $tess = trim((string)shell_exec('command -v tesseract 2>/dev/null'));
         if ($tess !== '') {
             $outTxt = tempnam(sys_get_temp_dir(), 'ndor_');
             $cmd = escapeshellarg($tess) . ' ' . escapeshellarg($pg) . ' ' . escapeshellarg($outTxt) . ' -l chi_sim+eng -c tessedit_create_txt=1 -c tessedit_create_tsv=1 2>/dev/null';
             @shell_exec($cmd);
             if ($outTxt !== false && is_file($outTxt . '.txt')) {
-                $text .= ' ' . (string)@file_get_contents($outTxt . '.txt');
+                $pageText = (string)@file_get_contents($outTxt . '.txt');
+                $text .= ' ' . $pageText;
                 @unlink($outTxt . '.txt');
             }
             if ($outTxt !== false && is_file($outTxt . '.tsv')) {
@@ -3478,7 +3549,9 @@ function netdisk_ocr_recognize_pdf(string $pdfPath, int $dpi = 300, int $f = 1, 
             }
             @unlink($outTxt);
         }
-        if ($text !== '') {
+        // 0020: 本页增量计数——仅本页文本非空才 +1。旧实现拿累计 $text 判空：
+        // 首个非空页之后所有空页也会被计入，pages_done 虚高。
+        if (trim($pageText) !== '') {
             $pagesDone++;
         }
         @unlink($pg);
@@ -4689,6 +4762,15 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
             quality=excluded.quality, chars=excluded.chars, attempts=excluded.attempts, last_error=excluded.last_error,
             dpi=excluded.dpi, pages_total=excluded.pages_total, pages_done=excluded.pages_done, engine=excluded.engine,
             elapsed_ms=excluded.elapsed_ms, pages_per_min=excluded.pages_per_min, finished_at=excluded.finished_at');
+    // 0020: starved 标记专用 upsert——与 worker 让位处同口径 CASE 保护：
+    // done/failed/invalid 行不被降级为 starved（0018 的两处裸 upsert 会把 done-不达标/failed-未熔断
+    // 的行覆盖成 starved），仅刷新 updated_at/size；attempts 对受保护行原样保留。
+    $upOcrFileStarved = $pdo->prepare('INSERT INTO netdisk_ocr_files (share_id, uri, updated_at, size, status, quality, chars, attempts, last_error, dpi, pages_total, pages_done, engine, elapsed_ms, pages_per_min, first_at, finished_at)
+        VALUES (:sid, :uri, :u, :z, "starved", 0, 0, :a, "starved", 0, 0, 0, "", 0, 0, :first, :t)
+        ON CONFLICT(share_id, uri) DO UPDATE SET updated_at=excluded.updated_at, size=excluded.size,
+            status=CASE WHEN netdisk_ocr_files.status IN ("done", "failed", "invalid") THEN netdisk_ocr_files.status ELSE "starved" END,
+            last_error=CASE WHEN netdisk_ocr_files.status IN ("done", "failed", "invalid") THEN netdisk_ocr_files.last_error ELSE "starved" END,
+            attempts=CASE WHEN netdisk_ocr_files.status IN ("done", "failed", "invalid") THEN netdisk_ocr_files.attempts ELSE excluded.attempts END');
 
     $ins = $pdo->prepare('INSERT INTO netdisk_index (share_id, uri, name, is_folder, ext, size, parent_path, text, indexed_at, updated_at)
         VALUES (:sid, :uri, :name, :isf, :ext, :size, :parent, :text, :t, :u)
@@ -4846,16 +4928,25 @@ $text = '';
                                     $ocrQueueDup++;
                                 }
                                 // 0018: 低优队列文件标记 starved（排队待空闲处理；让位/排队不计失败、不计入 attempts>=3 永久跳过）
+                                // 0020: 改用 CASE 保护 upsert——done/failed/invalid 行不被降级，仅刷新 updated_at/size
                                 $qNow = time();
                                 $qPrev = $ocrState[$navigateUri] ?? null;
-                                netdisk_exec_retry(fn() => $upOcrFile->execute([
+                                $qPrevSt = (string)($qPrev['status'] ?? '');
+                                netdisk_exec_retry(fn() => $upOcrFileStarved->execute([
                                     ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
-                                    ':st' => 'starved', ':q' => 0, ':c' => 0, ':a' => (int)($qPrev['attempts'] ?? 0), ':e' => 'starved',
-                                    ':dpi' => 0, ':pt' => 0, ':pd' => 0, ':eng' => '', ':ems' => 0, ':ppm' => 0.0, ':first' => $qNow, ':t' => $qNow,
+                                    ':a' => (int)($qPrev['attempts'] ?? 0), ':first' => $qNow, ':t' => $qNow,
                                 ]));
-                                $ocrState[$navigateUri] = ['uri' => $navigateUri, 'updated_at' => $cloudUpdatedAt, 'status' => 'starved',
-                                    'quality' => 0, 'chars' => 0, 'attempts' => (int)($qPrev['attempts'] ?? 0), 'first_at' => $qNow];
-                                $ocrStarvedMark++;
+                                if (in_array($qPrevSt, ['done', 'failed', 'invalid'], true)) {
+                                    // 受保护行：DB 保持原 status/last_error/attempts，内存态同步只刷新 updated_at/size
+                                    if (is_array($qPrev)) {
+                                        $ocrState[$navigateUri]['updated_at'] = $cloudUpdatedAt;
+                                        $ocrState[$navigateUri]['size'] = $size;
+                                    }
+                                } else {
+                                    $ocrState[$navigateUri] = ['uri' => $navigateUri, 'updated_at' => $cloudUpdatedAt, 'status' => 'starved',
+                                        'quality' => 0, 'chars' => 0, 'attempts' => (int)($qPrev['attempts'] ?? 0), 'first_at' => $qNow];
+                                    $ocrStarvedMark++;
+                                }
                             }
                         }
                         if ($text !== '') {
@@ -4896,16 +4987,25 @@ $text = '';
                             $ocrQueueDup++;
                         }
                         // 0018: 低优队列文件标记 starved（排队待空闲处理；让位/排队不计失败、不计入 attempts>=3 永久跳过）
+                        // 0020: 改用 CASE 保护 upsert——done/failed/invalid 行不被降级，仅刷新 updated_at/size
                         $qNow = time();
                         $qPrev = $ocrState[$navigateUri] ?? null;
-                        netdisk_exec_retry(fn() => $upOcrFile->execute([
+                        $qPrevSt = (string)($qPrev['status'] ?? '');
+                        netdisk_exec_retry(fn() => $upOcrFileStarved->execute([
                             ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
-                            ':st' => 'starved', ':q' => 0, ':c' => 0, ':a' => (int)($qPrev['attempts'] ?? 0), ':e' => 'starved',
-                            ':dpi' => 0, ':pt' => 0, ':pd' => 0, ':eng' => '', ':ems' => 0, ':ppm' => 0.0, ':first' => $qNow, ':t' => $qNow,
+                            ':a' => (int)($qPrev['attempts'] ?? 0), ':first' => $qNow, ':t' => $qNow,
                         ]));
-                        $ocrState[$navigateUri] = ['uri' => $navigateUri, 'updated_at' => $cloudUpdatedAt, 'status' => 'starved',
-                            'quality' => 0, 'chars' => 0, 'attempts' => (int)($qPrev['attempts'] ?? 0), 'first_at' => $qNow];
-                        $ocrStarvedMark++;
+                        if (in_array($qPrevSt, ['done', 'failed', 'invalid'], true)) {
+                            // 受保护行：DB 保持原 status/last_error/attempts，内存态同步只刷新 updated_at/size
+                            if (is_array($qPrev)) {
+                                $ocrState[$navigateUri]['updated_at'] = $cloudUpdatedAt;
+                                $ocrState[$navigateUri]['size'] = $size;
+                            }
+                        } else {
+                            $ocrState[$navigateUri] = ['uri' => $navigateUri, 'updated_at' => $cloudUpdatedAt, 'status' => 'starved',
+                                'quality' => 0, 'chars' => 0, 'attempts' => (int)($qPrev['attempts'] ?? 0), 'first_at' => $qNow];
+                            $ocrStarvedMark++;
+                        }
                     }
                 }
                 $now = time();
@@ -5021,8 +5121,11 @@ $text = '';
             // 0019: 失败归因——预算守卫标记过的文件（巨图/超大文件）落 invalid + 具体原因，
             // 不再笼统记 failed；invalid 同样计入 attempts>=3 熔断（巨图重试三次也不会变小）。
             $invReason = isset($task['tmp']) ? netdisk_ocr_invalid_reason((string)$task['tmp']) : '';
+            // 0020: sidecar 服务端失败（5xx/超时/解析失败）→ 状态行仍 failed（文件本身不坏，
+            // 交连续失败计数管），last_error 记具体原因替代笼统文案
+            $failReason = isset($task['tmp']) ? netdisk_ocr_fail_reason((string)$task['tmp']) : '';
             $stStatus = $txt !== '' ? 'done' : ($invReason !== '' ? 'invalid' : 'failed');
-            $stErr = $txt !== '' ? '' : ($invReason !== '' ? $invReason : 'OCR 返回空文本（图片损坏/格式不支持/OCR 服务异常）');
+            $stErr = $txt !== '' ? '' : ($invReason !== '' ? $invReason : ($failReason !== '' ? $failReason : 'OCR 返回空文本（图片损坏/格式不支持/OCR 服务异常）'));
             // 0019: 页级进度——成功记总页数；失败记已成功识别页数（GLOBALS 由 recognize_pdf 维护）
             $stPagesDone = $txt !== '' ? $stPages : (int)($GLOBALS['ND_OCR_PAGES_DONE'][(string)($task['tmp'] ?? '')] ?? 0);
             // 0018: 耗时指标——优先 finalize 逐文件真实耗时；桩/异常缺失时退回池累计。
@@ -5286,8 +5389,10 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
             $qAtt = $txt !== '' ? 0 : ((int)($qPrev['attempts'] ?? 0) + 1);
             // 0019: 失败归因（预算守卫标记 → invalid + 原因）与页级进度
             $qInv = netdisk_ocr_invalid_reason((string)($j['tmp'] ?? ''));
+            // 0020: sidecar 服务端失败归因（同 build 侧口径：failed + 具体原因）
+            $qFail = netdisk_ocr_fail_reason((string)($j['tmp'] ?? ''));
             $qSt = $txt !== '' ? 'done' : ($qInv !== '' ? 'invalid' : 'failed');
-            $qErr = $txt !== '' ? '' : ($qInv !== '' ? $qInv : 'OCR 返回空文本（图片损坏/格式不支持/OCR 服务异常）');
+            $qErr = $txt !== '' ? '' : ($qInv !== '' ? $qInv : ($qFail !== '' ? $qFail : 'OCR 返回空文本（图片损坏/格式不支持/OCR 服务异常）'));
             $qPagesDone = $txt !== '' ? $qPages : (int)($GLOBALS['ND_OCR_PAGES_DONE'][(string)($j['tmp'] ?? '')] ?? 0);
             $qFirst = (int)($qPrev['first_at'] ?? 0) > 0 ? (int)$qPrev['first_at'] : $qNow;
             // 0018: 耗时指标——优先 finalize 逐文件真实耗时，缺失退回批累计（PDF 记 pages_per_min，图片记 0）
