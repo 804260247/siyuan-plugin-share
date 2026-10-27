@@ -3507,11 +3507,15 @@ function netdisk_ocr_recognize_pdf(string $pdfPath, int $dpi = 300, int $f = 1, 
     $nAcc = 0;
     foreach ($pages as $pg) {
         if ($sidecarActive) {
-            // 官方 serving 每页 base64；页间短暂间隔避免连续大图导致 onnxruntime 内存峰值崩溃，
-            // 单页失败重试一次（NAS 上连续多页处理易 OOM，退刀槽4页能过但攻略18页崩）。
+            // 官方 serving 每页 base64；页间短暂间隔避免连续大图导致 onnxruntime 内存峰值崩溃。
+            // 0021: 页级外层重试收敛为单层——sidecar_recognize 内部已对 5xx/超时/连接失败
+            // 重试 1 次并记 fail 原因，外层再叠一次会放大到单页最多 4 次 /ocr 请求；
+            // sidecar 挂死（接受连接但不响应，非拒连）时单页最坏 4×300s≈20 分钟，
+            // 20 页 PDF 可拖到 6 小时。仅当内层未记 fail 原因（空入参守卫等非服务端
+            // 失败，函数内层重试帮不上、外层隔 300ms 再试仍可能有效）才保留外层重试。
             $res = netdisk_ocr_sidecar_recognize($pg, $dpi);
-            if ($res === null) {
-                usleep(300000); // 300ms 后重试一次
+            if ($res === null && netdisk_ocr_fail_reason($pg) === '') {
+                usleep(300000); // 300ms 后重试一次（仅内层无 fail 记录时）
                 $res = netdisk_ocr_sidecar_recognize($pg, $dpi);
             }
             if ($res !== null) {

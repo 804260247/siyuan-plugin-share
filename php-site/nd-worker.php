@@ -15,9 +15,22 @@ if (PHP_SAPI !== 'cli') {
 set_time_limit(0);
 error_reporting(E_ALL & ~E_DEPRECATED);
 // 0019: worker 为 CLI 单作业串行进程，解除 php.ini 的 1G 上限（真机三连崩根因：
-// Allowed memory size of 1073741824 bytes exhausted）。安全边界不靠该上限，
+// Allowed memory size of 1073741824 bytes exhausted）。解码安全边界不靠该上限，
 // 靠 netdisk_ocr_memory_budget()：cgroup 上限 − 已用，再乘 60% 安全系数做解码预算守卫。
-ini_set('memory_limit', '-1');
+// 0021: 不再无条件 -1——拿得到 cgroup 上限（v2 memory.max / v1 limit_in_bytes，
+// netdisk_ocr_cgroup_limit() 已滤掉 'max' 与 ≥2^50 的 v1 无限制哨兵值）时，
+// memory_limit 设为上限×80%；拿不到才回退 -1（裸机/未限容器）。
+// 理由：-1 之后若出现预算守卫覆盖不到的无界分配，超限会变成 cgroup OOM-kill（SIGKILL），
+// shutdown handler 不执行、fatal 详情不落日志、crash_count 熔断直接失效，
+// job 重新掉回「崩溃→supervisord 拉起→再崩溃」的无限重启黑洞（0019 修掉的那个）。
+// 保留 PHP 层上限则超限走可捕获的 Fatal error，0019 的崩溃治理链路完整生效；
+// 80% 留出余量给 php-fpm 之外的进程内非守卫分配与 cgroup 内核记账开销。
+$__ndCgLimit = netdisk_ocr_cgroup_limit();
+if ($__ndCgLimit > 0) {
+    ini_set('memory_limit', (string)(int)floor($__ndCgLimit * 0.8));
+} else {
+    ini_set('memory_limit', '-1');
+}
 
 // 0019: 所有日志行加时间戳（supervisord 只给自己的行打时间，child 行没有——
 // 排障时无法与 supervisord.log 的崩溃时刻对齐）。
