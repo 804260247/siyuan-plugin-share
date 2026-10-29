@@ -4512,16 +4512,19 @@ function netdisk_index_ocr_concurrency(?int $configId = 0): int {
 }
 
 // 正常优先级 OCR 的单文件体积上限（MB）：≤该值在重建时立即入池 OCR
+// 0028: 允许 0——0 表示没有任何文件进高优池，OCR 候选全部改走低优先级队列（由 worker 空闲时处理）
 function netdisk_index_ocr_max_mb(?int $configId = 0): int {
     $v = netdisk_index_cfg_value((int)$configId, 'index_ocr_max_mb', 'netdisk_index_ocr_max_mb', '10');
-    return max(1, (int)$v);
+    return max(0, (int)$v);
 }
 
 // 低优先级 OCR 兜底上限（MB）：>max_mb 且 ≤该值的文件写入 netdisk_ocr_queue，
 // 由后台 worker 在空闲时 OCR；超过该值则跳过 OCR（仍按文件名索引）。
+// 0028: 允许 0——0 表示所有 OCR 候选一律跳过识别，本轮只下载/算哈希/建索引（等效「只建索引」开关）。
+// 旧实现 max(1, ...) 会把 0 抬成 1MB，设 0 后 ≤1MB 的扫描件照旧被 OCR，与用户意图相反。
 function netdisk_index_ocr_low_max_mb(?int $configId = 0): int {
     $v = netdisk_index_cfg_value((int)$configId, 'index_ocr_low_max_mb', 'netdisk_index_ocr_low_max_mb', '50');
-    return max(1, (int)$v);
+    return max(0, (int)$v);
 }
 
 // 索引刷新 TTL（秒）：索引建好后长期有效；超过该时长后，搜索仍返回索引结果，
@@ -5068,6 +5071,7 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
     $ocrTasks = [];       // 高优先级（≤max_mb）：重建时入池
     $ocrQueued = 0;       // 低优先级（>max_mb ≤low_max_mb）：入队空闲 OCR
     $ocrOversize = 0;     // >low_max_mb：跳过 OCR
+    $ocrZeroSkipped = 0;  // 0028: 跳过阈值MB=0 模式下被跳过的 OCR 候选数（本轮只建索引，不做 OCR）
     $ocrDone = 0;         // 高优先级池实际 OCR 完成的文件数
     $ocrSkipInc = 0;      // 0018: 状态表达标、增量跳过的 OCR 文件数
     $ocrGaveUp = 0;       // 0018: failed/invalid 且 attempts>=3、放弃重试的 OCR 文件数
@@ -5315,6 +5319,9 @@ $text = '';
                                 ->execute([':h' => $caHash, ':s' => $shareId, ':u' => $navigateUri]));
                             netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_results SET last_hit_at=:t WHERE content_hash=:h AND params_key=:k')
                                 ->execute([':t' => $rhNow, ':h' => $caHash, ':k' => $caParamsKey]));
+                        } elseif ($isOcr && $text === '' && $ocrLowBytes === 0) {
+                            // 0028: 跳过阈值MB=0——下载/哈希/文件名索引照旧，但不进 OCR 池、不进队列
+                            $ocrZeroSkipped++;
                         } elseif ($isOcr && $text === '' && $size <= $ocrLowBytes) {
                             if ($size <= $ocrMaxBytes) {
                                 $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
@@ -5368,7 +5375,10 @@ $text = '';
                 } elseif (!$isFolder && $size > 5242880 && $size > 0) {
                     // 5MB~上限 的 OCR 候选：≤max_mb 取字节入池，否则入低优队列/跳过
                     $isOcr = $allowOcr && netdisk_is_ocr_candidate($ext);
-                    if ($isOcr && $size > $ocrLowBytes) {
+                    if ($isOcr && $ocrLowBytes === 0) {
+                        // 0028: 跳过阈值MB=0 时不再报「超大文件（>0MB）」，一律计为「只建索引」跳过
+                        $ocrZeroSkipped++;
+                    } elseif ($isOcr && $size > $ocrLowBytes) {
                         $ocrOversize++;
                     } elseif ($isOcr && $size <= $ocrMaxBytes) {
                         $raw = netdisk_fetch_raw_bytes($contCfg, $navigateUri);
@@ -5663,13 +5673,21 @@ $text = '';
         $notes[] = 'OCR 完成 ' . $ocrDone . ' 个文件（并发 ' . netdisk_index_ocr_concurrency() . '）';
     }
     if ($ocrQueued > 0) {
-        $notes[] = $ocrQueued . ' 个较大文件（>' . netdisk_index_ocr_max_mb() . 'MB）已加入低优先级 OCR 队列，将后台空闲时处理';
+        // 0028: 正常上限MB=0 时「>0MB」是鬼话，改为说清语义；同时备注按本连接的配置取阈值（旧实现取全局默认值）
+        if (netdisk_index_ocr_max_mb($configId) === 0) {
+            $notes[] = '正常上限MB=0：本轮不进高优 OCR 池，' . $ocrQueued . ' 个 OCR 候选全部加入低优先级队列，将后台空闲时处理';
+        } else {
+            $notes[] = $ocrQueued . ' 个较大文件（>' . netdisk_index_ocr_max_mb($configId) . 'MB）已加入低优先级 OCR 队列，将后台空闲时处理';
+        }
     }
     if ($ocrStarvedMark > 0) {
         $notes[] = $ocrStarvedMark . ' 个低优队列文件标记为待处理（starved）——排队/让位不计入失败次数，不会触发≥3 次永久跳过';
     }
-    if ($ocrOversize > 0) {
-        $notes[] = $ocrOversize . ' 个超大文件（>' . netdisk_index_ocr_low_max_mb() . 'MB）跳过 OCR，仍按文件名索引';
+    if ($allowOcr && $ocrLowBytes === 0) {
+        // 0028: 跳过阈值MB=0 → 本轮完全不做 OCR；旧实现会输出「n 个超大文件（>0MB）跳过 OCR」这种误导文案
+        $notes[] = '跳过阈值MB=0：本轮只建索引、不做 OCR' . ($ocrZeroSkipped > 0 ? '，' . $ocrZeroSkipped . ' 个 OCR 候选已跳过' : '');
+    } elseif ($ocrOversize > 0) {
+        $notes[] = $ocrOversize . ' 个超大文件（>' . netdisk_index_ocr_low_max_mb($configId) . 'MB）跳过 OCR，仍按文件名索引';
     }
     if ($ocrReuseHit > 0) {
         $notes[] = $ocrReuseHit . ' 个 OCR 文件按内容哈希命中复用（改名/移动/多分享共享，未重新识别）';
@@ -18075,7 +18093,7 @@ if ($path === '/admin') {
             $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
             $content .= '<input type="hidden" name="config_id" value="' . $icfgId . '">';
             $content .= '<label class="checkbox" style="margin-bottom:6px;display:inline-block"><input type="checkbox" name="index_ocr_enabled" value="1" data-netdisk-index-ocr-toggle' . ($icfgOcrOn ? ' checked' : '') . '> 启用 OCR</label>';
-            $content .= '<div class="muted" style="margin-bottom:6px;font-size:0.75rem">OCR 引擎：PaddleOCR（PP-OCRv5，通过 serving 接入）。DPI 为 PDF 页转图分辨率。侧车模式下「DPI 上限 / 质量阈值 / 并发数」不生效，已改为隐藏保留值，保存时原样回传。</div>';
+            $content .= '<div class="muted" style="margin-bottom:6px;font-size:0.75rem">OCR 引擎：PaddleOCR（PP-OCRv5，通过 serving 接入）。DPI 为 PDF 页转图分辨率。侧车模式下「DPI 上限 / 质量阈值 / 并发数」不生效，已改为隐藏保留值，保存时原样回传。跳过阈值MB 填 0 = 完全不做 OCR（只建索引）；正常上限MB 填 0 = 不设高优池，所有 OCR 候选只进低优先级队列。</div>';
             $content .= '<div class="grid" data-netdisk-index-ocr-fields' . ($icfgOcrOn ? '' : ' hidden') . ' style="grid-template-columns:repeat(4,minmax(0,1fr));max-width:920px">';
             // 0027: 只保留侧车模式下真正生效的 5 项
             $icInputs = [
@@ -19357,8 +19375,8 @@ if ($path === '/admin/netdisk/reindex' && $_SERVER['REQUEST_METHOD'] === 'POST')
     $forceOcr = !empty($_POST['force_ocr']) || !empty($_GET['force_ocr']);
     set_setting('netdisk_index_ocr', !empty($_POST['index_ocr']) ? '1' : '0');
     set_setting('netdisk_index_ocr_concurrency', (string)max(1, (int)($_POST['ocr_concurrency'] ?? 4)));
-    set_setting('netdisk_index_ocr_max_mb', (string)max(1, (int)($_POST['ocr_max_mb'] ?? 10)));
-    set_setting('netdisk_index_ocr_low_max_mb', (string)max(1, (int)($_POST['ocr_low_max_mb'] ?? 50)));
+    set_setting('netdisk_index_ocr_max_mb', (string)max(0, (int)($_POST['ocr_max_mb'] ?? 10)));
+    set_setting('netdisk_index_ocr_low_max_mb', (string)max(0, (int)($_POST['ocr_low_max_mb'] ?? 50)));
     set_setting('netdisk_index_refresh_ttl', (string)max(60, (int)($_POST['refresh_ttl'] ?? 3600)));
     set_setting('netdisk_index_ocr_dpi_start', (string)max(50, min(600, (int)($_POST['ocr_dpi_start'] ?? 100))));
     set_setting('netdisk_index_ocr_dpi_max', (string)max(100, min(600, (int)($_POST['ocr_dpi_max'] ?? 600))));
