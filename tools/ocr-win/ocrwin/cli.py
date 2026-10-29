@@ -79,7 +79,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--out-dir", default=None, help="状态目录（默认 <input>/.ocr-win-state）")
     r.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_MAX, help="单批行数上限（≤50）")
     r.add_argument("--batch-bytes", type=int, default=DEFAULT_BYTES_MAX, help="单批请求体上限（≤4 MB）")
-    r.add_argument("--device", default="cpu", help="paddlex 设备（默认 cpu）")
+    r.add_argument("--device", default="cpu",
+                   help="paddlex 设备（默认 cpu；gpu:0 需装 paddlepaddle-gpu 与 cuDNN，"
+                        "见 README「Windows GPU 前置条件」，GPU 下 --workers 必须 1）")
     r.add_argument("--resample", default="bilinear",
                    choices=list(render.RESAMPLE_CHOICES),
                    help="缩放到 max_side 的插值算法（默认 bilinear，与 NAS 侧 GD 同算法）")
@@ -217,6 +219,17 @@ def cmd_run(a) -> int:
             % (len(files), len(skipped_ext), skipped_done, dup))
         return EXIT_OK
 
+    # 待识别 0 个就到此为止（0033）：旧实现无条件往下走 ensure_ready()，
+    # 续跑全部命中的场景也会去建 pipeline —— GPU 版 paddle 缺 cuDNN 时明明
+    # 一个文件都不用处理，却会崩在引擎初始化上（真机就是这样炸的），
+    # 还会顺带下载几百 MB 模型。
+    if not todo:
+        log("待识别 0 个，跳过引擎初始化（不建 pipeline、不下载模型、不回导）")
+        log("汇总：扫描 %d、扩展名跳过 %d、已完成跳过 %d、同内容重复 %d、不可读 %d"
+            % (len(files), len(skipped_ext), skipped_done, dup, unreadable))
+        log("汇总：识别成功 0、失败 0、回导 accepted=0 rejected=0 批次=0 用时 0.0 秒")
+        return EXIT_OK
+
     # 依赖预检：缺依赖直接退，不要跑到一半才发现
     try:
         render._import_pymupdf()
@@ -224,6 +237,22 @@ def cmd_run(a) -> int:
     except render.DependencyError as exc:
         log("依赖缺失：%s" % exc)
         return EXIT_DEPENDENCY
+    workers = max(1, min(int(a.workers or 1), MAX_WORKERS))
+    # GPU 预检（0033）：显存与运行库两个坑都必须在开跑前拦住，不许静默继续。
+    #   ① GPU 下每 worker 一份模型，8 GB 显存跑 2 份通常直接 OOM；
+    #   ② Windows 版 paddlepaddle-gpu 不带 cuDNN，缺 DLL 会等到 create_pipeline()
+    #      才抛 `error code is 126`，用户看不懂 —— 这里 ctypes 提前试加载。
+    if engine_mod.is_gpu_device(a.device):
+        if workers > 1:
+            log("GPU 模式下 --workers 必须为 1（每 worker 一份模型，8 GB 显存会 OOM）："
+                "当前 --workers %d，请改成 --workers 1 重跑" % workers)
+            return EXIT_STARTUP
+        gpu_ok, gpu_msg = engine_mod.gpu_preflight(a.device)
+        if not gpu_ok:
+            log(gpu_msg)
+            return EXIT_DEPENDENCY
+        if gpu_msg:
+            log(gpu_msg)
     try:
         engine_mod.get_engine(a.device).ensure_ready()
     except engine_mod.OcrEngineError as exc:
@@ -233,7 +262,6 @@ def cmd_run(a) -> int:
     uploader = Uploader(client, params["params_key"], store, log,
                         batch_max=a.batch_size, bytes_max=a.batch_bytes)
     stats = {"ocr_ok": 0, "failed": 0, "pages": 0, "secs": 0.0}
-    workers = max(1, min(int(a.workers or 1), MAX_WORKERS))
     tmp_root = Path(tempfile.mkdtemp(prefix="ocr-win-"))
     t0 = time.time()
     total = len(todo)

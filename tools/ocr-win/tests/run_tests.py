@@ -786,5 +786,198 @@ class TestSelfCheckGpuLine(unittest.TestCase):
         self.assertIn("仅 CPU（模拟）", out)
 
 
+# --------------------------------------------------------------------------- 0033 惰性引擎 / GPU 预检
+
+class _EnsureCounter:
+    """替身引擎：只统计 ensure_ready 有没有被调用。"""
+
+    label = "fake"
+
+    def __init__(self):
+        self.ensure_calls = 0
+
+    def ensure_ready(self):
+        self.ensure_calls += 1
+
+    def recognize_image(self, jpeg_path):
+        return ["x"]
+
+
+class TestLazyEngine(BaseCase):
+    """0033 第 1 条：待识别 0 个时不许初始化引擎（真机崩在 error code 126 的那条路径）。"""
+
+    def test_zero_todo_does_not_init_engine(self):
+        make_pdf(self.input / "a.pdf", pages=1)
+        with NasStub() as stub:
+            rc1, out1 = run_cli(["run", "--input", str(self.input), "--server", stub.base,
+                                 "--token", TOKEN])
+            self.assertEqual(rc1, cli.EXIT_OK, out1)
+            counter = _EnsureCounter()
+            engine_mod.get_engine = lambda device="cpu": counter     # 覆盖 BaseCase 的假引擎
+            rc2, out2 = run_cli(["run", "--input", str(self.input), "--server", stub.base,
+                                 "--token", TOKEN])
+        self.assertEqual(rc2, cli.EXIT_OK, out2)
+        self.assertIn("已完成跳过 1", out2)
+        self.assertIn("待识别 0 个", out2)
+        self.assertIn("跳过引擎初始化", out2)
+        self.assertEqual(counter.ensure_calls, 0, "待识别 0 个还去建 pipeline 就是 0033 要修的 bug")
+        self.assertNotIn("GPU 运行库", out2)
+
+    def test_nonzero_todo_still_fails_fast_on_bad_engine(self):
+        """有任务时仍然要 fail-fast：引擎建不起来照样退 4，不能变成逐个文件失败。"""
+        make_pdf(self.input / "a.pdf", pages=1)
+
+        class Boom:
+            label = "boom"
+
+            def __init__(self, device="cpu"):
+                pass
+
+            def ensure_ready(self):
+                raise engine_mod.OcrEngineError("缺少 paddlex")
+
+        engine_mod.get_engine = lambda device="cpu": Boom()
+        with NasStub() as stub:
+            rc, out = run_cli(["run", "--input", str(self.input), "--server", stub.base,
+                               "--token", TOKEN])
+        self.assertEqual(rc, cli.EXIT_DEPENDENCY, out)
+        self.assertIn("OCR 引擎不可用", out)
+
+
+class TestGpuPreflight(unittest.TestCase):
+    """0033 第 2 条：cuDNN 缺失必须提前拦住，且文案能照着做。"""
+
+    def _libs(self, *names):
+        d = Path(tempfile.mkdtemp(prefix="ocrwin-libs-"))
+        for n in names:
+            (d / n).write_bytes(b"not a real dll")
+        self.addCleanup(shutil.rmtree, str(d), True)
+        return d
+
+    def test_cpu_device_skips_probe(self):
+        ok, msg = engine_mod.gpu_preflight("cpu", loader=lambda *a: (_ for _ in ()).throw(OSError()))
+        self.assertTrue(ok)
+        self.assertEqual(msg, "")
+
+    def test_is_gpu_device(self):
+        for d in ("gpu", "gpu:0", "GPU:1", " gpu:0 "):
+            self.assertTrue(engine_mod.is_gpu_device(d), d)
+        for d in ("cpu", "", None, "xpu:0"):
+            self.assertFalse(engine_mod.is_gpu_device(d), d)
+
+    def test_no_win_dll_means_no_probe(self):
+        """非 Windows（CI/开发机）没有 ctypes.WinDLL：如实跳过，不误报缺库。"""
+        orig = getattr(__import__("ctypes"), "WinDLL", None)
+        try:
+            if orig is None:
+                self.assertEqual(engine_mod.gpu_preflight("gpu:0", libs_dir=None), (True, ""))
+        finally:
+            pass
+
+    def test_missing_cudnn_reports_guidance(self):
+        libs = self._libs()                       # 空目录：一个 cudnn 都没有
+
+        def loader(name):
+            raise OSError("[WinError 126] 找不到指定的模块")
+
+        ok, msg = engine_mod.gpu_preflight("gpu:0", libs_dir=str(libs), loader=loader)
+        self.assertFalse(ok)
+        self.assertIn("cuDNN", msg)
+        self.assertIn("cudnn64_9.dll", msg)
+        self.assertIn("README", msg)
+        self.assertIn("cuDNN 9.x", msg, "必须给出 cu126 对应的 cuDNN 大版本")
+        self.assertIn("--device cpu", msg, "必须给出降级办法")
+
+    def test_found_cudnn_is_ok(self):
+        libs = self._libs("cudnn64_9.dll")
+        seen = []
+
+        def loader(name):
+            seen.append(name)
+            return object()
+
+        ok, msg = engine_mod.gpu_preflight("gpu:0", libs_dir=str(libs), loader=loader)
+        self.assertTrue(ok, msg)
+        self.assertIn("GPU 运行库就绪", msg)
+        self.assertIn("cudnn64_9.dll", msg)
+        self.assertTrue(str(libs) in seen[0], "先查 paddle\\libs 再查 PATH")
+
+    def test_cudart_in_libs_must_load(self):
+        libs = self._libs("cudnn64_9.dll", "cudart64_12.dll")
+
+        def loader(name):
+            if str(name).endswith("cudart64_12.dll"):
+                raise OSError("cudart 加载失败")
+            return object()
+
+        ok, msg = engine_mod.gpu_preflight("gpu:0", libs_dir=str(libs), loader=loader)
+        self.assertFalse(ok)
+        self.assertIn("cudart64_12.dll", msg)
+
+
+class TestGpuCliGuard(BaseCase):
+    """0033 第 2 条：GPU + workers>1 退 2；缺库退 4；都不许静默继续。"""
+
+    def test_gpu_with_two_workers_exits_2(self):
+        make_pdf(self.input / "a.pdf", pages=1)
+        with NasStub() as stub:
+            rc, out = run_cli(["run", "--input", str(self.input), "--server", stub.base,
+                               "--token", TOKEN, "--device", "gpu:0", "--workers", "2"])
+        self.assertEqual(rc, cli.EXIT_STARTUP, out)
+        self.assertIn("--workers 必须为 1", out)
+        self.assertEqual(FakeEngine.calls, 0, "参数不对就不许开跑")
+
+    def test_cpu_with_two_workers_is_fine(self):
+        make_pdf(self.input / "a.pdf", pages=1)
+        with NasStub() as stub:
+            rc, out = run_cli(["run", "--input", str(self.input), "--server", stub.base,
+                               "--token", TOKEN, "--device", "cpu", "--workers", "2"])
+        self.assertEqual(rc, cli.EXIT_OK, out)
+
+    def test_missing_cudnn_exits_4_with_guide(self):
+        make_pdf(self.input / "a.pdf", pages=1)
+        orig = engine_mod.gpu_preflight
+        engine_mod.gpu_preflight = lambda *a, **k: (
+            False, "GPU 运行库缺失：未找到 cudnn64_9.dll（见 README「Windows GPU 前置条件」）")
+        try:
+            with NasStub() as stub:
+                rc, out = run_cli(["run", "--input", str(self.input), "--server", stub.base,
+                                   "--token", TOKEN, "--device", "gpu:0", "--workers", "1"])
+        finally:
+            engine_mod.gpu_preflight = orig
+        self.assertEqual(rc, cli.EXIT_DEPENDENCY, out)
+        self.assertIn("cudnn64_9.dll", out)
+        self.assertIn("README", out)
+        self.assertEqual(FakeEngine.calls, 0, "缺库时不许开跑")
+
+
+class TestFriendlyInitError(unittest.TestCase):
+    """0033：原生 `error code is 126` 不许原样糊给用户。"""
+
+    RAW = ("(PreconditionNotMet) The third-party dynamic library (cudnn64_9.dll) that "
+           "Paddle depends on is not configured correctly. (error code is 126)")
+
+    def test_dll_error_translated(self):
+        msg = engine_mod._friendly_init_error(RuntimeError(self.RAW))
+        self.assertIn("cuDNN", msg)
+        self.assertIn("cudnn64_9.dll", msg)
+        self.assertIn("README", msg)
+        self.assertNotIn("error code is 126", msg)
+        self.assertNotIn("PreconditionNotMet", msg)
+
+    def test_debug_env_keeps_raw(self):
+        os.environ["OCR_WIN_DEBUG"] = "1"
+        try:
+            msg = engine_mod._friendly_init_error(RuntimeError(self.RAW))
+        finally:
+            del os.environ["OCR_WIN_DEBUG"]
+        self.assertIn("error code is 126", msg)
+
+    def test_unrelated_error_untouched(self):
+        msg = engine_mod._friendly_init_error(RuntimeError("OCR requires additional dependencies"))
+        self.assertIn("OCR requires additional dependencies", msg)
+        self.assertNotIn("cuDNN", msg)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

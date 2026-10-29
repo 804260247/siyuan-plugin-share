@@ -170,6 +170,38 @@ python -m ocrwin run --input "D:\扫描" --server http://192.168.1.111:3003 --to
 - 首次用 GPU 仍会下载模型（几百 MB），之后缓存命中。
 - **GPU 只加速识别**：`PyMuPDF` 渲染与缩放是纯 CPU 的，页多、墨迹重的 PDF 渲染本身就是大头——先看逐文件行的 `pages=N 识别=Z 秒（W 秒/页）` 再决定值不值得装 GPU。
 
+### Windows GPU 前置条件（必读：缺一样就是 `error code is 126`）
+
+**Windows 版 `paddlepaddle-gpu` 轮子不包含 cuDNN**，也不需要 CUDA Toolkit（驱动够新即可），但 cuDNN 的 DLL 必须自己装：
+
+| wheel 来源 | 匹配 CUDA | 需要 cuDNN |
+| --- | --- | --- |
+| `cu126`（上面那条命令） | 12.6（驱动 572.83 / CUDA 12.8 实测可用） | **cuDNN 9.x for CUDA 12** |
+| `cu118`（cu126 报 DLL 缺失时退这条） | 11.8 | **cuDNN 8.6 for CUDA 11** |
+
+装法（不用装 CUDA Toolkit、不用降驱动）：
+
+1. 从 NVIDIA 开发者站下 cuDNN 对应大版本的 Windows zip（需登录）；
+2. 解压后把 `bin` 目录（里面有 `cudnn64_9.dll`）加进 PATH，或直接把 DLL **复制进 `<venv>\Lib\site-packages\paddle\libs\`**（后者最稳，优先级也最高）；
+3. cuDNN 9 被拆成多个包（`cudnn_graph` / `cudnn_ops` / `cudnn_engines_*` 等），报错可能逐个出现，缺哪个补哪个。
+
+排查三连（按顺序，把输出贴给别人看就够定位）：
+
+```powershell
+# a) 只能有一条 paddle 记录；出现两条说明 CPU 版没卸干净，会「装了 GPU 版却说只有 CPU」
+.venv\Scripts\python.exe -m pip list | findstr /i paddle
+
+# b) paddle\libs 里有没有 cuDNN（没有就是没装进 venv/系统 PATH）
+dir .venv\Lib\site-packages\paddle\libs\*cudnn*
+
+# c) 我们的预检：开跑前会自己试加载 cuDNN/cudart，缺了直接给上面这套指引
+.venv\Scripts\python.exe run_ocr_win.py run --input "E:\待扫目录" --server https://<你的站点>:4344 --token <Key> --device gpu:0 --workers 1
+```
+
+- **GPU 下 `--workers` 只能是 1**：传 >1 现在会在启动阶段直接退 2 并给出提示（每 worker 一份模型，8 GB 显存跑 2 份通常 OOM），不会跑到一半才崩。
+- **`self-check` 的 GPU 行查的是「有没有卡」，`run` 打的那行 `GPU 运行库就绪：xxx.dll` 查的是「库能不能加载」**——两件事，都要看。
+- 缺库时报错会被翻译成中文指引（原始 `error code is 126` 只在设了 `OCR_WIN_DEBUG=1` 时附带），并退 4。
+
 ## 打包 exe
 
 ```powershell
@@ -239,5 +271,6 @@ paste /tmp/nas-before.tsv /tmp/nas-after.tsv | awk -F'\t' '
 - `.docx/.xlsx/.pptx` 不支持；加密 PDF 会进 `failed.jsonl`。
 - 引擎结果字段形状在 paddlex 3.x 各小版本间有差异，`extract_rec_texts()` 做容错提取（`rec_texts` 可能出现在 `res` / `prunedResult` / `.json` 下）。
 - 打包末尾的冒烟自检默认真初始化流水线：**离线机器第一次打包会因模型下载失败而判定失败**。先在联网环境跑一次 `self-check` 预热 `%USERPROFILE%\.paddlex` 缓存即可；只想跳过着一步验证依赖时手动执行 `dist\ocr-win\ocr-win.exe self-check --no-pipeline`。
+- **待识别 0 个时不初始化引擎**：续跑全部命中（`已完成跳过 N`）时直接收尾退出 0，不建 pipeline、不下载模型——否则 GPU 版 paddle 缺 cuDNN 会在「一个文件都不用处理」的情况下崩在启动阶段。
 - **GPU 只支持源码模式**：`dist\ocr-win\ocr-win.exe` 是 CPU 版，没有任何 GPU 打包路径（CUDA DLL 收集不可靠、体积 3 GB 起）。需要显卡加速就在 venv 里加 `--device gpu:0`。GPU 存不存在都不影响退出码。
 - 本工具回导的 `engine` 写 `paddle5`，NAS 侧车写 `paddleocr-sidecar`——这是**有意差异**，配 `source`（`win` / `nas`）可一眼区分某条结果是 PC 导的还是 NAS 扫的。副作用：只按 `engine='paddleocr-sidecar'` 过滤的统计会漏掉 PC 导入的结果，统计口径请改用 `source` 或不过滤 `engine`（`params_key` 本身也以 `paddle5|` 开头）。

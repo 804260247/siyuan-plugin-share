@@ -12,6 +12,9 @@ PaddleX 的结果对象形状在 3.x 各小版本间有出入（dict / 带 .json
 
 from __future__ import annotations
 
+import ctypes
+import glob
+import os
 import threading
 
 from . import ENGINE_LABEL
@@ -91,7 +94,7 @@ class PaddleEngine:
             # 个别版本不接受 device 关键字
             self._pipeline = create_pipeline(pipeline="OCR")
         except Exception as exc:
-            raise OcrEngineError("OCR 流水线初始化失败：%s" % exc)
+            raise OcrEngineError(_friendly_init_error(exc))
 
     def ensure_ready(self):
         """公开的初始化检查（启动阶段 fail-fast 用）。"""
@@ -199,6 +202,132 @@ def _gpu_probe(p) -> str:
     else:
         bits.append("cuDNN 版本未知")
     return "，".join(bits)
+
+
+# --------------------------------------------------------------------------- GPU 预检（0033）
+
+#: Windows 版 paddlepaddle-gpu 的 cuDNN 依赖：cu126 轮子要 cuDNN 9、cu118 要 cuDNN 8。
+CUDNN_CANDIDATES = ("cudnn64_9.dll", "cudnn64_8.dll")
+
+_GPU_RUNBOOK = "README「Windows GPU 前置条件」"
+
+
+def is_gpu_device(device) -> bool:
+    """`gpu` / `gpu:0` / `GPU:1` 都算 GPU，`cpu` / 空串不算。"""
+    return str(device or "").strip().lower().startswith("gpu")
+
+
+def _paddle_libs_dir():
+    """`<site-packages>/paddle/libs` —— Windows wheel 把 CUDA 运行库放这里。"""
+    try:
+        import paddle
+    except Exception:
+        return None
+    base = os.path.dirname(getattr(paddle, "__file__", "") or "")
+    if not base:
+        return None
+    libs = os.path.join(base, "libs")
+    return libs if os.path.isdir(libs) else None
+
+
+def _dll_probe_names():
+    return list(CUDNN_CANDIDATES)
+
+
+def gpu_preflight(device="gpu:0", libs_dir=None, loader=None):
+    """开跑前的 GPU 运行库预检，返回 (ok, 一行说明)。
+
+    背景：Windows 版 `paddlepaddle-gpu` 轮子**不打包 cuDNN**，运行时靠 PATH 里的
+    `cudnn64_9.dll` 加载；缺了要等到 `create_pipeline()` 才炸，报的是
+    `third-party dynamic library ... error code is 126`，对使用者毫无信息量。
+    这里提前用 ctypes 试加载，缺就直接给出「装 cuDNN」的指引。
+
+    - 非 GPU 设备 / 非 Windows：直接 (True, "")，不做任何事；
+    - `libs_dir`、`loader` 可注入，便于在 Linux/CI 上覆盖缺库路径。
+    """
+    if not is_gpu_device(device):
+        return True, ""
+    if loader is None:
+        loader = getattr(ctypes, "WinDLL", None)
+    if loader is None:                      # 非 Windows：没有 WinDLL，无从预检
+        return True, ""
+    if libs_dir is None:
+        libs_dir = _paddle_libs_dir()
+
+    def _try(path_or_name):
+        try:
+            loader(path_or_name)
+            return True
+        except Exception:
+            return False
+
+    where = libs_dir or "（未找到 paddle\\libs）"
+    found = None
+    for name in _dll_probe_names():
+        cand = os.path.join(libs_dir, name) if libs_dir else None
+        if cand and os.path.isfile(cand):
+            if _try(cand):
+                found = cand
+                break
+        if _try(name):
+            found = name
+            break
+
+    if not found:
+        return False, (
+            "GPU 运行库缺失：未找到可加载的 %s（已查 paddle\\libs 与 PATH：%s）。"
+            "Windows 版 paddlepaddle-gpu 打包时不含 cuDNN，需自行装：cu126 轮子配 "
+            "cuDNN 9.x for CUDA 12、cu118 轮子配 cuDNN 8.6（下载后把 cuDNN 的 bin 目录"
+            "加入 PATH，或把 DLL 复制进 paddle\\libs）。详细步骤见 %s；"
+            "想先跑起来就用 --device cpu。"
+            % (" / ".join(CUDNN_CANDIDATES), where, _GPU_RUNBOOK))
+
+    # cudart 一并探一下：只在 paddle\libs 里确实带了 cudart 时才算硬条件，
+    # 否则可能来自系统 CUDA 安装，交给 paddle 自己按 PATH 找。
+    cudarts = sorted(glob.glob(os.path.join(libs_dir, "cudart64_*.dll"))) if libs_dir else []
+    extra = ""
+    if cudarts:
+        first = next((c for c in cudarts if _try(c)), None)
+        if first is None:
+            return False, (
+                "GPU 运行库缺失：cuDNN 已就绪（%s），但 paddle\\libs 里的 CUDA 运行库"
+                "（%s）加载失败，通常是缺配套的 CUDA 运行库或 PATH 上装了版本冲突的同名 DLL。"
+                "见 %s，或先用 --device cpu。" % (os.path.basename(found),
+                                              ", ".join(os.path.basename(c) for c in cudarts),
+                                              _GPU_RUNBOOK))
+        extra = "，CUDA 运行库 %s" % os.path.basename(first)
+    return True, "GPU 运行库就绪：%s%s" % (
+        os.path.basename(found) if os.path.sep in str(found) else found, extra)
+
+
+_DLL_ERROR_HINTS = ("third-party dynamic library", "dynamic library", "cudnn64",
+                    "cudart64", "cublas64", "error code is 126")
+
+
+def _friendly_init_error(exc) -> str:
+    """把 paddle 的原生 DLL 报错换成能照着做的说明（0033）。
+
+    真机报的是 `(PreconditionNotMet) The third-party dynamic library
+    (cudnn64_9.dll) ... error code is 126`，用户看不懂也定位不到。
+    原始首行只在 `OCR_WIN_DEBUG=1` 时附带，避免默认就把原生报错糊到脸上。
+    """
+    text = str(exc).strip() or exc.__class__.__name__
+    low = text.lower()
+    missing = ""
+    for name in ("cudnn64_9.dll", "cudnn64_8.dll", "cudart64_12.dll", "cudart64_110.dll"):
+        if name in low:
+            missing = name
+            break
+    if not (missing or any(h in low for h in _DLL_ERROR_HINTS)):
+        return "OCR 流水线初始化失败：%s" % text
+    why = ("缺少 %s" % missing) if missing else "缺少 CUDA / cuDNN 动态库"
+    msg = ("OCR 流水线初始化失败：GPU 运行库未就绪（%s）。Windows 版 paddlepaddle-gpu "
+           "不含 cuDNN，需自行安装（cu126 轮子配 cuDNN 9.x for CUDA 12，cu118 轮子配 "
+           "cuDNN 8.6），步骤见 %s；也可以直接用 --device cpu 先跑。"
+           % (why, _GPU_RUNBOOK))
+    if os.environ.get("OCR_WIN_DEBUG"):
+        msg += "｜原始报错：%s" % text.splitlines()[0][:300]
+    return msg
 
 
 _local = threading.local()
