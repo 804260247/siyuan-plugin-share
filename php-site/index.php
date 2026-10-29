@@ -720,6 +720,30 @@ function migrate(PDO $pdo): void {
         $pdo->exec('ALTER TABLE netdisk_ocr_files ADD COLUMN pages_per_min REAL NOT NULL DEFAULT 0');
     }
 
+    // 0024: OCR 结果内容寻址表——识别正文按 (content_hash, params_key) 绑定文件内容而非路径。
+    // 改名/移动/重命名父目录后内容哈希不变 → 直接复用旧正文，不再重新 OCR；
+    // params_key 变化（DPI/max_side/profile/引擎换代）→ 视为未命中重扫，旧行保留（改回可复用）。
+    // PC 端（tools/ocr-win）扫描结果经 POST /admin/netdisk/ocr/import 写入本表（source='win'），
+    // NAS 遍历到同哈希文件时命中复用（source='nas' 为 NAS 直扫）。
+    $pdo->exec('CREATE TABLE IF NOT EXISTS netdisk_ocr_results (
+        content_hash TEXT NOT NULL,
+        params_key   TEXT NOT NULL,
+        size         INTEGER NOT NULL DEFAULT 0,
+        pages        INTEGER NOT NULL DEFAULT 0,
+        chars        INTEGER NOT NULL DEFAULT 0,
+        quality      REAL    NOT NULL DEFAULT 0,
+        engine       TEXT    NOT NULL DEFAULT "",
+        text         TEXT    NOT NULL DEFAULT "",
+        source       TEXT    NOT NULL DEFAULT "",
+        created_at   INTEGER NOT NULL DEFAULT 0,
+        last_hit_at  INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(content_hash, params_key)
+    );');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ocr_results_hit ON netdisk_ocr_results(last_hit_at)');
+    // 0024: 两张路径键老表各补 content_hash 列（走 ensure_column，对已有库无损；不写无条件 ALTER）
+    ensure_column($pdo, 'netdisk_index', 'content_hash', 'TEXT NOT NULL DEFAULT ""');
+    ensure_column($pdo, 'netdisk_ocr_files', 'content_hash', 'TEXT NOT NULL DEFAULT ""');
+
     // 迁移旧版每配置的 office 引擎地址到全局 office_apps（去重）
     $officeCount = (int)$pdo->query('SELECT COUNT(*) FROM office_apps')->fetchColumn();
     if ($officeCount === 0) {
@@ -4678,6 +4702,176 @@ function netdisk_scan_share_tree(array $cfg, string $root): array {
     return ['files' => $files, 'folders' => $folders, 'dirs' => $visited];
 }
 
+// ===== 0024: OCR 结果内容寻址（content-addressed）=====
+// 识别正文按 sha256(原始文件字节) + params_key 绑定，而非 (share_id, uri) 路径键。
+// 价值：改名/移动/重命名父目录后内容不变 → 命中复用，不重新 OCR；同一内容挂多个分享只扫一次。
+// params_key 是 NAS 侧渲染/引擎参数指纹：任何预处理变更必须先动 render_ver 或相关字段，
+// 让旧结果自然失效（不做数据迁移）。PC 端导入须原样回传 params_key，不一致即拒收。
+
+// params_key 规格（单一来源；0024 写库与 0025 GET /admin/netdisk/ocr/params 必须调本函数）：
+//   engine_tag | profile | dpi | max_side | render_ver
+//   例：paddle5|high|300|960|r1
+// - engine_tag 固定 'paddle5'（引擎换代时才改）
+// - profile 取 OCR_PROFILE 环境变量（0022 解析后为 low/high；web 容器未设时记 'low'，
+//   与 ocr 容器实际档位可能不同——params_key 只需 NAS 侧自洽且稳定，PC 端原样回传即可）
+// - dpi 取连接级 index_ocr_dpi_start 实际值；max_side 取 netdisk_ocr_image_resize_b64 默认 960
+// - render_ver v1 固定 'r1'；缺失字段一律空串占位，不许省略（否则两侧拼出的字符串不一致且极难排查）
+function netdisk_ocr_params_key(?int $configId = 0): string {
+    $profile = strtolower(trim((string)(getenv('OCR_PROFILE') ?: 'low')));
+    if ($profile === '') {
+        $profile = 'low';
+    }
+    $dpi = netdisk_index_ocr_dpi_start((int)$configId);
+    $maxSide = 960; // 与 netdisk_ocr_image_resize_b64() 默认 maxSide 一致
+    return 'paddle5|' . $profile . '|' . $dpi . '|' . $maxSide . '|r1';
+}
+
+// 结果表查询：命中且达标（netdisk_ocr_index_quality_ok 同口径：chars>=20 且 quality>=0.6）返回行，
+// 未命中/不达标/异常返回 null。params_key 不一致视为未命中（不得静默复用旧参数结果）。
+// 达标门槛与 0018 状态行跳过判定同口径：不达标结果不传播，走重扫路径（重试语义与 0018 一致）。
+function netdisk_ocr_result_lookup(string $hash, string $paramsKey, ?PDO $pdo = null): ?array {
+    if ($hash === '' || $paramsKey === '') {
+        return null;
+    }
+    try {
+        $pdo = $pdo ?? db();
+        $st = $pdo->prepare('SELECT content_hash, params_key, size, pages, chars, quality, engine, text, source, created_at, last_hit_at
+            FROM netdisk_ocr_results WHERE content_hash=:h AND params_key=:k LIMIT 1');
+        $st->execute([':h' => $hash, ':k' => $paramsKey]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        $st->closeCursor();
+        if ($row === false || !netdisk_ocr_index_quality_ok((string)$row['text'])) {
+            return null;
+        }
+        return $row;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+// 结果表写入（upsert）：created_at 仅首次插入置值，重导入不覆盖；last_hit_at 每次刷新。
+// text 入库前过 netdisk_normalize_ocr_text()（与 NAS 直扫同口径）；chars/quality 服务端重算。
+function netdisk_ocr_result_save(string $hash, string $paramsKey, int $size, int $pages, string $text,
+    string $engine, string $source, ?PDO $pdo = null): bool {
+    if ($hash === '' || $paramsKey === '') {
+        return false;
+    }
+    $text = netdisk_normalize_ocr_text($text);
+    if ($text === '') {
+        return false;
+    }
+    try {
+        $pdo = $pdo ?? db();
+        $chars = string_len($text);
+        $quality = netdisk_ocr_quality($text);
+        $now = time();
+        $st = $pdo->prepare('INSERT INTO netdisk_ocr_results
+            (content_hash, params_key, size, pages, chars, quality, engine, text, source, created_at, last_hit_at)
+            VALUES (:h, :k, :z, :pg, :c, :q, :e, :t, :src, :now, :now)
+            ON CONFLICT(content_hash, params_key) DO UPDATE SET
+                size=excluded.size, pages=excluded.pages, chars=excluded.chars, quality=excluded.quality,
+                engine=excluded.engine, text=excluded.text, source=excluded.source, last_hit_at=excluded.last_hit_at');
+        $st->execute([':h' => $hash, ':k' => $paramsKey, ':z' => $size, ':pg' => $pages, ':c' => $chars,
+            ':q' => $quality, ':e' => $engine, ':t' => $text, ':src' => $source, ':now' => $now]);
+        return true;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+// GC（孤儿保留策略）：仍被任一 netdisk_index.content_hash 引用的结果行永不删除；
+// 孤儿行（无任何引用）按 last_hit_at 淘汰——超过 TTL 天删除，或孤儿总字节超上限时按 last_hit_at ASC 淘汰到阈值以下。
+// 触发点：索引重建收尾跑一次（不新增 cron、不加 worker 任务）。单次打一行 [nd-index] gc results deleted=N kept=M。
+// 孤儿策略的意义：PC 先扫后传场景下，导入结果在 NAS 遍历到该文件前没有引用，绝不能被当垃圾清掉。
+function netdisk_ocr_results_gc(?PDO $pdo = null): void {
+    try {
+        $pdo = $pdo ?? db();
+        $ttlDays = (int)(getenv('NETDISK_OCR_RESULTS_TTL') ?: '90');
+        if ($ttlDays <= 0) {
+            $ttlDays = 90;
+        }
+        $maxMb = (int)(getenv('NETDISK_OCR_RESULTS_MAX_MB') ?: '5120');
+        if ($maxMb <= 0) {
+            $maxMb = 5120;
+        }
+        $now = time();
+        $cutoff = $now - $ttlDays * 86400;
+        // 孤儿 = 不被任何 netdisk_index.content_hash 引用的结果行
+        $orphanCond = 'NOT EXISTS (SELECT 1 FROM netdisk_index i WHERE i.content_hash = netdisk_ocr_results.content_hash AND i.content_hash != "")';
+        // TTL 淘汰
+        $delTtl = $pdo->prepare('DELETE FROM netdisk_ocr_results WHERE ' . $orphanCond . ' AND last_hit_at < :cut');
+        $delTtl->execute([':cut' => $cutoff]);
+        $deleted = $delTtl->rowCount();
+        // 容量淘汰：孤儿总字节（LENGTH(text)）超上限 → 按 last_hit_at ASC 删到阈值以下
+        $capBytes = $maxMb * 1048576;
+        $sumSt = $pdo->query('SELECT COALESCE(SUM(LENGTH(CAST(text AS BLOB))),0) FROM netdisk_ocr_results WHERE ' . $orphanCond);
+        $orphanBytes = (int)$sumSt->fetchColumn();
+        $sumSt->closeCursor();
+        if ($orphanBytes > $capBytes) {
+            $selOrph = $pdo->query('SELECT content_hash, params_key, LENGTH(CAST(text AS BLOB)) AS tlen FROM netdisk_ocr_results
+                WHERE ' . $orphanCond . ' ORDER BY last_hit_at ASC');
+            $orphRows = $selOrph->fetchAll(PDO::FETCH_ASSOC);
+            $selOrph->closeCursor();
+            $delCap = $pdo->prepare('DELETE FROM netdisk_ocr_results WHERE content_hash=:h AND params_key=:k');
+            foreach ($orphRows as $or) {
+                if ($orphanBytes <= $capBytes) {
+                    break;
+                }
+                $delCap->execute([':h' => $or['content_hash'], ':k' => $or['params_key']]);
+                $deleted += $delCap->rowCount();
+                $orphanBytes -= (int)$or['tlen'];
+            }
+        }
+        $keptSt = $pdo->query('SELECT COUNT(*) FROM netdisk_ocr_results');
+        $kept = (int)$keptSt->fetchColumn();
+        $keptSt->closeCursor();
+        @error_log('[nd-index] gc results deleted=' . $deleted . ' kept=' . $kept);
+    } catch (Throwable $e) {
+        // GC 失败不影响本轮索引
+    }
+}
+
+// 从 Cloudreve 文件项 metadata 探测 sha256（大小写归一 + 去 'sha256:' 前缀 + 64hex 校验）。
+// 候选键名按优先级探测；命中返回小写 hex 并打 source=metadata 日志，未命中返回 ''（打降级日志带 reason）。
+// 注意：只在快速路径未命中后才调用（判定顺序①优先——快速路径命中时哈希函数零调用）。
+function netdisk_ocr_file_hash_meta(array $f, string $uri, string &$reason = ''): string {
+    if (isset($GLOBALS['ND_CA_HASH_CALLS'])) {
+        $GLOBALS['ND_CA_HASH_CALLS']++;
+    }
+    $md = $f['metadata'] ?? null;
+    $reason = 'metadata-absent';
+    if (!is_array($md) || empty($md)) {
+        @error_log('[nd-index] hash source=download reason=metadata-absent uri=' . netdisk_ocr_log_oneline($uri, 200));
+        return '';
+    }
+    foreach (['sys:sha256', 'sha256', 'sys:hash', 'hash', 'sys:checksum', 'checksum'] as $k) {
+        if (!array_key_exists($k, $md)) {
+            continue;
+        }
+        $v = strtolower(trim((string)$md[$k]));
+        if (str_starts_with($v, 'sha256:')) {
+            $v = substr($v, 7);
+        }
+        if (preg_match('/^[a-f0-9]{64}$/', $v)) {
+            @error_log('[nd-index] hash source=metadata uri=' . netdisk_ocr_log_oneline($uri, 200));
+            return $v;
+        }
+        $reason = 'metadata-algo-unknown';
+    }
+    @error_log('[nd-index] hash source=download reason=' . $reason . ' uri=' . netdisk_ocr_log_oneline($uri, 200));
+    return '';
+}
+
+// 降级路径：对已下载字节算 sha256（不为算哈希单独多下一次文件——复用调用方已持有的 $raw）。
+function netdisk_ocr_file_hash_bytes(string $raw, string $uri): string {
+    if (isset($GLOBALS['ND_CA_HASH_CALLS'])) {
+        $GLOBALS['ND_CA_HASH_CALLS']++;
+    }
+    $h = hash('sha256', $raw);
+    @error_log('[nd-index] hash source=download uri=' . netdisk_ocr_log_oneline($uri, 200));
+    return $h;
+}
+
 // 重建/刷新某分享的网盘本地全文索引（增量：按 Cloudreve updated_at 跳过未变化文件，不重复下载）
 // 返回 ['files'=>int, 'folders'=>int, 'texts'=>int, 'errors'=>int, 'skipped'=>int, 'notes'=>string,
 //        'ocr_done'=>int, 'ocr_queued'=>int, 'ocr_oversize'=>int]
@@ -4700,6 +4894,9 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
     $seenDirs = [$root => true];
     $contCfg = $cfg['cfg'];
     $configId = (int)($cfg['config_id'] ?? 0); // 连接级索引/OCR 配置归属
+    // 0024: 本轮内容寻址参数指纹（单一来源函数 netdisk_ocr_params_key）；results 表查询/写入均用此 key
+    $caParamsKey = netdisk_ocr_params_key($configId);
+    $ocrReuseHit = 0;     // 0024: 内容寻址命中复用（未重新 OCR）的文件数
     $lastHb = 0; // 心跳节流：距上次上报至少 1s
 
     // 预扫描总量（目录缓存 300s，正式遍历直接命中，不增加 API 请求）
@@ -4732,13 +4929,15 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
 
     // 载入现有索引（增量依据：uri => [updated_at, text, is_folder]）
     $existing = [];
-    $sel = $pdo->prepare('SELECT uri, updated_at, text, is_folder FROM netdisk_index WHERE share_id = :s');
+    $sel = $pdo->prepare('SELECT uri, updated_at, text, is_folder, content_hash FROM netdisk_index WHERE share_id = :s');
     $sel->execute([':s' => $shareId]);
     foreach ($sel->fetchAll(PDO::FETCH_ASSOC) as $row) {
         $existing[(string)$row['uri']] = [
             'updated_at' => (string)$row['updated_at'],
             'text' => (string)$row['text'],
             'is_folder' => (int)$row['is_folder'],
+            // 0024: fast-path 复用轮不重算哈希，写回时保留既有 content_hash（不被空串覆盖）
+            'content_hash' => (string)($row['content_hash'] ?? ''),
         ];
     }
     $seenUris = [];
@@ -4782,9 +4981,9 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
             last_error=CASE WHEN netdisk_ocr_files.status IN ("done", "failed", "invalid") THEN netdisk_ocr_files.last_error ELSE "starved" END,
             attempts=CASE WHEN netdisk_ocr_files.status IN ("done", "failed", "invalid") THEN netdisk_ocr_files.attempts ELSE excluded.attempts END');
 
-    $ins = $pdo->prepare('INSERT INTO netdisk_index (share_id, uri, name, is_folder, ext, size, parent_path, text, indexed_at, updated_at)
-        VALUES (:sid, :uri, :name, :isf, :ext, :size, :parent, :text, :t, :u)
-        ON CONFLICT(share_id, uri) DO UPDATE SET name=:name2, is_folder=:isf2, ext=:ext2, size=:size2, parent_path=:parent2, text=:text2, indexed_at=:t2, updated_at=:u2');
+    $ins = $pdo->prepare('INSERT INTO netdisk_index (share_id, uri, name, is_folder, ext, size, parent_path, text, indexed_at, updated_at, content_hash)
+        VALUES (:sid, :uri, :name, :isf, :ext, :size, :parent, :text, :t, :u, :ch)
+        ON CONFLICT(share_id, uri) DO UPDATE SET name=:name2, is_folder=:isf2, ext=:ext2, size=:size2, parent_path=:parent2, text=:text2, indexed_at=:t2, updated_at=:u2, content_hash=:ch2');
     $updText = $pdo->prepare('UPDATE netdisk_index SET text=:text WHERE share_id=:sid AND uri=:uri');
     for ($depth = 0; $depth <= 5; $depth++) {
         if (empty($currentLevel) || $visited >= 300) {
@@ -4820,6 +5019,9 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
                 $size = (int)($f['size'] ?? 0);
                 $cloudUpdatedAt = (string)($f['updated_at'] ?? '');
                 $seenUris[$navigateUri] = true;
+                // 0024: 内容寻址哈希惰性求值——快速路径（判定顺序①）命中时保持 ''，哈希函数零调用；
+                // 未命中才在 F 分支（metadata 探测）或下载分支（字节顺带算）里赋值。
+                $caHash = '';
 
 $text = '';
                 $skipExts = netdisk_index_skip_exts($configId);
@@ -4905,6 +5107,30 @@ $text = '';
                 } elseif ($isSkipExt) {
                     // 黑名单扩展名：跳过下载正文/OCR，仅索引文件名
                     $skippedByExt++;
+                } elseif ($isOcrCandFile && !$forceOcr
+                    && ($caHash = netdisk_ocr_file_hash_meta($f, $navigateUri)) !== ''
+                    && ($caRow = netdisk_ocr_result_lookup($caHash, $caParamsKey, $pdo)) !== null) {
+                    // 0024 判定顺序②：metadata 已带 sha256 且结果表命中达标 → 直接复用正文，不下载、不进 OCR 队列。
+                    // 改名/移动/重命名父目录后内容不变即走此路（uri 变、updated_at 可能变，但哈希不变）。
+                    $text = (string)$caRow['text'];
+                    $skipped++;
+                    $ocrReuseHit++;
+                    $rhNow = time();
+                    $rhQ = netdisk_ocr_quality($text);
+                    $rhChars = string_len($text);
+                    netdisk_exec_retry(fn() => $upOcrFile->execute([
+                        ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
+                        ':st' => 'done', ':q' => $rhQ, ':c' => $rhChars, ':a' => 0, ':e' => '',
+                        ':dpi' => 0, ':pt' => (int)$caRow['pages'], ':pd' => (int)$caRow['pages'], ':eng' => 'reuse-' . (string)$caRow['source'],
+                        ':ems' => 0, ':ppm' => 0.0, ':first' => $rhNow, ':t' => $rhNow,
+                    ]));
+                    netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_files SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                        ->execute([':h' => $caHash, ':s' => $shareId, ':u' => $navigateUri]));
+                    netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_results SET last_hit_at=:t WHERE content_hash=:h AND params_key=:k')
+                        ->execute([':t' => $rhNow, ':h' => $caHash, ':k' => $caParamsKey]));
+                    if ($text !== '') {
+                        $texts++;
+                    }
                 } elseif (!$isFolder && $size > 0 && $size <= 5242880) {
                     // ≤5MB：下载取正文（文本/Office/PDF 文本层/OCR 高优）
                     $isOcr = $allowOcr && netdisk_is_ocr_candidate($ext);
@@ -4912,13 +5138,37 @@ $text = '';
                     if ($raw === null) {
                         $errors++;
                     } else {
+                        // 0024: 已下载字节顺带算哈希（OCR 候选才算；不为算哈希单独多下一次文件）
+                        if ($caHash === '' && $isOcr) {
+                            $caHash = netdisk_ocr_file_hash_bytes($raw, $navigateUri);
+                        }
                         $text = netdisk_extract_text_from_bytes($ext, $raw, false);
-                        if ($isOcr && $text === '' && $size <= $ocrLowBytes) {
+                        // 0024 判定顺序②：文本层为空需 OCR 时，先查内容寻址结果表；命中达标即复用，不进池/队
+                        $caHitG = ($isOcr && $text === '' && $caHash !== '' && !$forceOcr)
+                            ? netdisk_ocr_result_lookup($caHash, $caParamsKey, $pdo) : null;
+                        if ($caHitG !== null) {
+                            $text = (string)$caHitG['text'];
+                            $skipped++;
+                            $ocrReuseHit++;
+                            $rhNow = time();
+                            $rhQ = netdisk_ocr_quality($text);
+                            $rhChars = string_len($text);
+                            netdisk_exec_retry(fn() => $upOcrFile->execute([
+                                ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
+                                ':st' => 'done', ':q' => $rhQ, ':c' => $rhChars, ':a' => 0, ':e' => '',
+                                ':dpi' => 0, ':pt' => (int)$caHitG['pages'], ':pd' => (int)$caHitG['pages'], ':eng' => 'reuse-' . (string)$caHitG['source'],
+                                ':ems' => 0, ':ppm' => 0.0, ':first' => $rhNow, ':t' => $rhNow,
+                            ]));
+                            netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_files SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                                ->execute([':h' => $caHash, ':s' => $shareId, ':u' => $navigateUri]));
+                            netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_results SET last_hit_at=:t WHERE content_hash=:h AND params_key=:k')
+                                ->execute([':t' => $rhNow, ':h' => $caHash, ':k' => $caParamsKey]));
+                        } elseif ($isOcr && $text === '' && $size <= $ocrLowBytes) {
                             if ($size <= $ocrMaxBytes) {
                                 $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
                                 if ($tmp !== false) {
                                     @file_put_contents($tmp, $raw);
-                                    $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId, 'updated_at' => $cloudUpdatedAt, 'size' => $size];
+                                    $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId, 'updated_at' => $cloudUpdatedAt, 'size' => $size, 'content_hash' => $caHash];
                                 } else {
                                     $errors++;
                                 }
@@ -4973,12 +5223,40 @@ $text = '';
                         if ($raw === null) {
                             $errors++;
                         } else {
-                            $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
-                            if ($tmp !== false) {
-                                @file_put_contents($tmp, $raw);
-                                $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId, 'updated_at' => $cloudUpdatedAt, 'size' => $size];
+                            // 0024: 已下载字节顺带算哈希
+                            if ($caHash === '') {
+                                $caHash = netdisk_ocr_file_hash_bytes($raw, $navigateUri);
+                            }
+                            $caHitH = (!$forceOcr) ? netdisk_ocr_result_lookup($caHash, $caParamsKey, $pdo) : null;
+                            if ($caHitH !== null) {
+                                // 0024 判定顺序②：内容寻址命中达标 → 复用正文，不进高优池
+                                $text = (string)$caHitH['text'];
+                                $skipped++;
+                                $ocrReuseHit++;
+                                $rhNow = time();
+                                $rhQ = netdisk_ocr_quality($text);
+                                $rhChars = string_len($text);
+                                netdisk_exec_retry(fn() => $upOcrFile->execute([
+                                    ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
+                                    ':st' => 'done', ':q' => $rhQ, ':c' => $rhChars, ':a' => 0, ':e' => '',
+                                    ':dpi' => 0, ':pt' => (int)$caHitH['pages'], ':pd' => (int)$caHitH['pages'], ':eng' => 'reuse-' . (string)$caHitH['source'],
+                                    ':ems' => 0, ':ppm' => 0.0, ':first' => $rhNow, ':t' => $rhNow,
+                                ]));
+                                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_files SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                                    ->execute([':h' => $caHash, ':s' => $shareId, ':u' => $navigateUri]));
+                                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_results SET last_hit_at=:t WHERE content_hash=:h AND params_key=:k')
+                                    ->execute([':t' => $rhNow, ':h' => $caHash, ':k' => $caParamsKey]));
+                                if ($text !== '') {
+                                    $texts++;
+                                }
                             } else {
-                                $errors++;
+                                $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
+                                if ($tmp !== false) {
+                                    @file_put_contents($tmp, $raw);
+                                    $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId, 'updated_at' => $cloudUpdatedAt, 'size' => $size, 'content_hash' => $caHash];
+                                } else {
+                                    $errors++;
+                                }
                             }
                         }
                     } elseif ($isOcr) {
@@ -5019,11 +5297,13 @@ $text = '';
                     }
                 }
                 $now = time();
+                // 0024: content_hash 写回——本轮算出/命中即用新值；快速路径等未算哈希的轮次保留既有值（不被空串覆盖）
+                $caHashW = $caHash !== '' ? $caHash : (string)($prev['content_hash'] ?? '');
                 netdisk_exec_retry(fn() => $ins->execute([
                     ':sid' => $shareId, ':uri' => $navigateUri, ':name' => $name, ':isf' => $isFolder ? 1 : 0,
-                    ':ext' => $ext, ':size' => $size, ':parent' => $parent, ':text' => $text, ':t' => $now, ':u' => $cloudUpdatedAt,
+                    ':ext' => $ext, ':size' => $size, ':parent' => $parent, ':text' => $text, ':t' => $now, ':u' => $cloudUpdatedAt, ':ch' => $caHashW,
                     ':name2' => $name, ':isf2' => $isFolder ? 1 : 0, ':ext2' => $ext, ':size2' => $size,
-                    ':parent2' => $parent, ':text2' => $text, ':t2' => $now, ':u2' => $cloudUpdatedAt,
+                    ':parent2' => $parent, ':text2' => $text, ':t2' => $now, ':u2' => $cloudUpdatedAt, ':ch2' => $caHashW,
                 ]));
                 // 细粒度进度：按文件上报当前处理对象 + 心跳（节流 ≥1s）
                 if ($jobId > 0 && ($now - $lastHb) >= 1) {
@@ -5113,6 +5393,13 @@ $text = '';
                 netdisk_exec_retry(fn() => $updText->execute([':text' => $txt, ':sid' => $shareId, ':uri' => $uri]));
                 $texts++;
                 $ocrDone++;
+                // 0024 判定顺序③：OCR 成功后额外写一份进内容寻址结果表（source='nas'），供改名/移动/多分享复用
+                $caTaskHash = (string)($task['content_hash'] ?? '');
+                if ($caTaskHash !== '') {
+                    netdisk_ocr_result_save($caTaskHash, $caParamsKey, (int)($task['size'] ?? 0), $stPages, $txt, $stEngine, 'nas', $pdo);
+                    netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_index SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                        ->execute([':h' => $caTaskHash, ':s' => $shareId, ':u' => $uri]));
+                }
             } else {
                 $prevText = $existing[$uri]['text'] ?? '';
                 if ($prevText !== '') {
@@ -5154,6 +5441,13 @@ $text = '';
             ]));
             $ocrState[$uri] = ['uri' => $uri, 'updated_at' => (string)($task['updated_at'] ?? ''), 'status' => $stStatus,
                 'quality' => $stQ, 'chars' => $stChars, 'attempts' => $stAtt, 'first_at' => $stFirst];
+            // 0024: content_hash 回填必须在状态行 upsert 之后——upsert 语句不含该列，
+            // 若在 upsert 前 UPDATE 会命中 0 行，状态行 content_hash 永远为空（快速路径①因此永不命中）。
+            if ($txt !== '' && (string)($task['content_hash'] ?? '') !== '') {
+                $caRtHash = (string)$task['content_hash'];
+                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_files SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                    ->execute([':h' => $caRtHash, ':s' => $shareId, ':u' => $uri]));
+            }
             if ($txt === '') {
                 $ocrFailedNow++;
             }
@@ -5173,12 +5467,17 @@ $text = '';
         }
     }
     // 清理索引中已不存在的条目（删除的文件）
+    // 0024: 此处只删路径行（netdisk_index 与 netdisk_ocr_files）；netdisk_ocr_results 结果行一行都不跟着删——
+    // 路径行删除后对应结果行变孤儿，交收尾 GC 按 last_hit_at + TTL/容量淘汰
+    // （PC 先扫后传的结果在 NAS 遍历到该文件之前就是孤儿，绝不能被当垃圾清掉）。
     $allUris = netdisk_exec_retry(fn() => $pdo->query("SELECT uri FROM netdisk_index WHERE share_id=$shareId")->fetchAll(PDO::FETCH_COLUMN)) ?: [];
     $toDelete = array_values(array_diff($allUris, array_keys($seenUris)));
     if (!empty($toDelete)) {
         $del = $pdo->prepare('DELETE FROM netdisk_index WHERE share_id=:s AND uri=:u');
+        $delOcrF = $pdo->prepare('DELETE FROM netdisk_ocr_files WHERE share_id=:s AND uri=:u');
         foreach ($toDelete as $uri) {
             netdisk_exec_retry(fn() => $del->execute([':s' => $shareId, ':u' => $uri]));
+            netdisk_exec_retry(fn() => $delOcrF->execute([':s' => $shareId, ':u' => $uri]));
         }
     }
     // 0018: 替代原"重建开头整表清空"——仅删除本轮遍历中已消失（云端删除/移出 root）的队列行，
@@ -5197,6 +5496,8 @@ $text = '';
     } catch (Throwable $ign) {
         // 队列清理失败不影响本轮索引结果
     }
+    // 0024: 重建收尾跑一次结果表 GC（孤儿按 last_hit_at + TTL/容量淘汰；被引用行永不删）
+    netdisk_ocr_results_gc($pdo);
     if ($visited >= 300) {
         $notes[] = '达到目录上限(300)，大目录可能未完整索引';
     }
@@ -5217,6 +5518,9 @@ $text = '';
     }
     if ($ocrOversize > 0) {
         $notes[] = $ocrOversize . ' 个超大文件（>' . netdisk_index_ocr_low_max_mb() . 'MB）跳过 OCR，仍按文件名索引';
+    }
+    if ($ocrReuseHit > 0) {
+        $notes[] = $ocrReuseHit . ' 个 OCR 文件按内容哈希命中复用（改名/移动/多分享共享，未重新识别）';
     }
     if ($ocrSkipInc > 0) {
         $notes[] = $ocrSkipInc . ' 个 OCR 文件已跳过（增量：结果达标未重扫' . ($ocrBackfilled > 0 ? '，含 ' . $ocrBackfilled . ' 个旧索引回填' : '') . '）';
@@ -5338,6 +5642,32 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
                 }
                 continue;
             }
+            // 0024: 已下载字节顺带算哈希；内容寻址命中达标则直接复用正文、标记队列完成，不进 OCR 池
+            $caHashQ = netdisk_ocr_file_hash_bytes($raw, $uri);
+            $caParamsKeyQ = netdisk_ocr_params_key($rowCfgId);
+            $caHitQ = netdisk_ocr_result_lookup($caHashQ, $caParamsKeyQ, $pdo);
+            if ($caHitQ !== null) {
+                $caTxtQ = (string)$caHitQ['text'];
+                netdisk_exec_retry(fn() => $updIndex->execute([':t' => $caTxtQ, ':s' => $shareId, ':u' => $uri]));
+                netdisk_exec_retry(fn() => $markDone->execute([':t' => time(), ':id' => $qid]));
+                $caNowQ = time();
+                $caQQ = netdisk_ocr_quality($caTxtQ);
+                $caCQ = string_len($caTxtQ);
+                netdisk_exec_retry(fn() => $upOcrFileQ->execute([
+                    ':sid' => $shareId, ':uri' => $uri, ':u' => '', ':z' => $size,
+                    ':st' => 'done', ':q' => $caQQ, ':c' => $caCQ, ':a' => 0, ':e' => '',
+                    ':dpi' => 0, ':pt' => (int)$caHitQ['pages'], ':pd' => (int)$caHitQ['pages'], ':eng' => 'reuse-' . (string)$caHitQ['source'],
+                    ':ems' => 0, ':ppm' => 0.0, ':first' => $caNowQ, ':t' => $caNowQ,
+                ]));
+                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_files SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                    ->execute([':h' => $caHashQ, ':s' => $shareId, ':u' => $uri]));
+                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_index SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                    ->execute([':h' => $caHashQ, ':s' => $shareId, ':u' => $uri]));
+                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_results SET last_hit_at=:t WHERE content_hash=:h AND params_key=:k')
+                    ->execute([':t' => $caNowQ, ':h' => $caHashQ, ':k' => $caParamsKeyQ]));
+                $totalDone++;
+                continue;
+            }
             $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
             if ($tmp === false) {
                 netdisk_exec_retry(fn() => $markFailed->execute([':e' => '临时文件失败', ':t' => time(), ':id' => $qid]));
@@ -5345,7 +5675,7 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
             }
             @file_put_contents($tmp, $raw);
             $jobs[] = ['uri' => $uri, 'tmp' => $tmp, 'ext' => (string)($row['ext'] ?? ''), 'name' => (string)($row['name'] ?? ''), 'config_id' => $rowCfgId];
-            $meta[$uri] = ['qid' => $qid, 'share_id' => $shareId, 'tmp' => $tmp];
+            $meta[$uri] = ['qid' => $qid, 'share_id' => $shareId, 'tmp' => $tmp, 'content_hash' => $caHashQ, 'params_key' => $caParamsKeyQ, 'size' => $size];
         }
         if (empty($jobs)) {
             break;
@@ -5389,6 +5719,12 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
             $txt = trim((string)($finalResults[$uri] ?? ''));
             netdisk_exec_retry(fn() => $updIndex->execute([':t' => $txt, ':s' => $m['share_id'], ':u' => $uri]));
             netdisk_exec_retry(fn() => $markDone->execute([':t' => time(), ':id' => $m['qid']]));
+            // 0024 判定顺序③：队列 OCR 成功后写内容寻址结果表（source='nas'）+ 两张路径表 content_hash 列
+            if ($txt !== '' && (string)($m['content_hash'] ?? '') !== '') {
+                netdisk_ocr_result_save((string)$m['content_hash'], (string)$m['params_key'], (int)($m['size'] ?? 0), (int)($pdfPagesQ[$uri] ?? 0), $txt, $stEngineQ, 'nas', $pdo);
+                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_index SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                    ->execute([':h' => (string)$m['content_hash'], ':s' => (int)$m['share_id'], ':u' => $uri]));
+            }
             // 0018: 落状态行（updated_at 队列不存，写空串——重建侧判定允许空串回退比对 netdisk_index.updated_at）
             $qQ = $txt !== '' ? netdisk_ocr_quality($txt) : 0.0;
             $qChars = $txt !== '' ? string_len($txt) : 0;
@@ -5418,6 +5754,12 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
                 ':dpi' => 0, ':pt' => $qPages, ':pd' => $qPagesDone,
                 ':eng' => $stEngineQ, ':ems' => $qElapsed, ':ppm' => $qPpm, ':first' => $qFirst, ':t' => $qNow,
             ]));
+            // 0024: content_hash 回填在 upsert 之后（同 build 侧，upsert 不含该列）
+            if ($txt !== '' && (string)($m['content_hash'] ?? '') !== '') {
+                $caRtHashQ = (string)$m['content_hash'];
+                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_files SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                    ->execute([':h' => $caRtHashQ, ':s' => (int)$m['share_id'], ':u' => $uri]));
+            }
             $totalDone++;
         }
         // 出现新的 pending 重建 job → 让位（重建优先）
