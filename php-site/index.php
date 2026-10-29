@@ -4831,6 +4831,158 @@ function netdisk_ocr_results_gc(?PDO $pdo = null): void {
     }
 }
 
+// ===== 0025: OCR 参数导出 + PC 端结果回导 =====
+// 与 0024 内容寻址配套：PC 端（tools/ocr-win）启动先拉参数、扫完把原始文本回导。
+// 四条硬约束：
+//   1) params_key 只能由 netdisk_ocr_params_key() 生成——本文件禁止另写一份拼接（两侧指纹不一致极难排查）；
+//   2) 派生字段（chars / quality / status / attempts / pages_*）一律服务端重算，PC 只回传原始文本；
+//   3) 文本入库前单行化（与 0020 的 netdisk_ocr_log_oneline 同规则，但保留完整正文不截断）；
+//   4) 导入不触发索引重建：NAS 下一轮遍历按 0024 判定顺序②自会命中（唯一入口，不另开旁路）。
+
+// GET /admin/netdisk/ocr/params 的回包体（严格 8 个字段，不多给）。
+// profile / dpi / max_side / render_ver 直接从 params_key 拆出来，避免与写库口径出现第二份解析逻辑。
+// 不得返回文件路径 / uri / token / 容器内路径 / 数据库路径——此处只放渲染参数指纹相关的公开字段。
+function netdisk_ocr_params_payload(?int $configId = 0): array {
+    $key = netdisk_ocr_params_key($configId);
+    $parts = explode('|', $key);
+    return [
+        'v' => 1,
+        'engine' => 'paddle-ppocrv5',
+        'engine_version' => 'paddlex 3.0.3 / paddlepaddle 3.0.0',
+        'profile' => (string)($parts[1] ?? ''),
+        'dpi' => (int)($parts[2] ?? 0),
+        'max_side' => (int)($parts[3] ?? 0),
+        'render_ver' => (string)($parts[4] ?? ''),
+        'params_key' => $key,
+    ];
+}
+
+// 0025: JSON 直出（params / import 两端点专用）。与 api_response() 的差别：params 必须严格 8 字段、
+// import 必须顶层 accepted/rejected（任务书 3.1 / 3.2 的回包形状），不能被 {code,msg,data} 外层包住。
+// CORS 头沿用 api_response 口径，另加 X-CSRF-Token（PC 端预检可能带该头）。
+function netdisk_ocr_api_json(int $code, array $payload): void {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Access-Control-Allow-Origin: *');
+    header('Access-Control-Allow-Headers: Content-Type, X-Api-Key, Authorization, X-CSRF-Token');
+    header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+    http_response_code($code);
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+// 0025: 后台鉴权（沿用既有机制，不另造一套）——先按会话（current_user() + role=admin，与 require_admin()
+// 同一判定条件；差别只在失败时回 JSON 而不是 redirect 到 /login：本组端点是给程序调的 API），
+// 再按 API Key（api_user_from_key()，与 require_api_user() 同一判定与同一取 key 位置）。
+// 返回 ['user' => …, 'via' => 'session'|'apikey']；两个端点共用，避免两处鉴权判定漂移。
+function netdisk_ocr_api_user(): array {
+    $u = current_user();
+    if ($u) {
+        if ((int)($u['disabled'] ?? 0) === 1) {
+            netdisk_ocr_api_json(401, ['code' => 401, 'msg' => '账号已被禁用']);
+        }
+        if ((string)($u['role'] ?? '') !== 'admin') {
+            netdisk_ocr_api_json(403, ['code' => 403, 'msg' => 'Forbidden']);
+        }
+        touch_user_activity($u);
+        return ['user' => $u, 'via' => 'session'];
+    }
+    $key = (string)($_SERVER['HTTP_X_API_KEY'] ?? '');
+    if ($key === '') {
+        $auth = (string)($_SERVER['HTTP_AUTHORIZATION'] ?? '');
+        if (stripos($auth, 'bearer ') === 0) {
+            $key = trim(substr($auth, 7));
+        }
+    }
+    $u = api_user_from_key($key);
+    if ($u && (string)($u['role'] ?? '') === 'admin') {
+        touch_user_activity($u);
+        return ['user' => $u, 'via' => 'apikey'];
+    }
+    netdisk_ocr_api_json(401, ['code' => 401, 'msg' => '未登录或 API Key 无效']);
+}
+
+// 0025: 导入端点的 CSRF 校验。会话通道（cookie 认证）必须带 csrf——表单字段或 X-CSRF-Token 头，
+// 与后台 check_csrf() 同一 $_SESSION['csrf'] 值、同一 hash_equals 比较（失败回 JSON 而非纯文本）；
+// API Key 通道不走 cookie，跨站表单无法设置 X-Api-Key / Authorization 头，CSRF 面不存在，故免除。
+function netdisk_ocr_import_csrf_ok(string $via): bool {
+    if ($via !== 'session') {
+        return true;
+    }
+    $tok = (string)($_POST['csrf'] ?? ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? ''));
+    return $tok !== '' && hash_equals((string)($_SESSION['csrf'] ?? ''), $tok);
+}
+
+// 0025: 单行校验 + 组装（逐行失败不影响整批其他行）。返回 ['ok'=>true, hash/size/pages/engine/text]
+// 或 ['ok'=>false, 'reason'=>…]。size / updated_at 与「已知记录」比对：已知记录 = 同 content_hash 的
+// netdisk_ocr_files 或 netdisk_index 行（PC 端不知道云端 updated_at，故仅在该行已存在且字段非空时比对），
+// 比对不上判 size_mismatch / stale，拒绝写入——防 PC 端扫的是旧副本、文本与库里内容错配。
+function netdisk_ocr_import_item(array $it, string $expectedKey, ?PDO $pdo = null): array {
+    $hash = strtolower(trim((string)($it['content_hash'] ?? '')));
+    if (!preg_match('/^[0-9a-f]{64}$/', $hash)) {
+        return ['ok' => false, 'reason' => 'bad_hash'];
+    }
+    $itemKey = trim((string)($it['params_key'] ?? ''));
+    if ($itemKey !== '' && $itemKey !== $expectedKey) {
+        return ['ok' => false, 'reason' => 'params_mismatch'];
+    }
+    $text = (string)($it['text'] ?? '');
+    if (strlen($text) > 4 * 1048576) {
+        return ['ok' => false, 'reason' => 'text_too_large'];
+    }
+    // 单行化：复用 0020 的 netdisk_ocr_log_oneline（\r\n/\r/\n/\t → 空格、多空格合并、trim），
+    // maxChars 取本串长度+1 —— 该函数的截断是为日志服务的，识别正文必须完整保留。
+    $text = netdisk_ocr_log_oneline($text, max(200, string_len($text) + 1));
+    // 全角空格（U+3000）既不在 PCRE \s 内、trim() 也去不掉——纯全角空白的「正文」等同空文本，
+    // 否则会往结果表塞一行永远不达标的垃圾（chars<20 永不命中，只占容量）。
+    if ($text === '' || trim(str_replace("\u{3000}", '', $text)) === '') {
+        return ['ok' => false, 'reason' => 'empty_text'];
+    }
+    $size = (int)($it['size'] ?? 0);
+    if ($size < 0) {
+        $size = 0;
+    }
+    $pages = (int)($it['pages'] ?? 0);
+    if ($pages < 0) {
+        $pages = 0;
+    }
+    if ($pages > 100000) {
+        $pages = 100000;
+    }
+    // engine 只作溯源标记，不参与命中判定；单行化 + 截 64 字符，空则记 'paddle5'
+    $engine = netdisk_ocr_log_oneline((string)($it['engine'] ?? ''), 64);
+    if ($engine === '') {
+        $engine = 'paddle5';
+    }
+    try {
+        $pdo = $pdo ?? db();
+        $known = false;
+        $st = $pdo->prepare('SELECT size, updated_at FROM netdisk_ocr_files WHERE content_hash=:h AND content_hash != "" LIMIT 1');
+        $st->execute([':h' => $hash]);
+        $known = $st->fetch(PDO::FETCH_ASSOC);
+        $st->closeCursor();
+        if (!is_array($known)) {
+            $st2 = $pdo->prepare('SELECT size, updated_at FROM netdisk_index WHERE content_hash=:h AND content_hash != "" LIMIT 1');
+            $st2->execute([':h' => $hash]);
+            $known = $st2->fetch(PDO::FETCH_ASSOC);
+            $st2->closeCursor();
+        }
+        if (is_array($known)) {
+            $kSize = (int)($known['size'] ?? 0);
+            if ($kSize > 0 && $size > 0 && $kSize !== $size) {
+                return ['ok' => false, 'reason' => 'size_mismatch'];
+            }
+            $kUpd = trim((string)($known['updated_at'] ?? ''));
+            $iUpd = trim((string)($it['updated_at'] ?? ''));
+            if ($kUpd !== '' && $iUpd !== '' && $kUpd !== $iUpd) {
+                return ['ok' => false, 'reason' => 'stale'];
+            }
+        }
+    } catch (Throwable $e) {
+        // 比对查询异常不阻断导入：size/updated_at 只是防错配保护，不能因此丢结果
+    }
+    return ['ok' => true, 'hash' => $hash, 'size' => $size, 'pages' => $pages, 'engine' => $engine, 'text' => $text];
+}
+
 // 从 Cloudreve 文件项 metadata 探测 sha256（大小写归一 + 去 'sha256:' 前缀 + 64hex 校验）。
 // 候选键名按优先级探测；命中返回小写 hex 并打 source=metadata 日志，未命中返回 ''（打降级日志带 reason）。
 // 注意：只在快速路径未命中后才调用（判定顺序①优先——快速路径命中时哈希函数零调用）。
@@ -19372,6 +19524,89 @@ if ($path === '/admin/netdisk/reindex/cancel' && $_SERVER['REQUEST_METHOD'] === 
         api_response(400, null, '缺少参数');
     }
 }
+// 0025: 两个端点的 CORS 预检（PC 端带 X-Api-Key 头时浏览器环境会预检；Python 端不走，一并支持）
+if (($path === '/admin/netdisk/ocr/params' || $path === '/admin/netdisk/ocr/import') && $_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    header('Access-Control-Allow-Origin: *');
+    header('Access-Control-Allow-Headers: Content-Type, X-Api-Key, Authorization, X-CSRF-Token');
+    header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+    http_response_code(204);
+    exit;
+}
+// 0025: GET /admin/netdisk/ocr/params —— PC 端（tools/ocr-win）启动先拉本接口：用回包的 dpi / max_side
+// 渲染、原样使用 params_key 回传。只读、无副作用（不写任何 OCR 表、不触发重建）；
+// params_key 与 0024 写库同出 netdisk_ocr_params_key()，不存在第二份拼接。
+if ($path === '/admin/netdisk/ocr/params' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    netdisk_ocr_api_user();
+    netdisk_ocr_api_json(200, netdisk_ocr_params_payload(0));
+}
+
+// 0025: POST /admin/netdisk/ocr/import —— PC 端识别结果批量回导（唯一写入口；禁止 PC 直连 app.db，
+// SQLite WAL 经 SMB 共享会锁错甚至损坏库）。限额：单批 ≤ 50 行、请求体 ≤ 4 MB，超限整体拒收；
+// 逐行校验，单行失败不影响其他行。成功只写 netdisk_ocr_results（source='win'），
+// 不主动触发索引重建——NAS 下一轮遍历按 0024 判定顺序②自会命中（唯一入口）。
+if ($path === '/admin/netdisk/ocr/import' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $ndAu = netdisk_ocr_api_user();
+    if (!netdisk_ocr_import_csrf_ok((string)$ndAu['via'])) {
+        netdisk_ocr_api_json(400, ['code' => 400, 'msg' => 'CSRF 校验失败']);
+    }
+    // 请求体限流：只读 4 MB + 1 字节，超出部分不进内存即可判定超限
+    $ndMaxBody = 4 * 1048576;
+    $ndRaw = (string)file_get_contents('php://input', false, null, 0, $ndMaxBody + 1);
+    if (strlen($ndRaw) > $ndMaxBody) {
+        netdisk_ocr_api_json(413, ['code' => 413, 'msg' => '请求体超过 4 MB 上限，整批未写入']);
+    }
+    $ndBody = json_decode($ndRaw, true);
+    if (!is_array($ndBody)) {
+        netdisk_ocr_api_json(400, ['code' => 400, 'msg' => '请求体不是合法 JSON 对象']);
+    }
+    if (!isset($ndBody['items']) || !is_array($ndBody['items'])) {
+        netdisk_ocr_api_json(400, ['code' => 400, 'msg' => '缺少 items 数组']);
+    }
+    $ndItems = array_values($ndBody['items']);
+    if (count($ndItems) > 50) {
+        netdisk_ocr_api_json(400, ['code' => 400, 'msg' => '单批最多 50 行（本次 ' . count($ndItems) . ' 行），整批未写入']);
+    }
+    $ndPdo = db();
+    // 单一来源：与 0024 写库、GET /admin/netdisk/ocr/params 同一函数
+    $ndExpected = netdisk_ocr_params_key(0);
+    $ndBodyKey = trim((string)($ndBody['params_key'] ?? ''));
+    $ndBatchMismatch = ($ndBodyKey !== '' && $ndBodyKey !== $ndExpected);
+    $ndAccepted = 0;
+    $ndRejected = [];
+    foreach ($ndItems as $ndIt) {
+        $ndIt = is_array($ndIt) ? $ndIt : [];
+        $ndHint = strtolower(trim((string)($ndIt['content_hash'] ?? '')));
+        if ($ndBatchMismatch) {
+            // 顶层 params_key 与服务端不一致 → 整批拒收（逐行给原因）并回带 expected_params_key
+            $ndRejected[] = ['content_hash' => $ndHint, 'reason' => 'params_mismatch'];
+            continue;
+        }
+        $ndRow = netdisk_ocr_import_item($ndIt, $ndExpected, $ndPdo);
+        if (empty($ndRow['ok'])) {
+            $ndRejected[] = ['content_hash' => $ndHint, 'reason' => (string)($ndRow['reason'] ?? 'invalid')];
+            continue;
+        }
+        // 落库复用 0024 的 netdisk_ocr_result_save：source='win'、created_at 仅首次插入置值、
+        // chars/quality 服务端重算、text 再过一次 netdisk_normalize_ocr_text（幂等）
+        $ndOk = netdisk_ocr_result_save((string)$ndRow['hash'], $ndExpected, (int)$ndRow['size'],
+            (int)$ndRow['pages'], (string)$ndRow['text'], (string)$ndRow['engine'], 'win', $ndPdo);
+        if ($ndOk) {
+            $ndAccepted++;
+        } else {
+            $ndRejected[] = ['content_hash' => $ndHint, 'reason' => 'save_failed'];
+        }
+    }
+    $ndResp = ['code' => 0, 'msg' => '', 'accepted' => $ndAccepted, 'rejected' => $ndRejected];
+    foreach ($ndRejected as $ndR) {
+        if ((string)($ndR['reason'] ?? '') === 'params_mismatch') {
+            $ndResp['expected_params_key'] = $ndExpected;
+            break;
+        }
+    }
+    @error_log('[nd-index] ocr import accepted=' . $ndAccepted . ' rejected=' . count($ndRejected));
+    netdisk_ocr_api_json(200, $ndResp);
+}
+
 if ($path === '/admin/share-batch' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     require_admin();
     check_csrf();
