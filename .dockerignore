@@ -41,3 +41,6 @@ php-site/config.php
 *.log
 *.tmp
 *.cache
+
+# PC 侧离线 OCR 工具（0026，不参与镜像构建）
+tools/

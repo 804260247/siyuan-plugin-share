@@ -1,0 +1,8 @@
+# 运行时依赖（Python 3.11）
+# 版本必须与 NAS 侧车对齐：paddlex[ocr]==3.0.3 + paddlepaddle==3.0.0
+# 渲染用 PyMuPDF（Windows 不需要 poppler/pdftoppm），缩放用 Pillow
+paddlex[ocr]==3.0.3
+paddlepaddle==3.0.0
+PyMuPDF>=1.24,<2
+Pillow>=10,<13
+requests>=2.31
