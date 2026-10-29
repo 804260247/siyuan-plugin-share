@@ -343,6 +343,30 @@ def _ver(module: str):
     return str(getattr(m, "__version__", "unknown"))
 
 
+def _packaging_probe():
+    """`packaging` 必须在产物内可 import（0034 第 9 条）。
+
+    `paddlex/utils/deps.py` 在**导入期**就 `from packaging.requirements import
+    Requirement`，并用它逐条解析 `importlib.metadata.requires("paddlex")` 的
+    `Requires-Dist`。PyInstaller 漏收 `packaging` 时抛的是 `ImportError`，
+    症状（一启动就崩）与「元数据缺失」（能启动、报 extras 未安装）完全不同，
+    所以这条必须单独断言，不能混进 metadata 维度。
+
+    只做纯检查：不 import paddlex（避免与自检的流水线初始化互相干扰）。
+    """
+    try:
+        from packaging.requirements import Requirement
+        import packaging.version  # noqa: F401  deps.py 也会用到版本解析
+    except Exception as exc:            # ImportError / 损坏的包都算不可用
+        return False, "不可 import（%s）" % exc
+    try:
+        req = Requirement('opencv-contrib-python==4.10.0.84; extra == "ocr"')
+        _ = (req.name, req.extras)
+    except Exception as exc:
+        return False, "可 import 但解析 Requires-Dist 失败（%s）" % exc
+    return True, "可 import，Requirement 可解析 Requires-Dist"
+
+
 def cmd_self_check(a) -> int:
     log("self-check 版本 %s" % __version__)
     print("  python      : %s" % sys.version.split()[0])
@@ -383,31 +407,60 @@ def cmd_self_check(a) -> int:
         log("自检结论：关键依赖缺失，先按 README 装依赖再跑")
         rc = EXIT_DEPENDENCY
 
-    # --- OCR extras 必须真查（0031）：旧版只看 paddlex 版本号字符串，
-    #     打包漏掉 extras 时照样报「关键依赖齐全」，拦不住真跑失败。
-    # 打包产物（PyInstaller --onedir）里没有 .dist-info，读不到 requires()；
-    # 此时不做清单核对，直接靠下面的真初始化兜底 —— 那才是权威判定。
+    # --- OCR extras 必须真查（0031），而且必须查**两个维度**（0034）：
+    #     ① 模块在不在 —— `find_spec`，对应 `--collect-all` 缺失；
+    #     ② 发行包元数据在不在 —— `importlib.metadata.version()`，对应
+    #        `--copy-metadata` 缺失。paddlex 判定 extras 用的正是后者
+    #        （`paddlex/utils/deps.py:is_dep_available`），不看 import。
+    #        打包产物里模块都在、但 `.dist-info` 不在时，paddlex 照样报
+    #        `OCR requires additional dependencies` —— 真机就是这么炸的。
     frozen = bool(getattr(sys, "frozen", False))
     ocr_pairs = []
+    miss = []
+    meta_missing = []
     if has_pdx:
-        if frozen:
-            print("  %s: 打包产物内无 dist-info，跳过清单核对（下一步真初始化流水线）"
-                  % _pad("OCR 依赖"))
+        names = pydeps.requirement_names()
+        if names:
+            print("  %s: %d 个（从 paddlex[ocr] 元数据派生）"
+                  % (_pad("OCR 依赖"), len(names)))
         else:
-            names = pydeps.requirement_names()
-            ocr_pairs = pydeps.module_pairs()
-            if names:
-                print("  %s: %d 个（从 paddlex[ocr] 元数据派生）"
-                      % (_pad("OCR 依赖"), len(names)))
-            else:
-                print("  %s: 读不到 paddlex[ocr] 的 extras（元数据缺失）"
-                      % _pad("OCR 依赖"))
+            print("  %s: 读不到 paddlex[ocr] 的 extras（元数据缺失）"
+                  % _pad("OCR 依赖"))
+        # 模块维度：源码模式与打包产物都查（PyInstaller 的 --copy-metadata
+        # 会把整个 .dist-info 复制进包，top_level.txt 在；缺它时 pydeps 用
+        # RECORD 兜底，两种环境下模块名都能算对）。
+        ocr_pairs = pydeps.module_pairs()
         miss = pydeps.missing_modules(ocr_pairs)
         if miss:
             for dist, mod in miss:
                 print("  %s: import %s 失败（发行包 %s）" % (_pad("缺失"), mod, dist))
             log("自检结论：OCR 依赖不完整，缺 %s"
                 % ", ".join(sorted({d for d, _ in miss})))
+            rc = EXIT_DEPENDENCY
+        # 元数据维度：paddlex 自己 + 每个 extras 发行包。frozen 下 paddlex
+        # 自身元数据缺失也要能认出来（否则连 extras 清单都读不出来）。
+        already = {d for d, _ in miss}          # 模块都缺的包不重复报元数据
+        meta_missing = [n for n in pydeps.missing_metadata(pydeps.metadata_names())
+                        if n not in already]
+        for name in meta_missing:
+            print("  %s: %s（发行包已打包但无 dist-info，paddlex 会误判 extras 未安装，"
+                  "需 --copy-metadata）" % (_pad("元数据缺失"), name))
+        if meta_missing:
+            log("自检结论：%d 个发行包的元数据缺失，paddlex 会判定 extras 未安装%s"
+                % (len(meta_missing),
+                   "（打包时漏了 --copy-metadata，见 README「打包 exe」）" if frozen else ""))
+            rc = EXIT_DEPENDENCY
+
+    # --- `packaging` 可 import 断言（0034 第 9 条，详见 _packaging_probe）。
+    #     paddlex 装了就必须有它（`deps.py` 导入期硬依赖）；paddlex 不在时
+    #     这条没有意义，如实跳过、不误报。
+    if has_pdx:
+        packaging_ok, packaging_msg = _packaging_probe()
+        print("  %s: %s" % (_pad("packaging"), packaging_msg))
+        if not packaging_ok:
+            log("自检结论：packaging 不可用 —— paddlex 导入期就会抛 ImportError，"
+                "与「元数据缺失」是两条不同的失败路径（打包漏 collect packaging，"
+                "见 README「打包 exe」）")
             rc = EXIT_DEPENDENCY
 
     # --- OCR 流水线真初始化（默认执行；--no-pipeline 只跳过这一步）。
@@ -426,8 +479,12 @@ def cmd_self_check(a) -> int:
                 if miss:
                     print("  %s: %s" % (_pad("缺失依赖"), ", ".join(
                         sorted({"%s（%s）" % (mod, dist) for dist, mod in miss}))))
-                log("自检结论：OCR 流水线初始化失败"
-                    "（打包漏 extras 就是这样，见 README「打包 exe」）")
+                if meta_missing:
+                    log("自检结论：OCR 流水线初始化失败，且已定位到 %d 个发行包缺元数据"
+                        "（补 --copy-metadata 后重新打包）" % len(meta_missing))
+                else:
+                    log("自检结论：OCR 流水线初始化失败"
+                        "（打包漏 extras 就是这样，见 README「打包 exe」）")
                 rc = EXIT_DEPENDENCY
             else:
                 print("  %s: 初始化成功" % _pad("OCR 流水线"))

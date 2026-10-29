@@ -6,6 +6,10 @@
     从构造上就不可能再出现 0029 那种「两个脚本写得不一致」。
   * OCR extras 的收集参数从 `paddlex` 的包元数据派生（`ocrwin/pydeps.py`），
     不硬编码包名：上游给 `ocr` extra 加包时无需改这里。
+  * 派生两类参数，缺一不可（0034）：`--collect-all <模块>` 让模块/数据文件
+    进包，`--copy-metadata <发行包>` 让 `.dist-info` 元数据进包 —— paddlex
+    判定 extras 用的是 `importlib.metadata.version()`，只补前者的产物会报
+    `OCR requires additional dependencies`（模块明明都在）。
 
 用法（在 tools\\ocr-win 下）：
   .venv\\Scripts\\python.exe build_exe.py            # --onedir
@@ -44,8 +48,15 @@ def pyinstaller_argv(onefile: bool, entry: str = "run_ocr_win.py",
         "--collect-submodules", "paddle",
         "--hidden-import", "onnxruntime",
         "--hidden-import", "PIL.Image",
+        # paddlex 的 deps.py 在导入期 `from packaging.requirements import
+        # Requirement` 解析每条 Requires-Dist（0034 第 9 条）。分析链通常能
+        # 顺着收进来，但这里显式声明：漏了就是 ImportError，与缺元数据不同。
+        "--hidden-import", "packaging",
+        "--hidden-import", "packaging.requirements",
+        "--hidden-import", "packaging.version",
     ]
-    argv += pydeps.pyinstaller_args(skip=BASE_MODULES)
+    argv += pydeps.pyinstaller_args(skip=BASE_MODULES)      # 模块进包
+    argv += pydeps.metadata_pyinstaller_args()              # 元数据进包（0034）
     argv.append(entry)
     return argv
 
@@ -72,6 +83,7 @@ def main(argv=None) -> int:
 
     names = pydeps.requirement_names()
     not_installed = pydeps.uninstalled()
+    meta_names = pydeps.metadata_names()
     print("[build] %s" % pydeps.summary(), flush=True)
     if not names:
         print("[build] 无法从 paddlex 元数据读出 ocr extras —— 依赖没装全，"
@@ -81,6 +93,19 @@ def main(argv=None) -> int:
         print("[build] 以下 extras 声明了但本机没装：%s —— "
               "打出来的 exe 会缺这些包，先 pip install -r requirements.txt"
               % ", ".join(not_installed), flush=True)
+        return EXIT_DEPENDENCY
+
+    # 两类派生结果都打印出来：出问题时能一眼看出是「没收集模块」还是
+    # 「没打进元数据」（0034 的故障就属于后者）。
+    mods = pydeps.collect_modules(skip=BASE_MODULES)
+    print("[build] --collect-all 派生模块 %d 个：%s"
+          % (len(mods), ", ".join(mods) or "（无）"), flush=True)
+    print("[build] --copy-metadata 派生发行包 %d 个：%s"
+          % (len(meta_names), ", ".join(meta_names) or "（无）"), flush=True)
+    missing_meta = pydeps.missing_metadata(meta_names)
+    if missing_meta:
+        print("[build] 以下发行包没有 dist-info 元数据：%s —— 打出来的 exe 会被 paddlex "
+              "误判 extras 未安装，先在打包机上装好依赖" % ", ".join(missing_meta), flush=True)
         return EXIT_DEPENDENCY
 
     args = pyinstaller_argv(a.onefile)

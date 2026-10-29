@@ -396,6 +396,11 @@ class TestSelfCheck(BaseCase):
         self.assertIn("GPU", out)      # 0032：GPU 能力探测行必须打，且不影响退出码
         self.assertIn(rc, (cli.EXIT_OK, cli.EXIT_DEPENDENCY), out)
 
+    def test_packaging_probe_skipped_without_paddlex(self):
+        """paddlex 不在时 packaging 那条没有意义，必须如实跳过而不是误报（0034）。"""
+        rc, out = run_cli(["self-check"])
+        self.assertNotIn("packaging", out)
+
 
 # --------------------------------------------------------------------------- 0031 打包依赖派生
 
@@ -474,6 +479,74 @@ class TestPydeps(unittest.TestCase):
     def test_summary_mentions_dist_and_count(self):
         self.assertIn("paddlex[ocr]", pydeps.summary("paddlex", "ocr"))
 
+    # --- 0034：--copy-metadata 派生（元数据必须进包） -------------------------
+
+    def test_metadata_names_includes_dist_itself_and_extras(self):
+        """paddlex 自己的元数据也要带：EXTRAS/DEP_SPECS 是 import 时算死的常量。"""
+        names = pydeps.metadata_names(requires=self.REQUIRES)
+        self.assertEqual(names[0], "paddlex")
+        self.assertIn("opencv-contrib-python", names)
+        self.assertIn("jinja2", names)                  # 规范化后小写（Jinja2 → jinja2）
+        self.assertNotIn("pyinstaller", names)          # dev extra 不许混进来
+        self.assertNotIn("pyyaml", names)               # serving extra 同理
+
+    def test_metadata_pyinstaller_args_uses_dist_not_module_names(self):
+        tmp = Path(tempfile.mkdtemp(prefix="ocrwin-meta-"))
+        try:
+            _fake_dist(tmp, "opencv-contrib-python", "4.10.0.84", "cv2")
+            _fake_dist(tmp, "scikit-learn", "1.5.2", "sklearn")
+            sys.path.insert(0, str(tmp))
+            try:
+                args = pydeps.metadata_pyinstaller_args(requires=self.REQUIRES)
+            finally:
+                sys.path.remove(str(tmp))
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+        pairs = [args[i + 1] for i, a in enumerate(args) if a == "--copy-metadata"]
+        self.assertIn("paddlex", pairs)                      # 自身元数据
+        self.assertIn("opencv-contrib-python", pairs)        # 发行包名，不是 cv2
+        self.assertNotIn("cv2", pairs)
+        self.assertEqual(args.count("--copy-metadata"), len(pairs))
+
+    def test_top_level_from_record_when_no_top_level_txt(self):
+        """没有 top_level.txt 的 wheel（poetry/hatch 打的）要用 RECORD 反推模块名。"""
+        tmp = Path(tempfile.mkdtemp(prefix="ocrwin-rec-"))
+        try:
+            d = tmp / "opencv_contrib_python-4.10.0.84.dist-info"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: opencv-contrib-python\nVersion: 4.10.0.84\n",
+                encoding="utf-8")
+            (d / "RECORD").write_text(
+                "cv2/__init__.py,sha256=abc,111\n"
+                "cv2/cv2.abi3.so,sha256=abc,222\n"
+                "opencv_contrib_python-4.10.0.84.dist-info/METADATA,sha256=abc,333\n",
+                encoding="utf-8")
+            sys.path.insert(0, str(tmp))
+            try:
+                self.assertFalse((d / "top_level.txt").exists())
+                self.assertEqual(pydeps.top_level_modules("opencv-contrib-python"), ["cv2"])
+            finally:
+                sys.path.remove(str(tmp))
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def test_missing_metadata_detects_absent_dists(self):
+        tmp = Path(tempfile.mkdtemp(prefix="ocrwin-meta2-"))
+        try:
+            _fake_dist(tmp, "opencv-contrib-python", "4.10.0.84", "cv2")
+            sys.path.insert(0, str(tmp))
+            try:
+                self.assertTrue(pydeps.has_metadata("opencv-contrib-python"))
+                self.assertFalse(pydeps.has_metadata("scikit-learn"))
+                miss = pydeps.missing_metadata(["paddlex", "opencv-contrib-python",
+                                                "scikit-learn"])
+            finally:
+                sys.path.remove(str(tmp))
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+        self.assertEqual(miss, ["paddlex", "scikit-learn"])
+
 
 class TestBuildExe(unittest.TestCase):
     """build_exe.py 是 build.ps1 / build.cmd 的唯一参数来源。"""
@@ -501,6 +574,57 @@ class TestBuildExe(unittest.TestCase):
         # 沙箱里没装 paddlex[ocr] → 明确报退出码 4，而不是假装成功
         self.assertEqual(rc, build_exe.EXIT_DEPENDENCY)
 
+    # --- 0034：--collect-all 与 --copy-metadata 必须同时出现 ----------------
+
+    def test_argv_contains_both_collect_all_and_copy_metadata(self):
+        """真走派生：假 paddlex 元数据 + 假 cv2 发行包 → 两类参数都要出现。"""
+        import build_exe
+        tmp = Path(tempfile.mkdtemp(prefix="ocrwin-argv-"))
+        try:
+            _fake_dist(tmp, "paddlex", "3.0.3", "paddlex",
+                       requires=['opencv-contrib-python==4.10.0.84; extra == "ocr"'])
+            _fake_dist(tmp, "opencv-contrib-python", "4.10.0.84", "cv2")
+            sys.path.insert(0, str(tmp))
+            try:
+                argv = build_exe.pyinstaller_argv(False)
+            finally:
+                sys.path.remove(str(tmp))
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+        self.assertIn("--collect-all", argv)          # 模块/数据进包
+        self.assertIn("--copy-metadata", argv)        # 元数据进包
+        # --copy-metadata 后面必须跟发行包名（opencv-contrib-python），不是模块名
+        metas = [argv[i + 1] for i, a in enumerate(argv) if a == "--copy-metadata"]
+        self.assertIn("paddlex", metas)
+        self.assertIn("opencv-contrib-python", metas)
+
+    def test_print_only_prints_both_derived_lists(self):
+        """--print-only 必须把两类派生结果都打全（排障靠这两行）。"""
+        import build_exe
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = build_exe.main(["--print-only"])
+        out = buf.getvalue()
+        self.assertEqual(rc, build_exe.EXIT_DEPENDENCY)   # 沙箱没 paddlex → 明确失败
+        self.assertIn("paddlex", out)
+
+    def test_build_aborts_when_metadata_missing(self):
+        """打包机上有模块但没 dist-info：必须中止，不许打出「模块都在却不能跑」的产物。"""
+        import build_exe
+        orig = (pydeps.requirement_names, pydeps.uninstalled, pydeps.metadata_names,
+                pydeps.missing_metadata)
+        pydeps.requirement_names = lambda *a, **k: ["opencv-contrib-python"]
+        pydeps.uninstalled = lambda *a, **k: []
+        pydeps.metadata_names = lambda *a, **k: ["paddlex", "opencv-contrib-python"]
+        pydeps.missing_metadata = lambda *a, **k: ["opencv-contrib-python"]
+        try:
+            rc = build_exe.main(["--print-only"])
+        finally:
+            (pydeps.requirement_names, pydeps.uninstalled, pydeps.metadata_names,
+             pydeps.missing_metadata) = orig
+        self.assertEqual(rc, build_exe.EXIT_DEPENDENCY)
+
 
 class TestSelfCheckPipeline(unittest.TestCase):
     """self-check 必须真初始化 pipeline（0031 的第二个缺陷）。"""
@@ -510,11 +634,15 @@ class TestSelfCheckPipeline(unittest.TestCase):
         self._orig_ver = cli._ver
         self._orig_req = pydeps.requirement_names
         self._orig_miss = pydeps.missing_modules
+        self._orig_meta = pydeps.missing_metadata
         self._orig_pipe = engine_mod.PaddleEngine
+        self._orig_pkg = cli._packaging_probe
 
         cli._ver = lambda m: "9.9.9" if m in ("pymupdf", "PIL", "paddlex", "paddle") else None
         pydeps.requirement_names = lambda *a, **k: ["einops", "opencv-contrib-python"]
         pydeps.missing_modules = lambda *a, **k: []
+        pydeps.missing_metadata = lambda *a, **k: []
+        cli._packaging_probe = lambda: (True, "可 import，Requirement 可解析 Requires-Dist")
 
         outer = self
 
@@ -531,7 +659,9 @@ class TestSelfCheckPipeline(unittest.TestCase):
         cli._ver = self._orig_ver
         pydeps.requirement_names = self._orig_req
         pydeps.missing_modules = self._orig_miss
+        pydeps.missing_metadata = self._orig_meta
         engine_mod.PaddleEngine = self._orig_pipe
+        cli._packaging_probe = self._orig_pkg
 
     def test_pipeline_initialized_by_default(self):
         rc, out = run_cli(["self-check"])
@@ -566,16 +696,57 @@ class TestSelfCheckPipeline(unittest.TestCase):
         self.assertEqual(rc, cli.EXIT_OK, out)
         self.assertIn("self-check 版本", out)
 
-    def test_frozen_bundle_skips_metadata_check(self):
-        """打包产物里没有 dist-info：跳过清单核对，但流水线必须照样真初始化。"""
+    def test_frozen_bundle_checks_metadata_instead_of_skipping(self):
+        """0034：打包产物里也必须查元数据（不再「跳过清单核对」），流水线照样真初始化。"""
         sys.frozen = True
         try:
             rc, out = run_cli(["self-check"])
         finally:
             del sys.frozen
         self.assertEqual(rc, cli.EXIT_OK, out)
-        self.assertIn("dist-info", out)
+        self.assertIn("OCR 依赖", out)
         self.assertIn("ensure_ready", self.calls)
+
+    def test_frozen_paddlex_metadata_missing_exits_4(self):
+        """frozen 下 paddlex 自身元数据缺失（打包漏 --copy-metadata paddlex）要能认出来。"""
+        pydeps.missing_metadata = lambda *a, **k: ["paddlex"]
+        sys.frozen = True
+        try:
+            rc, out = run_cli(["self-check"])
+        finally:
+            del sys.frozen
+        self.assertEqual(rc, cli.EXIT_DEPENDENCY, out)
+        self.assertIn("paddlex", out)
+        self.assertNotIn("ensure_ready", self.calls)  # 元数据已判定失败，不再去建流水线
+
+    def test_metadata_missing_exits_4_with_dist_wording(self):
+        """元数据缺失（模块都在）必须退 4，并说清是 dist-info、要 --copy-metadata。"""
+        pydeps.missing_metadata = lambda *a, **k: ["scikit-learn"]
+        rc, out = run_cli(["self-check"])
+        self.assertEqual(rc, cli.EXIT_DEPENDENCY, out)
+        for want in ("元数据缺失", "scikit-learn", "dist-info", "--copy-metadata"):
+            self.assertIn(want, out)
+        self.assertNotIn("ensure_ready", self.calls)  # 依赖不通过就不去初始化流水线
+
+    # --- 0034 第 9 条：packaging 必须单独断言 -----------------------------
+
+    def test_packaging_line_printed_when_paddlex_present(self):
+        """paddlex 在时必须单独打 packaging 行（与「元数据缺失」分开报）。"""
+        rc, out = run_cli(["self-check"])
+        self.assertEqual(rc, cli.EXIT_OK, out)
+        self.assertIn("packaging", out)
+        self.assertIn("Requires-Dist", out)
+        self.assertIn("ensure_ready", self.calls)   # packaging 通过 → 照常初始化
+
+    def test_packaging_missing_exits_4_and_names_importerror(self):
+        """packaging 不可 import（打包漏 collect）：单独退 4，且点明是 ImportError。"""
+        cli._packaging_probe = lambda: (False, "不可 import（No module named 'packaging'）")
+        rc, out = run_cli(["self-check"])
+        self.assertEqual(rc, cli.EXIT_DEPENDENCY, out)
+        self.assertIn("packaging", out)
+        self.assertIn("ImportError", out)
+        self.assertNotIn("ensure_ready", self.calls)   # 依赖已判死，不再建流水线
+        self.assertNotIn("初始化成功", out)
 
     def test_missing_extra_reports_before_pipeline(self):
         pydeps.missing_modules = lambda *a, **k: [("scikit-learn", "sklearn")]
@@ -747,12 +918,15 @@ class TestSelfCheckGpuLine(unittest.TestCase):
         self._orig_ver = cli._ver
         self._orig_req = pydeps.requirement_names
         self._orig_miss = pydeps.missing_modules
+        self._orig_meta = pydeps.missing_metadata
         self._orig_pipe = engine_mod.PaddleEngine
         self._orig_gpu = engine_mod.gpu_summary
+        self._orig_pkg = cli._packaging_probe
 
         cli._ver = lambda m: "9.9.9" if m in ("pymupdf", "PIL", "paddlex", "paddle") else None
         pydeps.requirement_names = lambda *a, **k: ["einops"]
         pydeps.missing_modules = lambda *a, **k: []
+        pydeps.missing_metadata = lambda *a, **k: []
 
         class FakePipeline:
             def __init__(self, device="cpu"):
@@ -760,6 +934,7 @@ class TestSelfCheckGpuLine(unittest.TestCase):
 
             def ensure_ready(self):
                 return None
+        cli._packaging_probe = lambda: (True, "可 import，Requirement 可解析 Requires-Dist")
 
         engine_mod.PaddleEngine = FakePipeline
 
@@ -767,8 +942,10 @@ class TestSelfCheckGpuLine(unittest.TestCase):
         cli._ver = self._orig_ver
         pydeps.requirement_names = self._orig_req
         pydeps.missing_modules = self._orig_miss
+        pydeps.missing_metadata = self._orig_meta
         engine_mod.PaddleEngine = self._orig_pipe
         engine_mod.gpu_summary = self._orig_gpu
+        cli._packaging_probe = self._orig_pkg
 
     def test_probe_exception_does_not_change_exit_code(self):
         def boom(*a, **k):

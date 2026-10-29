@@ -64,7 +64,10 @@ python -m ocrwin self-check --server http://192.168.1.111:3003 --token <你的 K
 - 只查依赖、不加载模型：加 `--no-pipeline`；
 - 依赖不全时退出码 `4`，并逐条打印缺哪个包（如 `import cv2 失败（发行包 opencv-contrib-python）`）；
 - 子命令也容忍写成 `--self-check`（带横杠），不会掉进 `run` 分支去要 `--input`。
-- 打包产物（`dist\ocr-win\`）里没有 `.dist-info`，读不到包元数据，因此清单核对会自动跳过、直接以**流水线初始化结果**为准——这一步才是打包漏依赖的权威判定。
+- 自检查**两个维度**：`import` 能不能找到模块（对应 `--collect-all`），以及**发行包元数据在不在**
+  （`importlib.metadata.version()`，对应 `--copy-metadata`）。缺后者会逐条打印
+  `元数据缺失：scikit-learn（发行包已打包但无 dist-info，paddlex 会误判 extras 未安装，需 --copy-metadata）`，
+  同样退出码 `4` —— 这条正是「模块全在、paddlex 却说没装依赖」的真凶（见「打包 exe → 两类派生」）。
 
 ## 第二步：先 dry-run，再真跑
 
@@ -232,6 +235,39 @@ dir .venv\Lib\site-packages\paddle\libs\*cudnn*
 静态分析追不到它依赖的第三方包 —— 打出来的 exe 一初始化就报
 `OCR requires additional dependencies`。上游给 `ocr` extra 加包时**无需改任何脚本**。
 
+### 两类派生，缺一不可：`--collect-all` 与 `--copy-metadata`
+
+`--print-only` 会把两类都打全（排障先看这两行）：
+
+```
+[build] --collect-all 派生模块 15 个：einops, ftfy, imagesize, jinja2, lxml, cv2, openpyxl, …
+[build] --copy-metadata 派生发行包 16 个：paddlex, einops, ftfy, imagesize, jinja2, lxml, opencv-contrib-python, …
+```
+
+| 参数 | 解决什么 | 缺了会怎样 |
+| --- | --- | --- |
+| `--collect-all <模块名>` | 把**模块本体**（`.py`/`.pyd`/数据文件）打进包 | `ModuleNotFoundError` / `import cv2 失败` |
+| `--copy-metadata <发行包名>` | 把 **`.dist-info` 元数据**打进包 | 模块明明都在，paddlex 仍报 `OCR requires additional dependencies` |
+
+为什么第二条不能省：paddlex 判定 extras 是否可用**不看 import**，而是
+`importlib.metadata.version(<发行包>)`（`paddlex/utils/deps.py:is_dep_available`）。
+PyInstaller 的产物只有 `.py`/`.pyd`，默认不带 `.dist-info`，元数据查不到 → 判定 extras 未安装。
+所以每个 extras 发行包**以及 `paddlex` 自己**都要 `--copy-metadata`：
+
+- 用**发行包名**不是模块名（`opencv-contrib-python`，不是 `cv2`）；
+- `paddlex` 自己的元数据不能漏：它的 extras 清单（`EXTRAS`/`DEP_SPECS`）是**导入时**用
+  `metadata("paddlex")` + `requires("paddlex")` 算死的常量，元数据缺失时连
+  `import paddlex.utils.deps` 都过不去（`PackageNotFoundError`）；
+- PyInstaller 的 `--copy-metadata` 是把整个 `<包>-<版本>.dist-info/` 目录复制进包，
+  `METADATA` 里的 `Requires-Dist` / `Provides-Extra` **原样保留**，不会被裁剪。
+- 还有一条**独立**的启动期依赖：`packaging`。`deps.py` 在**导入期**就
+  `from packaging.requirements import Requirement` 逐条解析 `Requires-Dist`，打包漏收它时抛的是
+  `ImportError`（进程起不来），和「元数据缺失」（能启动、paddlex 报 extras 未安装）是两条不同的
+  失败路径。`build_exe.py` 已显式加 `--hidden-import packaging` / `packaging.requirements` /
+  `packaging.version`；`self-check` 也会单独打一行
+  `packaging: 可 import，Requirement 可解析 Requires-Dist`，不可用时独立退 `4` 并在结论里点明是
+  `ImportError` 而不是 extras 判定失败。
+
 打包末尾还有**冒烟断言**：两个脚本都会跑一次 `dist\ocr-win\ocr-win.exe self-check`（默认带流水线初始化），
 非 0 即判定打包失败 —— 「打包完成但产物跑不起来」不会再悄悄通过。
 
@@ -270,6 +306,8 @@ paste /tmp/nas-before.tsv /tmp/nas-after.tsv | awk -F'\t' '
 - 单行结果超过 4 MB 无法回导（服务端单批上限），本地记 `text_too_large` 并跳过；这类文件建议回 NAS 端处理。
 - `.docx/.xlsx/.pptx` 不支持；加密 PDF 会进 `failed.jsonl`。
 - 引擎结果字段形状在 paddlex 3.x 各小版本间有差异，`extract_rec_texts()` 做容错提取（`rec_texts` 可能出现在 `res` / `prunedResult` / `.json` 下）。
+- PyInstaller 的 `--copy-metadata` 只带 `.dist-info`（含 `top_level.txt`/`RECORD`），**不带模块代码**；反过来 `--collect-all` 只带模块、不带元数据。两者互补，谁也替代不了谁。
+- 排障先分清三条独立链路：`--collect-all` 缺 → `ModuleNotFoundError` / `import xxx 失败`；`--copy-metadata` 缺 → 能启动但 `OCR requires additional dependencies`；`packaging` 缺 → `ImportError`。`self-check` 三者各有对应行，不要只看最后那句结论。
 - 打包末尾的冒烟自检默认真初始化流水线：**离线机器第一次打包会因模型下载失败而判定失败**。先在联网环境跑一次 `self-check` 预热 `%USERPROFILE%\.paddlex` 缓存即可；只想跳过着一步验证依赖时手动执行 `dist\ocr-win\ocr-win.exe self-check --no-pipeline`。
 - **待识别 0 个时不初始化引擎**：续跑全部命中（`已完成跳过 N`）时直接收尾退出 0，不建 pipeline、不下载模型——否则 GPU 版 paddle 缺 cuDNN 会在「一个文件都不用处理」的情况下崩在启动阶段。
 - **GPU 只支持源码模式**：`dist\ocr-win\ocr-win.exe` 是 CPU 版，没有任何 GPU 打包路径（CUDA DLL 收集不可靠、体积 3 GB 起）。需要显卡加速就在 venv 里加 `--device gpu:0`。GPU 存不存在都不影响退出码。

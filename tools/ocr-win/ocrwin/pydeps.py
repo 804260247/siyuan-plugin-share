@@ -11,6 +11,16 @@
   `importlib.metadata.requires("paddlex")` 里筛 `extra == "ocr"` 现算，
   不许在本文件里硬编码一份包名清单。
 
+但「收进包里」还不够 —— 这是 0034 的真机教训：
+  paddlex 判定 extras 是否可用时**不看 import**，而是
+  `importlib.metadata.version(<发行包>)`（`paddlex/utils/deps.py:is_dep_available`）。
+  PyInstaller 的产物只有 `.py` / `.pyd`，没有 `.dist-info`，元数据查不到，
+  paddlex 就认定 extras 没装 —— 模块全在也照样报
+  `OCR requires additional dependencies`。所以每个 extras 发行包
+  （以及 `paddlex` 自己）都必须再补一条 `--copy-metadata <发行包名>`：
+  `--collect-all` 解决「模块/数据文件进包」，`--copy-metadata` 解决
+  「元数据进包」，两者缺一不可、也不互相替代。
+
 纯标准库实现（打包机上不额外依赖 `packaging`）：
   * 发行包名 → 顶层模块名走 dist-info 的 `top_level.txt`，
     这样 `opencv-contrib-python` → `cv2`、`scikit-learn` → `sklearn`
@@ -70,11 +80,39 @@ def requirement_names(dist: str = DEFAULT_DIST, extra: str = DEFAULT_EXTRA,
     return out
 
 
+def _modules_from_record(meta) -> list[str]:
+    """从 `RECORD` 反推顶层模块名（poetry/hatch 打的 wheel 常常没有 `top_level.txt`）。
+
+    `RECORD` 是 PEP 376 强制项，每个 wheel 都有；取每行路径的第一段：
+    `cv2/__init__.py` → `cv2`、`einops.py` → `einops`。
+    """
+    try:
+        raw = meta.read_text("RECORD") or ""
+    except Exception:
+        return []
+    mods: list[str] = []
+    for line in raw.splitlines():
+        path = line.split(",", 1)[0].strip()
+        if not path or path.startswith(("/", "..")):
+            continue
+        head = path.replace("\\", "/").split("/", 1)[0]
+        if head.endswith((".dist-info", ".data")) or not head:
+            continue
+        if head.endswith((".py", ".pyd", ".so")):
+            head = head.rsplit(".", 1)[0]
+        if head == "__pycache__" or head in mods:
+            continue
+        if not head.replace("_", "").isalnum():
+            continue
+        mods.append(head)
+    return mods
+
+
 def top_level_modules(dist: str) -> list[str]:
     """发行包名 → 它真正能被 import 的顶层模块名。
 
-    读 dist-info 里的 `top_level.txt`；缺失/为空时退回「把名字里的 - 换成 _」。
-    发行包未安装返回 `[]`。
+    依次读 dist-info 的 `top_level.txt` → `RECORD`，都没有才退回
+    「把名字里的 - 换成 _」。发行包未安装返回 `[]`。
     """
     try:
         meta = md.distribution(dist)
@@ -89,6 +127,8 @@ def top_level_modules(dist: str) -> list[str]:
         mod = line.strip()
         if mod and mod not in mods:
             mods.append(mod)
+    if not mods:
+        mods = _modules_from_record(meta)
     if not mods:
         mods = [normalize(dist).replace("-", "_")]
     return mods
@@ -135,21 +175,78 @@ def missing_modules(pairs=None) -> list[tuple[str, str]]:
     return out
 
 
-def pyinstaller_args(dist: str = DEFAULT_DIST, extra: str = DEFAULT_EXTRA,
-                     skip=(), requires=None) -> list[str]:
-    """派生 PyInstaller 参数：每个 extra 模块一条 `--collect-all <module>`。
+def collect_modules(dist: str = DEFAULT_DIST, extra: str = DEFAULT_EXTRA,
+                   skip=(), requires=None) -> list[str]:
+    """需要 `--collect-all` 的模块名（去重、保 extra 声明顺序）。
 
-    `--collect-all` 会一并收集该包的 submodules / 数据文件 / 二进制扩展，
-    比只写 `--hidden-import` 稳（cv2 的 .pyd、tokenizers 的 dll 都在里面）。
     `skip` 里的模块视为「基础参数已经显式收集过」，不重复加。
     """
-    args: list[str] = []
+    out: list[str] = []
     seen = {str(s) for s in skip}
     for _dist, mod in module_pairs(dist, extra, requires=requires):
         if mod in seen:
             continue
         seen.add(mod)
+        out.append(mod)
+    return out
+
+
+def pyinstaller_args(dist: str = DEFAULT_DIST, extra: str = DEFAULT_EXTRA,
+                     skip=(), requires=None) -> list[str]:
+    """派生 PyInstaller 的 `--collect-all` 参数（每个 extra 模块一条）。
+
+    `--collect-all` 会一并收集该包的 submodules / 数据文件 / 二进制扩展，
+    比只写 `--hidden-import` 稳（cv2 的 .pyd、tokenizers 的 dll 都在里面）。
+    """
+    args: list[str] = []
+    for mod in collect_modules(dist, extra, skip=skip, requires=requires):
         args += ["--collect-all", mod]
+    return args
+
+
+def metadata_names(dist: str = DEFAULT_DIST, extra: str = DEFAULT_EXTRA,
+                   requires=None) -> list[str]:
+    """需要有 `dist-info` 元数据的发行包名：`<dist>` 自己 + 每个 extra 包。
+
+    为什么要连 `paddlex` 一起带上：paddlex 的 `EXTRAS` / `DEP_SPECS` 是**模块
+    导入时**用 `importlib.metadata.metadata("paddlex")` 与 `requires("paddlex")`
+    算出来的常量，元数据缺失时连 import 都过不去 —— 只补依赖包的元数据不够。
+    """
+    names = [normalize(dist)]
+    for name in requirement_names(dist, extra, requires=requires):
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def has_metadata(name: str) -> bool:
+    """发行包的 `dist-info` 元数据是否可读（与 paddlex 判定 extras 同一条路径）。"""
+    try:
+        md.version(normalize(name))
+    except Exception:            # PackageNotFoundError / 元数据损坏都算不可用
+        return False
+    return True
+
+
+def missing_metadata(names=None, dist: str = DEFAULT_DIST, extra: str = DEFAULT_EXTRA,
+                     requires=None) -> list[str]:
+    """`dist-info` 元数据读不到的发行包名（打包产物里就是全部 extras 包）。"""
+    if names is None:
+        names = metadata_names(dist, extra, requires=requires)
+    return [n for n in names if not has_metadata(n)]
+
+
+def metadata_pyinstaller_args(dist: str = DEFAULT_DIST, extra: str = DEFAULT_EXTRA,
+                              requires=None) -> list[str]:
+    """派生 PyInstaller 的 `--copy-metadata` 参数（每个发行包一条）。
+
+    作用是把 `<包>-<版本>.dist-info/METADATA` 原样打进产物，让
+    `importlib.metadata.version()` / `requires()` 在 frozen 环境里可用。
+    必须用**发行包名**（`opencv-contrib-python`），不是模块名（`cv2`）。
+    """
+    args: list[str] = []
+    for name in metadata_names(dist, extra, requires=requires):
+        args += ["--copy-metadata", name]
     return args
 
 
