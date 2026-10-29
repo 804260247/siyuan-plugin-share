@@ -393,6 +393,7 @@ class TestSelfCheck(BaseCase):
         rc, out = run_cli(["self-check"])
         self.assertIn("PyMuPDF", out)
         self.assertIn("paddlex", out)
+        self.assertIn("GPU", out)      # 0032：GPU 能力探测行必须打，且不影响退出码
         self.assertIn(rc, (cli.EXIT_OK, cli.EXIT_DEPENDENCY), out)
 
 
@@ -583,6 +584,206 @@ class TestSelfCheckPipeline(unittest.TestCase):
         self.assertIn("scikit-learn", out)
         self.assertNotIn("ensure_ready", self.calls)
 
+
+# --------------------------------------------------------------------------- 0032 性能可观测性 / GPU
+
+class TestPerfObservability(BaseCase):
+    """0032：逐文件耗时/页数必须真打出来，汇总补页级指标，缓冲文案不得再说「已导入」。"""
+
+    def test_per_file_line_reports_pages_and_secs(self):
+        make_pdf(self.input / "a.pdf", pages=2)
+        with NasStub() as stub:
+            rc, out = run_cli(["run", "--input", str(self.input), "--server", stub.base,
+                               "--token", TOKEN])
+        self.assertEqual(rc, cli.EXIT_OK, out)
+        self.assertIn("完成 a.pdf pages=2", out)
+        self.assertIn("秒/页", out)
+        self.assertLess(out.index("完成 a.pdf"), out.index("汇总：总页数"),
+                        "逐文件行必须在汇总之前")
+
+    def test_summary_reports_page_metrics(self):
+        make_pdf(self.input / "a.pdf", pages=2)
+        make_pdf(self.input / "b.pdf", pages=3)
+        with NasStub() as stub:
+            rc, out = run_cli(["run", "--input", str(self.input), "--server", stub.base,
+                               "--token", TOKEN])
+        self.assertEqual(rc, cli.EXIT_OK, out)
+        # 两个文件页数不同（PDF 内容不同 → 哈希不同 → 都进池）
+        self.assertIn("完成 a.pdf pages=2", out)
+        self.assertIn("完成 b.pdf pages=3", out)
+        self.assertIn("汇总：总页数 5", out)
+        self.assertIn("平均", out)
+        self.assertIn("页/分钟", out)
+
+    def test_progress_line_says_buffered_not_imported(self):
+        make_pdf(self.input / "a.pdf", pages=1)
+        with NasStub() as stub:
+            rc, out = run_cli(["run", "--input", str(self.input), "--server", stub.base,
+                               "--token", TOKEN])
+        self.assertEqual(rc, cli.EXIT_OK, out)
+        self.assertIn("已缓冲", out)
+        self.assertNotIn("已导入", out, "旧文案会让人以为没上传成功")
+
+
+class _FakeCuda:
+    def __init__(self, n):
+        self.n = n
+
+    def device_count(self):
+        return self.n
+
+    def get_device_name(self, i):
+        return "FakeGPU-%d" % i
+
+    def get_cudnn_version(self):
+        return 8907
+
+
+class _FakeDevice:
+    def __init__(self, compiled, n):
+        self._compiled = compiled
+        self.cuda = _FakeCuda(n)
+
+    def is_compiled_with_cuda(self):
+        return self._compiled
+
+
+class _FakePaddle:
+    def __init__(self, compiled=False, n=0, ver="3.0.0"):
+        self.device = _FakeDevice(compiled, n)
+        if ver:
+            self.__version__ = ver
+
+
+class TestGpuProbe(unittest.TestCase):
+    """GPU 探测：有卡说可用、无卡说仅 CPU、坏装不抛、都不改退出码。"""
+
+    def test_available(self):
+        txt = engine_mod.gpu_summary(_FakePaddle(True, 2))
+        self.assertIn("GPU 可用", txt)
+        self.assertIn("FakeGPU-0", txt)
+        self.assertIn("8907", txt)
+
+    def test_cpu_only_wheel(self):
+        txt = engine_mod.gpu_summary(_FakePaddle(False, 0))
+        self.assertIn("仅 CPU", txt)
+        self.assertIn("CPU 版，未编译 CUDA", txt)
+        self.assertIn("paddlepaddle", txt)
+        self.assertIn("paddlepaddle-gpu", txt, "要给出换 GPU 版的做法")
+        self.assertNotIn("GPU 版但未检测到设备", txt, "CPU 版不能说成「GPU 版无设备」")
+
+    def test_compiled_but_no_visible_device(self):
+        txt = engine_mod.gpu_summary(_FakePaddle(True, 0))
+        self.assertIn("GPU 版但未检测到设备", txt)
+        self.assertIn("paddlepaddle-gpu", txt)
+        self.assertNotIn("仅 CPU", txt, "GPU 版无设备不能说成「仅 CPU」")
+
+    def test_two_install_states_are_distinguishable(self):
+        """0032 追加项：CPU 版 vs GPU 版无卡，两条文案必须一眼能分开。"""
+        cpu = engine_mod.gpu_summary(_FakePaddle(False, 0))
+        gpu = engine_mod.gpu_summary(_FakePaddle(True, 0))
+        self.assertNotEqual(cpu, gpu)
+        self.assertIn("CPU 版", cpu)
+        self.assertIn("GPU 版", gpu)
+
+    def test_exact_wording_cpu_version(self):
+        """项目经理指定的字面口径：`paddlepaddle 3.0.0（CPU 版，未编译 CUDA）`。"""
+        orig = engine_mod._dist_label
+        engine_mod._dist_label = lambda p, g, v="": "paddlepaddle 3.0.0"
+        try:
+            txt = engine_mod.gpu_summary(_FakePaddle(False, 0))
+        finally:
+            engine_mod._dist_label = orig
+        self.assertTrue(txt.startswith("仅 CPU：paddlepaddle 3.0.0（CPU 版，未编译 CUDA）"), txt)
+
+    def test_exact_wording_gpu_version_no_device(self):
+        orig = engine_mod._dist_label
+        engine_mod._dist_label = lambda p, g, v="": "paddlepaddle-gpu 3.0.0"
+        try:
+            txt = engine_mod.gpu_summary(_FakePaddle(True, 0))
+        finally:
+            engine_mod._dist_label = orig
+        self.assertTrue(txt.startswith("paddlepaddle-gpu 3.0.0（GPU 版但未检测到设备）"), txt)
+
+    def test_dist_label_names_the_right_dist(self):
+        """包名判定：读不到 dist-info 时按「是否编译 CUDA」反推，不许把 GPU wheel 说成 paddlepaddle。"""
+        import importlib.metadata as md
+
+        def has(name):
+            try:
+                md.version(name)
+                return True
+            except Exception:
+                return False
+
+        cpu = engine_mod._dist_label(_FakePaddle(False, 0), False, "3.0.0")
+        gpu = engine_mod._dist_label(_FakePaddle(True, 0), True, "3.0.0")
+        self.assertIn("3.0.0", cpu)
+        self.assertIn("3.0.0", gpu)
+        if has("paddlepaddle") or has("paddlepaddle-gpu"):
+            self.assertIn("paddlepaddle", cpu)      # 真装了就看 dist-info
+            return
+        self.assertEqual(cpu, "paddlepaddle 3.0.0")
+        self.assertEqual(gpu, "paddlepaddle-gpu 3.0.0")
+
+    def test_broken_paddle_never_raises(self):
+        class Boom:
+            @property
+            def device(self):
+                raise RuntimeError("半装的 paddle")
+
+        self.assertIn("仅 CPU", engine_mod.gpu_summary(Boom()))
+
+    def test_no_paddle_at_all_is_safe(self):
+        txt = engine_mod.gpu_summary()      # 沙箱通常没装 paddle
+        self.assertIsInstance(txt, str)
+        self.assertTrue(("仅 CPU" in txt) or ("GPU 可用" in txt), txt)
+
+
+class TestSelfCheckGpuLine(unittest.TestCase):
+    """GPU 探测出错也不许改变 self-check 退出码。"""
+
+    def setUp(self):
+        self._orig_ver = cli._ver
+        self._orig_req = pydeps.requirement_names
+        self._orig_miss = pydeps.missing_modules
+        self._orig_pipe = engine_mod.PaddleEngine
+        self._orig_gpu = engine_mod.gpu_summary
+
+        cli._ver = lambda m: "9.9.9" if m in ("pymupdf", "PIL", "paddlex", "paddle") else None
+        pydeps.requirement_names = lambda *a, **k: ["einops"]
+        pydeps.missing_modules = lambda *a, **k: []
+
+        class FakePipeline:
+            def __init__(self, device="cpu"):
+                pass
+
+            def ensure_ready(self):
+                return None
+
+        engine_mod.PaddleEngine = FakePipeline
+
+    def tearDown(self):
+        cli._ver = self._orig_ver
+        pydeps.requirement_names = self._orig_req
+        pydeps.missing_modules = self._orig_miss
+        engine_mod.PaddleEngine = self._orig_pipe
+        engine_mod.gpu_summary = self._orig_gpu
+
+    def test_probe_exception_does_not_change_exit_code(self):
+        def boom(*a, **k):
+            raise RuntimeError("cuda 探测炸了")
+
+        engine_mod.gpu_summary = boom
+        rc, out = run_cli(["self-check"])
+        self.assertEqual(rc, cli.EXIT_OK, out)
+        self.assertIn("探测失败", out)
+
+    def test_cpu_only_still_exit_ok(self):
+        engine_mod.gpu_summary = lambda *a, **k: "仅 CPU（模拟）"
+        rc, out = run_cli(["self-check"])
+        self.assertEqual(rc, cli.EXIT_OK, out)
+        self.assertIn("仅 CPU（模拟）", out)
 
 
 if __name__ == "__main__":

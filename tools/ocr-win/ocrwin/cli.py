@@ -131,9 +131,18 @@ def _one_file(path: Path, content_hash: str, params: dict, device: str,
 
 
 def _apply(result: dict, store: StateStore, uploader: Uploader, stats: dict):
+    secs = float(result.get("secs") or 0.0)
+    stats["secs"] += secs                  # 每文件渲染+识别的累计耗时（多 worker 时是各文件之和）
     if result["ok"]:
-        uploader.add(result["item"])       # add() 内部按需 flush
+        item = result["item"]
+        pages = int(item.get("pages") or 0)
+        stats["pages"] += pages
+        uploader.add(item)                 # add() 内部按需 flush
         stats["ocr_ok"] += 1
+        # 逐文件耗时/页数：判断「慢在渲染还是慢在识别」的唯一依据，
+        # 此前 result["secs"] 与 pages 一直是只算不打（0032）。
+        log("完成 %s pages=%d 识别=%.1f 秒（%.2f 秒/页）"
+            % (result["path"].name, pages, secs, (secs / pages) if pages else 0.0))
         return
     stats["failed"] += 1
     store.mark_failed(result["hash"], result["reason"], result["attempts"], str(result["path"]))
@@ -223,7 +232,7 @@ def cmd_run(a) -> int:
 
     uploader = Uploader(client, params["params_key"], store, log,
                         batch_max=a.batch_size, bytes_max=a.batch_bytes)
-    stats = {"ocr_ok": 0, "failed": 0}
+    stats = {"ocr_ok": 0, "failed": 0, "pages": 0, "secs": 0.0}
     workers = max(1, min(int(a.workers or 1), MAX_WORKERS))
     tmp_root = Path(tempfile.mkdtemp(prefix="ocr-win-"))
     t0 = time.time()
@@ -233,9 +242,11 @@ def cmd_run(a) -> int:
         if total and (idx % 10 == 0 or idx == total):
             el = time.time() - t0
             rate = (idx / el) if el > 0 else 0
-            log("进度 %d/%d（成功 %d、失败 %d、已导入 %d）%.2f 个/秒"
+            # 「已导入」永远是 0：回导是按批缓冲的（batch_max=50），凑满一批才 POST，
+            # 进度行看到的只能是缓冲区里的行数，不是服务端已收下的行数（0032 改文案）。
+            log("进度 %d/%d（成功 %d、失败 %d、已缓冲 %d 行）%.2f 个/秒"
                 % (idx, total, stats["ocr_ok"], stats["failed"],
-                   uploader.stats["accepted"], rate))
+                   len(uploader.items), rate))
 
     try:
         with cf.ThreadPoolExecutor(max_workers=workers) as ex:
@@ -269,6 +280,12 @@ def cmd_run(a) -> int:
         % (stats["ocr_ok"], failed_total, uploader.stats["accepted"],
            uploader.stats["rejected"] + uploader.stats["too_large"],
            uploader.batches, el))
+    pages_total = stats["pages"]
+    total_secs = stats["secs"]
+    avg_page = (total_secs / pages_total) if pages_total else 0.0
+    ppm = (pages_total * 60.0 / el) if el > 0 else 0.0
+    log("汇总：总页数 %d、平均 %.2f 秒/页（逐文件累计 %.1f 秒）、%.2f 页/分钟"
+        % (pages_total, avg_page, total_secs, ppm))
     if uploader.stats["upload_failed"]:
         log("汇总：整批上传失败 %d 行（详见 failed.jsonl，重跑会自动重试这些文件）"
             % uploader.stats["upload_failed"])
@@ -304,6 +321,12 @@ def cmd_self_check(a) -> int:
     print("  platform    : %s" % platform.platform())
     print("  executable  : %s" % sys.executable)
     print("  http 传输   : %s" % httpapi.default_transport().name)
+    # GPU 是可选加速：探测失败/没有 CUDA 一律只打印、不改 rc（0032）。
+    try:
+        gpu_line = engine_mod.gpu_summary()
+    except Exception as exc:                    # 探测自身出错也不许拖垮自检
+        gpu_line = "探测失败（忽略，按 CPU 处理）：%s" % exc
+    print("  %s: %s" % (_pad("GPU"), gpu_line))
 
     mupdf_ver = _ver("pymupdf") or _ver("fitz")
     pil_ver = _ver("PIL")

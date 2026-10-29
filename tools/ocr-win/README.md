@@ -79,9 +79,23 @@ python -m ocrwin run --input "D:\扫描" --server http://192.168.1.111:3003 --to
 跑完会打印：
 
 ```
+[ocr-win] 完成 图纸A.pdf pages=8 识别=1043.2 秒（130.40 秒/页）
+[ocr-win] 完成 图纸B.pdf pages=1 识别=132.6 秒（132.60 秒/页）
+[ocr-win] 进度 2/305（成功 2、失败 0、已缓冲 2 行）0.19 个/秒
 [ocr-win] 汇总：扫描 320、扩展名跳过 12、已完成跳过 0、同内容重复 3、不可读 0
 [ocr-win] 汇总：识别成功 305、失败 0、回导 accepted=305 rejected=0 批次=7 用时 1854.3 秒
+[ocr-win] 汇总：总页数 1840、平均 0.99 秒/页（逐文件累计 1820.4 秒）、59.52 页/分钟
 ```
+
+两点关于这些数字（都不影响结果正确性）：
+
+- **`已缓冲 N 行` 不是「服务端已收下 N 行」**：回导是按批攒的（`--batch-size` 默认 50），
+  凑满一批才 POST 一次，最后一批在退出时提交。所以进度行里看到的只是缓冲区行数，
+  真正入库数看汇总行的 `回导 accepted=`（旧文案写「已导入」，永远显示 0，已修正）。
+- **每文件那行是「渲染 + 识别」的总耗时**，除以页数得到单页成本。
+  `平均 秒/页` 按逐文件耗时累计算（多 worker 时是各文件之和，不是墙钟时间）；
+  `页/分钟` 按墙钟时间算。这两个数才是判断「慢在渲染还是慢在识别」的依据——
+  提高 `--workers` 只会改善 `页/分钟`，不会改善单页成本。
 
 ## 参数
 
@@ -97,7 +111,7 @@ python -m ocrwin run --input "D:\扫描" --server http://192.168.1.111:3003 --to
 | `--out-dir` | `<input>\.ocr-win-state` | 状态目录（断点续跑与失败清单都在这里） |
 | `--batch-size` | 50 | 单批行数上限（服务端硬上限 50） |
 | `--batch-bytes` | 4 MB − 64 KB | 单批请求体上限（服务端硬上限 4 MB） |
-| `--device` | `cpu` | paddlex 设备（有独显可试 `gpu:0`） |
+| `--device` | `cpu` | paddlex 设备；NVIDIA 独显装 GPU 版 wheel 后可填 `gpu:0`（见「GPU 加速」） |
 | `--resample` | `bilinear` | 缩放到 `max_side` 的插值算法；默认与 NAS 侧 GD 同算法，便于字符数对照 |
 
 支持扩展名：`.pdf .png .jpg .jpeg .bmp .tif .tiff .webp`（多帧 TIFF 按帧逐页处理）；其他一律跳过并计数。
@@ -123,6 +137,38 @@ python -m ocrwin run --input "D:\扫描" --server http://192.168.1.111:3003 --to
 | `failed.jsonl` | 每条 `{content_hash, reason, attempts, path}` —— 失败原因含 `empty_text` / `text_too_large` / `size_mismatch` / `stale` / `network_error` / `http_<code>` / 渲染或引擎异常文本 |
 
 删掉整个状态目录 = 下次全量重跑。
+
+## GPU 加速（可选，只走源码模式）
+
+推理代码**不用改**：`--device` 一路透传给 `create_pipeline`，换 wheel 就能用显卡。
+参考环境（真机实测路径）：**NVIDIA GeForce RTX 4060 Laptop / 8 GB 显存 / 驱动 572.83（CUDA 12.8）/ Python 3.12 / 24 GB 内存**。
+
+```powershell
+# 1) 卸掉 CPU 版 paddle（版本号必须与 requirements.txt 的 3.0.0 一致）
+.venv\Scripts\python.exe -m pip uninstall -y paddlepaddle
+
+# 2) 装 GPU wheel：--no-deps 必须带（理由见下），cu126 源里有 cp312 轮子，对应 Python 3.12
+.venv\Scripts\python.exe -m pip install --no-deps paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+
+# 3) 自检：GPU 行应变成「paddlepaddle-gpu 3.0.0，GPU 可用：<卡名> ×1，CUDA 已编译，cuDNN xxxx」
+.venv\Scripts\python.exe run_ocr_win.py self-check --server https://<你的站点>:4344 --token <Key>
+
+# 4) 真跑时指定设备；8 GB 显存机型 --workers 必须 1
+.venv\Scripts\python.exe run_ocr_win.py run --input "E:\待扫目录" --server https://<你的站点>:4344 --token <Key> --device gpu:0 --workers 1
+```
+
+- **`--no-deps` 不能省**：Windows 版 `paddlepaddle-gpu` 轮子自带 cuDNN/cuBLAS DLL；按常规 `pip install` 会把 CPU 版 `paddlepaddle` 当依赖再拉回来，两个 dist 同时存在、`import paddle` 命中哪个不确定，典型症状就是「装了 GPU 版，self-check 却说只有 CPU」。
+- **不用装 CUDA Toolkit、不用降驱动**：cu126 二进制在 CUDA 12.8 驱动上向下兼容。若 cu126 轮子报 DLL 缺失，退 cu118 源——同一条命令把 URL 里的 `cu126` 换成 `cu118`，版本号仍是 `paddlepaddle-gpu==3.0.0`。
+- **只认 NVIDIA**：`paddlepaddle-gpu` 需要 CUDA，AMD / Intel 核显这条路不存在，`--device gpu:0` 会初始化失败。
+- **GPU 下 `--workers` 用 1**：每多一个 worker 就多占一份显存，8 GB 显存跑 2 份模型通常直接 OOM；多卡机器按卡数分配。`self-check` 的 GPU 探测只是打印、不影响退出码（GPU 属可选加速，没有也照常跑 CPU）。
+- **self-check 的 GPU 行有四种取值，直接看它判断装对没有**：
+  - `仅 CPU：paddlepaddle 3.0.0（CPU 版，未编译 CUDA）` → 还是 CPU 版 wheel，第 1、2 步没生效；
+  - `paddlepaddle-gpu 3.0.0（GPU 版但未检测到设备）` → wheel 对了，但机器/驱动没把卡暴露给 paddle，先用 `nvidia-smi` 确认驱动与占用；
+  - `paddlepaddle-gpu 3.0.0，GPU 可用：<卡名> ×1，CUDA 已编译，cuDNN xxxx` → 可以加 `--device gpu:0`；
+  - `仅 CPU（未安装 paddlepaddle：…）` → 连 CPU 版都没装，先按上面「安装」一节装依赖。
+- **exe 不打 GPU 版**（有意取舍）：GPU 版 PyInstaller 产物 3 GB 起，且 CUDA/cuDNN 的 DLL 极容易漏收（就是 0031 那类问题的放大版，还更难查）。要 GPU 就用 venv 源码模式跑；`dist\ocr-win\ocr-win.exe` 永远是 CPU 版。真需要 GPU 版 exe 请单独立项。
+- 首次用 GPU 仍会下载模型（几百 MB），之后缓存命中。
+- **GPU 只加速识别**：`PyMuPDF` 渲染与缩放是纯 CPU 的，页多、墨迹重的 PDF 渲染本身就是大头——先看逐文件行的 `pages=N 识别=Z 秒（W 秒/页）` 再决定值不值得装 GPU。
 
 ## 打包 exe
 
@@ -193,4 +239,5 @@ paste /tmp/nas-before.tsv /tmp/nas-after.tsv | awk -F'\t' '
 - `.docx/.xlsx/.pptx` 不支持；加密 PDF 会进 `failed.jsonl`。
 - 引擎结果字段形状在 paddlex 3.x 各小版本间有差异，`extract_rec_texts()` 做容错提取（`rec_texts` 可能出现在 `res` / `prunedResult` / `.json` 下）。
 - 打包末尾的冒烟自检默认真初始化流水线：**离线机器第一次打包会因模型下载失败而判定失败**。先在联网环境跑一次 `self-check` 预热 `%USERPROFILE%\.paddlex` 缓存即可；只想跳过着一步验证依赖时手动执行 `dist\ocr-win\ocr-win.exe self-check --no-pipeline`。
+- **GPU 只支持源码模式**：`dist\ocr-win\ocr-win.exe` 是 CPU 版，没有任何 GPU 打包路径（CUDA DLL 收集不可靠、体积 3 GB 起）。需要显卡加速就在 venv 里加 `--device gpu:0`。GPU 存不存在都不影响退出码。
 - 本工具回导的 `engine` 写 `paddle5`，NAS 侧车写 `paddleocr-sidecar`——这是**有意差异**，配 `source`（`win` / `nas`）可一眼区分某条结果是 PC 导的还是 NAS 扫的。副作用：只按 `engine='paddleocr-sidecar'` 过滤的统计会漏掉 PC 导入的结果，统计口径请改用 `source` 或不过滤 `engine`（`params_key` 本身也以 `paddle5|` 开头）。
