@@ -4103,7 +4103,7 @@
       if (statusBox.dataset.mode !== "table") {
         statusBox.dataset.mode = "table";
       }
-      let html = '<table class="table" style="max-width:880px;table-layout:fixed;width:100%"><colgroup><col style="width:18%"><col style="width:11%"><col style="width:34%"><col style="width:37%"></colgroup><thead><tr><th>连接</th><th>状态</th><th>进度</th><th>统计</th></tr></thead><tbody>';
+      let html = '<table class="table" style="max-width:880px;table-layout:fixed;width:100%"><colgroup><col style="width:22%"><col style="width:12%"><col style="width:66%"></colgroup><thead><tr><th>连接</th><th>状态</th><th>进度</th></tr></thead><tbody>';
       configs.forEach((cfg) => {
         const agg = cfg.agg || {};
         const active = agg.active_job || null;
@@ -4141,12 +4141,11 @@
           progText = filesTotal ? ("文件 " + filesDone + "/" + filesTotal) : (shareTotal ? shareTotal + " 个分享" : "未重建");
           if (doneShares >= shareTotal && shareTotal > 0) barPct = "100%";
         }
-        // 统计列
+        // 0027: 原「统计」列并入进度列灰字；文件 x/y 与进度条文本重复，不再重复显示
         let statsHtml = "分享 " + shareTotal + "，完成 " + doneShares;
         if (agg.running_shares) statsHtml += "，重建中 " + agg.running_shares;
         if (agg.pending_shares) statsHtml += "，排队 " + agg.pending_shares;
         if (agg.failed_shares) statsHtml += "，失败 " + agg.failed_shares;
-        if (filesTotal) statsHtml += "，文件 " + filesDone + "/" + filesTotal;
         // 状态徽标
         let statusHtml = '<span class="muted">' + jobStatusLabel(jobStatus) + "</span>";
         if (jobStatus === "running") statusHtml = '<span style="color:#d97706">重建中</span>';
@@ -4166,8 +4165,8 @@
             '<div class="nd-progress"><span class="nd-progress-bar" style="width:' + ocrBarPct + '"></span></div>';
         }
         if (progDetail) html += '<div class="nd-progress-detail">' + escapeHtml(progDetail) + "</div>";
+        if (statsHtml) html += '<div class="nd-progress-detail">' + escapeHtml(statsHtml) + "</div>";
         html += "</td>";
-        html += "<td data-nd-stats>" + escapeHtml(statsHtml) + "</td>";
         html += "</tr>";
       });
       html += "</tbody></table>";

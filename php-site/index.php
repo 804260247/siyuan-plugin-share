@@ -18031,19 +18031,17 @@ if ($path === '/admin') {
     $content .= '<div style="margin-top:12px"><button class="button primary" type="submit">保存预览设置</button></div>';
     $content .= '</form>';
     $content .= '<h3 style="margin-top:20px;margin-bottom:8px">全文索引</h3>';
-    $content .= '<div class="muted" style="margin-bottom:8px">无需 Cloudreve 管理员权限即可检索文件名与文档正文。为每个 Cloudreve 连接配置 OCR/索引参数（新增连接默认关闭 OCR）；绑定该连接的分享在重建时按其配置运行，并可独立重建/终止。重建在后台异步执行，可实时查看进度。</div>';
+    $content .= '<div class="muted" style="margin-bottom:8px">无需 Cloudreve 管理员权限即可检索文件名与正文；每个连接各自配置 OCR/索引参数（新增连接默认关闭 OCR），重建在后台运行、可独立重建/终止，进度见下方表格。</div>';
     if (empty($cloudreveConfigs)) {
         $content .= '<div class="notice">请先在上方添加至少一个 Cloudreve 连接配置。</div>';
     } else {
-        $content .= '<div class="table-scroll table-scroll-has-actions" style="margin-top:8px"><table class="table table-has-actions"><thead><tr><th>连接</th><th>OCR</th><th>DPI</th><th>并发</th><th>上限MB</th><th>低优MB</th><th>刷新秒</th><th class="actions">操作</th></tr></thead><tbody>';
+        $content .= '<div class="table-scroll table-scroll-has-actions" style="margin-top:8px"><table class="table table-has-actions"><thead><tr><th>连接</th><th>OCR</th><th>DPI</th><th>上限MB</th><th>跳过MB</th><th>刷新秒</th><th class="actions">操作</th></tr></thead><tbody>';
         foreach ($cloudreveConfigs as $icfg) {
             $icfgId = (int)$icfg['id'];
             $icfgName = htmlspecialchars((string)($icfg['name'] ?? ''));
             $icfgOcrOn = trim((string)($icfg['index_ocr_enabled'] ?? '')) === '' ? false : trim((string)$icfg['index_ocr_enabled']) !== '0';
             $icCfgId = $icfgId;
             $icDpiS = netdisk_index_ocr_dpi_start($icCfgId);
-            $icDpiM = netdisk_index_ocr_dpi_max($icCfgId);
-            $icConc = netdisk_index_ocr_concurrency($icCfgId);
             $icMax = netdisk_index_ocr_max_mb($icCfgId);
             $icLow = netdisk_index_ocr_low_max_mb($icCfgId);
             $icTtl = netdisk_index_refresh_ttl($icCfgId);
@@ -18056,43 +18054,53 @@ if ($path === '/admin') {
             $content .= '<tr>';
             $content .= '<td>' . $icfgName . '</td>';
             $content .= '<td>' . ($icfgOcrOn ? '<span style="color:#16a34a">开</span>' : '<span class="muted">关</span>') . '</td>';
-            $content .= '<td>' . (int)$icDpiS . '→' . (int)$icDpiM . '</td>';
-            $content .= '<td>' . (int)$icConc . '</td>';
-            $content .= '<td>' . (int)$icMax . '</td>';
-            $content .= '<td>' . (int)$icLow . '</td>';
+            // 0027: OCR 关闭时 DPI/上限MB/跳过MB 无意义，显示占位符而非真实值
+            $icDash = '<span class="muted">—</span>';
+            $content .= '<td>' . ($icfgOcrOn ? (int)$icDpiS : $icDash) . '</td>';
+            $content .= '<td>' . ($icfgOcrOn ? (int)$icMax : $icDash) . '</td>';
+            $content .= '<td>' . ($icfgOcrOn ? (int)$icLow : $icDash) . '</td>';
             $content .= '<td>' . (int)$icTtl . '</td>';
             $content .= '<td class="actions">';
             $content .= '<button class="button" type="button" data-netdisk-icfg-toggle data-cfg-id="' . $icfgId . '">配置</button>';
             // 重建/终止二合一：初始显示"重建索引"，运行时报状态由前端根据 configs[].job_status 切换
             $content .= '<button class="button" type="button" data-netdisk-cfg-action data-config-id="' . $icfgId . '" data-config-name="' . $icfgName . '" data-running="0">重建索引</button>';
-            // 0018: 强制重跑 OCR 勾选框（默认不勾；勾选后重建请求附带 force_ocr=1，忽略已有高质量结果）
-            $content .= '<label class="checkbox" style="display:inline-flex;align-items:center;gap:4px;margin-left:8px;font-size:0.78rem;white-space:nowrap" title="忽略已有高质量 OCR 结果，全部重新识别"><input type="checkbox" data-nd-force-ocr data-config-id="' . $icfgId . '"> 强制重跑 OCR（忽略已有高质量结果）</label>';
             $content .= '</td>';
             $content .= '</tr>';
             // 展开的配置编辑表单（默认隐藏）
-            $content .= '<tr class="nd-icfg-edit-row" data-nd-icfg-edit="' . $icfgId . '" hidden><td colspan="8">';
+            $content .= '<tr class="nd-icfg-edit-row" data-nd-icfg-edit="' . $icfgId . '" hidden><td colspan="7">';
+            // 0018: 强制重跑 OCR 勾选框（默认不勾；勾选后重建请求附带 force_ocr=1，忽略已有高质量结果）
+            // 0027: 从操作列移入配置展开区，且置于 form 之外（它无 name，不参与保存）；重建按钮按 data-config-id 读取，行为不变
+            $content .= '<label class="checkbox" style="display:inline-flex;align-items:center;gap:4px;margin:8px 0 0;font-size:0.78rem" title="忽略已有高质量 OCR 结果，全部重新识别"><input type="checkbox" data-nd-force-ocr data-config-id="' . $icfgId . '"> 强制重跑 OCR（忽略已有高质量结果）</label>';
             $content .= '<form method="post" action="' . base_path() . '/admin/netdisk/index-config/save" style="margin:8px 0" class="card-sub-form">';
             $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
             $content .= '<input type="hidden" name="config_id" value="' . $icfgId . '">';
             $content .= '<label class="checkbox" style="margin-bottom:6px;display:inline-block"><input type="checkbox" name="index_ocr_enabled" value="1" data-netdisk-index-ocr-toggle' . ($icfgOcrOn ? ' checked' : '') . '> 启用 OCR</label>';
-            $content .= '<div class="muted" style="margin-bottom:6px;font-size:0.75rem">OCR 引擎：PaddleOCR（PP-OCRv6，通过 serving 接入）。DPI 为 PDF 页转图分辨率，PaddleOCR 一次识别即高质量，无需再按阈值升档重扫。</div>';
+            $content .= '<div class="muted" style="margin-bottom:6px;font-size:0.75rem">OCR 引擎：PaddleOCR（PP-OCRv5，通过 serving 接入）。DPI 为 PDF 页转图分辨率。侧车模式下「DPI 上限 / 质量阈值 / 并发数」不生效，已改为隐藏保留值，保存时原样回传。</div>';
             $content .= '<div class="grid" data-netdisk-index-ocr-fields' . ($icfgOcrOn ? '' : ' hidden') . ' style="grid-template-columns:repeat(4,minmax(0,1fr));max-width:920px">';
+            // 0027: 只保留侧车模式下真正生效的 5 项
             $icInputs = [
                 ['index_ocr_dpi_start', 'PDF转图DPI', '200'],
-                ['index_ocr_dpi_max', 'DPI上限', '600'],
-                ['index_ocr_quality_threshold', '质量阈值', '0.3'],
-                ['index_ocr_concurrency', 'OCR 并发数', '4'],
                 ['index_ocr_max_mb', '正常上限MB', '10'],
-                ['index_ocr_low_max_mb', '低优上限MB', '50'],
+                ['index_ocr_low_max_mb', '跳过阈值MB', '50'],
                 ['index_refresh_ttl', '刷新间隔秒', '3600'],
                 ['index_skip_exts', '跳过扩展名', 'zip,dwg,rar'],
+            ];
+            // 0027: 这三项在侧车模式下不生效，但仍须原样回传——保存接口对缺失字段取空串，
+            // 直接删输入框会把用户此前自定义的值覆盖成默认值（保存行为必须零变化）。
+            $icHiddenInputs = [
+                ['index_ocr_dpi_max', '600'],
+                ['index_ocr_quality_threshold', '0.3'],
+                ['index_ocr_concurrency', '4'],
             ];
             foreach ($icInputs as $icIn) {
                 $fName = $icIn[0];
                 $fVal = trim((string)($icfg[$fName] ?? ''));
-                $fDefault = $icIn[2];
-                $fDisp = $fVal === '' ? $fDefault : $fVal;
+                $fDisp = $fVal === '' ? $icIn[2] : $fVal;
                 $content .= '<div style="display:flex;flex-direction:column;gap:4px"><label>' . htmlspecialchars($icIn[1]) . '</label><input class="input" name="' . $fName . '" value="' . htmlspecialchars($fDisp) . '"></div>';
+            }
+            foreach ($icHiddenInputs as $icHid) {
+                $hVal = trim((string)($icfg[$icHid[0]] ?? ''));
+                $content .= '<input type="hidden" name="' . $icHid[0] . '" value="' . htmlspecialchars($hVal === '' ? $icHid[1] : $hVal) . '">';
             }
             $content .= '</div>';
             $content .= '<div style="margin-top:8px"><button class="button primary" type="submit">保存该连接配置</button></div>';

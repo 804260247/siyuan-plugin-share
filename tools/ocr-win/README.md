@@ -159,3 +159,4 @@ paste /tmp/nas-before.tsv /tmp/nas-after.tsv | awk -F'\t' '
 - 单行结果超过 4 MB 无法回导（服务端单批上限），本地记 `text_too_large` 并跳过；这类文件建议回 NAS 端处理。
 - `.docx/.xlsx/.pptx` 不支持；加密 PDF 会进 `failed.jsonl`。
 - 引擎结果字段形状在 paddlex 3.x 各小版本间有差异，`extract_rec_texts()` 做容错提取（`rec_texts` 可能出现在 `res` / `prunedResult` / `.json` 下）。
+- 本工具回导的 `engine` 写 `paddle5`，NAS 侧车写 `paddleocr-sidecar`——这是**有意差异**，配 `source`（`win` / `nas`）可一眼区分某条结果是 PC 导的还是 NAS 扫的。副作用：只按 `engine='paddleocr-sidecar'` 过滤的统计会漏掉 PC 导入的结果，统计口径请改用 `source` 或不过滤 `engine`（`params_key` 本身也以 `paddle5|` 开头）。
