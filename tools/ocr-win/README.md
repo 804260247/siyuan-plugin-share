@@ -121,6 +121,13 @@ python -m ocrwin run --input "D:\扫描" --server http://192.168.1.111:3003 --to
 .\build.ps1 -OneFile   # 单文件，启动慢一点
 ```
 
+零基础推荐直接**双击 `build.cmd`**（cmd 批处理，等价于 `.\build.ps1`，不受 PowerShell 执行策略/编码/行尾影响）。
+
+> 这两个脚本必须以 **CRLF 行尾**入库（`.gitattributes` 已用 `-text` 钉住，任何平台 checkout 出来都是 CRLF），
+> `build.ps1` 另带 **UTF-8 BOM**。原因：Windows PowerShell 5.1 解析纯 LF 文件时，行尾反引号续行不可靠
+> （会报「一元运算符 -- 后面缺少表达式」）；无 BOM 时按系统代码页（中文 Windows 为 GBK）解码，中文注释全乱。
+> 另注意：原生 exe 的非 0 退出码不会触发 `$ErrorActionPreference`，脚本内每处调用都显式检查 `$LASTEXITCODE`，失败即中断。
+
 产物在 `dist\ocr-win\`（或 `dist\ocr-win.exe`）。打包会带上 paddlex 与 paddle 的模型加载代码，
 体积较大（约 1.5–2 GB），这是正常的。
 
