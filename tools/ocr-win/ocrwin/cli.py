@@ -26,6 +26,7 @@ from . import __version__
 from . import engine as engine_mod
 from . import httpapi
 from . import params as params_mod
+from . import pydeps
 from . import render, runner, scan
 from .httpapi import ApiClient, ApiError
 from .state import StateStore
@@ -40,6 +41,14 @@ EXIT_INTERRUPTED = 130
 
 STATE_DIR_NAME = ".ocr-win-state"
 MAX_WORKERS = 8
+
+#: 子命令别名（带横杠的写法是第一遍就会被人敲的，容忍掉）
+ALIASES = {
+    "--self-check": "self-check",
+    "-self-check": "self-check",
+    "--self_check": "self-check",
+    "selfcheck": "self-check",
+}
 
 
 def log(msg: str):
@@ -79,6 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--server", default="", help="可选：顺带验证参数接口可达")
     s.add_argument("--token", default="", help="可选：API Key")
     s.add_argument("--params-url", default=None, help="可选：覆盖参数接口地址")
+    s.add_argument("--no-pipeline", action="store_true",
+                   help="跳过 OCR 流水线初始化（只查依赖，不加载模型/不下载模型）")
     return p
 
 
@@ -320,10 +331,60 @@ def cmd_self_check(a) -> int:
     if not (has_mupdf and has_pil and has_pdx):
         log("自检结论：关键依赖缺失，先按 README 装依赖再跑")
         rc = EXIT_DEPENDENCY
-    else:
-        log("自检结论：关键依赖齐全")
 
-    if a.server:
+    # --- OCR extras 必须真查（0031）：旧版只看 paddlex 版本号字符串，
+    #     打包漏掉 extras 时照样报「关键依赖齐全」，拦不住真跑失败。
+    # 打包产物（PyInstaller --onedir）里没有 .dist-info，读不到 requires()；
+    # 此时不做清单核对，直接靠下面的真初始化兜底 —— 那才是权威判定。
+    frozen = bool(getattr(sys, "frozen", False))
+    ocr_pairs = []
+    if has_pdx:
+        if frozen:
+            print("  %s: 打包产物内无 dist-info，跳过清单核对（下一步真初始化流水线）"
+                  % _pad("OCR 依赖"))
+        else:
+            names = pydeps.requirement_names()
+            ocr_pairs = pydeps.module_pairs()
+            if names:
+                print("  %s: %d 个（从 paddlex[ocr] 元数据派生）"
+                      % (_pad("OCR 依赖"), len(names)))
+            else:
+                print("  %s: 读不到 paddlex[ocr] 的 extras（元数据缺失）"
+                      % _pad("OCR 依赖"))
+        miss = pydeps.missing_modules(ocr_pairs)
+        if miss:
+            for dist, mod in miss:
+                print("  %s: import %s 失败（发行包 %s）" % (_pad("缺失"), mod, dist))
+            log("自检结论：OCR 依赖不完整，缺 %s"
+                % ", ".join(sorted({d for d, _ in miss})))
+            rc = EXIT_DEPENDENCY
+
+    # --- OCR 流水线真初始化（默认执行；--no-pipeline 只跳过这一步）。
+    #     依赖缺失在 paddlex 3.x 是在 create_pipeline 里才抛的（懒导入），
+    #     所以这里必须真构造一次，不能只查版本号。
+    if rc == EXIT_OK and has_pdx:
+        if getattr(a, "no_pipeline", False):
+            print("  %s: 已跳过（--no-pipeline）" % _pad("OCR 流水线"))
+        else:
+            log("初始化 OCR 流水线（pipeline=OCR device=cpu，首次会下载模型，数百 MB）…")
+            try:
+                engine_mod.PaddleEngine(device="cpu").ensure_ready()
+            except Exception as exc:            # 依赖缺失 / 模型损坏都落这里
+                print("  %s: %s" % (_pad("OCR 流水线"), exc))
+                miss = pydeps.missing_modules(ocr_pairs)
+                if miss:
+                    print("  %s: %s" % (_pad("缺失依赖"), ", ".join(
+                        sorted({"%s（%s）" % (mod, dist) for dist, mod in miss}))))
+                log("自检结论：OCR 流水线初始化失败"
+                    "（打包漏 extras 就是这样，见 README「打包 exe」）")
+                rc = EXIT_DEPENDENCY
+            else:
+                print("  %s: 初始化成功" % _pad("OCR 流水线"))
+
+    if rc == EXIT_OK:
+        log("自检结论：关键依赖齐全（含 OCR extras 与流水线初始化）")
+
+    if a.server and rc == EXIT_OK:
         client = ApiClient(a.server, a.token, params_url=a.params_url)
         log("验证参数接口：%s" % client.params_url)
         try:
@@ -335,6 +396,8 @@ def cmd_self_check(a) -> int:
         print("  %s: dpi=%d max_side=%d profile=%s"
               % (_pad("渲染参数"), p["dpi"], p["max_side"], p.get("profile", "")))
         log("自检结论：参数接口正常，可以开始扫描")
+    elif getattr(a, "server", ""):
+        log("依赖/引擎未通过，跳过参数接口验证")
     else:
         print("  %s: 未提供（加 --server/--token 可顺带验证接口）" % _pad("params 接口"))
     return rc
@@ -345,6 +408,8 @@ def cmd_self_check(a) -> int:
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     known = ("run", "self-check")
+    if argv and argv[0] in ALIASES:
+        argv[0] = ALIASES[argv[0]]      # 子命令别名，别让人第二次踩 --self-check
     if not argv:
         build_parser().print_help()
         return EXIT_STARTUP

@@ -56,6 +56,16 @@ python -m ocrwin self-check --server http://192.168.1.111:3003 --token <你的 K
 [ocr-win] 自检结论：参数接口正常，可以开始扫描
 ```
 
+自检**会真初始化一次 OCR 流水线**（`create_pipeline(pipeline="OCR")`），不是只比版本号：
+`paddlex[ocr]` 的 extras（`cv2` / `sklearn` / `tokenizers` …）是懒导入的，只查版本号会漏报、
+真跑时才炸（见下面「打包 exe」）。所以：
+
+- 首次自检会下载 PP-OCRv5 模型（数百 MB）到 `%USERPROFILE%\.paddlex`，之后很快；
+- 只查依赖、不加载模型：加 `--no-pipeline`；
+- 依赖不全时退出码 `4`，并逐条打印缺哪个包（如 `import cv2 失败（发行包 opencv-contrib-python）`）；
+- 子命令也容忍写成 `--self-check`（带横杠），不会掉进 `run` 分支去要 `--input`。
+- 打包产物（`dist\ocr-win\`）里没有 `.dist-info`，读不到包元数据，因此清单核对会自动跳过、直接以**流水线初始化结果**为准——这一步才是打包漏依赖的权威判定。
+
 ## 第二步：先 dry-run，再真跑
 
 ```powershell
@@ -131,6 +141,22 @@ python -m ocrwin run --input "D:\扫描" --server http://192.168.1.111:3003 --to
 产物在 `dist\ocr-win\`（或 `dist\ocr-win.exe`）。打包会带上 paddlex 与 paddle 的模型加载代码，
 体积较大（约 1.5–2 GB），这是正常的。
 
+### 依赖是「派生」的，不是手抄的
+
+两个脚本自己不再拼 PyInstaller 参数，统一调 `build_exe.py`（**同一份参数**，不会再出现两边不一致），
+`build_exe.py` 从 `paddlex` 的包元数据里筛 `extra == "ocr"` **现算**依赖，并给每个包生成 `--collect-all`：
+
+```powershell
+.\.venv\Scripts\python.exe build_exe.py --print-only   # 只打印派生结果与完整命令行，不打包
+```
+
+为什么必须派生：`--collect-submodules paddlex` 只收 paddlex 自己的 `.py`，而 OCR pipeline 是懒导入、
+静态分析追不到它依赖的第三方包 —— 打出来的 exe 一初始化就报
+`OCR requires additional dependencies`。上游给 `ocr` extra 加包时**无需改任何脚本**。
+
+打包末尾还有**冒烟断言**：两个脚本都会跑一次 `dist\ocr-win\ocr-win.exe self-check`（默认带流水线初始化），
+非 0 即判定打包失败 —— 「打包完成但产物跑不起来」不会再悄悄通过。
+
 ## 与 NAS 直扫的一致性怎么验（任务书 4.4 用例 6）
 
 口径是「**同一份文件，PC 导入 vs NAS 直扫，字符数差异 < 5%**，关键字段（编号/金额/日期）抽样人工无实质错误」，
@@ -166,4 +192,5 @@ paste /tmp/nas-before.tsv /tmp/nas-after.tsv | awk -F'\t' '
 - 单行结果超过 4 MB 无法回导（服务端单批上限），本地记 `text_too_large` 并跳过；这类文件建议回 NAS 端处理。
 - `.docx/.xlsx/.pptx` 不支持；加密 PDF 会进 `failed.jsonl`。
 - 引擎结果字段形状在 paddlex 3.x 各小版本间有差异，`extract_rec_texts()` 做容错提取（`rec_texts` 可能出现在 `res` / `prunedResult` / `.json` 下）。
+- 打包末尾的冒烟自检默认真初始化流水线：**离线机器第一次打包会因模型下载失败而判定失败**。先在联网环境跑一次 `self-check` 预热 `%USERPROFILE%\.paddlex` 缓存即可；只想跳过着一步验证依赖时手动执行 `dist\ocr-win\ocr-win.exe self-check --no-pipeline`。
 - 本工具回导的 `engine` 写 `paddle5`，NAS 侧车写 `paddleocr-sidecar`——这是**有意差异**，配 `source`（`win` / `nas`）可一眼区分某条结果是 PC 导的还是 NAS 扫的。副作用：只按 `engine='paddleocr-sidecar'` 过滤的统计会漏掉 PC 导入的结果，统计口径请改用 `source` 或不过滤 `engine`（`params_key` 本身也以 `paddle5|` 开头）。

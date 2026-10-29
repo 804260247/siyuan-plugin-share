@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ocrwin import cli, engine as engine_mod, params as params_mod, upload as upload_mod  # noqa: E402
+from ocrwin import pydeps  # noqa: E402
 from ocrwin.httpapi import ApiClient, UrllibTransport  # noqa: E402
 from ocrwin.state import StateStore  # noqa: E402
 
@@ -393,6 +394,195 @@ class TestSelfCheck(BaseCase):
         self.assertIn("PyMuPDF", out)
         self.assertIn("paddlex", out)
         self.assertIn(rc, (cli.EXIT_OK, cli.EXIT_DEPENDENCY), out)
+
+
+# --------------------------------------------------------------------------- 0031 打包依赖派生
+
+def _fake_dist(root: Path, name: str, version: str, top_level: str, requires=()):
+    """造一个 dist-info 目录（顶到 sys.path 前面），模拟已安装的发行包。"""
+    d = root / ("%s-%s.dist-info" % (name.replace("-", "_"), version))
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: %s\nVersion: %s\n" % (name, version), encoding="utf-8")
+    (d / "top_level.txt").write_text(top_level + "\n", encoding="utf-8")
+    if requires:
+        (d / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: %s\nVersion: %s\n%s\n" % (
+                name, version,
+                "".join("Requires-Dist: %s\n" % r for r in requires), ),
+            encoding="utf-8")
+    return d
+
+
+class TestPydeps(unittest.TestCase):
+    """OCR extras 必须从 paddlex 元数据派生，不许硬编码。"""
+
+    REQUIRES = [
+        'einops; extra == "ocr"',
+        "ftfy; extra == \"ocr\"",
+        'opencv-contrib-python==4.10.0.84; extra == "ocr"',
+        'pypdfium2>=4; extra == "ocr"',
+        'Jinja2; extra == "ocr"',
+        'tokenizers>=0.19; extra == "ocr"',
+        'lxml; extra == "ocr" and platform_system == "Windows"',
+        'paddlepaddle==3.0.0',
+        'pyinstaller>=6,<7; extra == "dev"',
+        'PyYAML; extra == "serving"',
+    ]
+
+    def test_requirement_names_filters_extra(self):
+        names = pydeps.requirement_names(requires=self.REQUIRES)
+        self.assertEqual(names, ["einops", "ftfy", "opencv-contrib-python",
+                                 "pypdfium2", "jinja2", "tokenizers", "lxml"])
+
+    def test_requirement_names_absent_dist_returns_empty(self):
+        self.assertEqual(pydeps.requirement_names("no-such-dist-xyz", requires=None), [])
+
+    def test_top_level_mapping(self):
+        """包名≠模块名（opencv-contrib-python→cv2、scikit-learn→sklearn）走 top_level.txt。"""
+        tmp = Path(tempfile.mkdtemp(prefix="ocrwin-deps-"))
+        try:
+            _fake_dist(tmp, "opencv-contrib-python", "4.10.0.84", "cv2")
+            _fake_dist(tmp, "scikit-learn", "1.5.2", "sklearn")
+            _fake_dist(tmp, "Jinja2", "3.1.4", "jinja2")
+            sys.path.insert(0, str(tmp))
+            try:
+                self.assertEqual(pydeps.top_level_modules("opencv-contrib-python"), ["cv2"])
+                self.assertEqual(pydeps.top_level_modules("scikit-learn"), ["sklearn"])
+                self.assertEqual(pydeps.top_level_modules("jinja2"), ["jinja2"])
+                self.assertEqual(pydeps.top_level_modules("no-such-dist-xyz"), [])
+                pairs = pydeps.module_pairs(requires=self.REQUIRES)
+                # 未安装的发行包跳过，已安装的按 dist→module 映射
+                self.assertEqual([p for p in pairs if p[0] == "opencv-contrib-python"],
+                                 [("opencv-contrib-python", "cv2")])
+                args = pydeps.pyinstaller_args(skip=("paddlex", "paddle"),
+                                               requires=self.REQUIRES)
+                self.assertIn("--collect-all", args)
+                self.assertIn("cv2", args)
+                self.assertNotIn("paddlex", args)   # skip 生效
+            finally:
+                sys.path.remove(str(tmp))
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def test_missing_modules_reports_names(self):
+        pairs = [("opencv-contrib-python", "definitely_not_a_module_xyz"), ("jinja2", "sys")]
+        miss = pydeps.missing_modules(pairs)
+        self.assertEqual(miss, [("opencv-contrib-python", "definitely_not_a_module_xyz")])
+
+    def test_summary_mentions_dist_and_count(self):
+        self.assertIn("paddlex[ocr]", pydeps.summary("paddlex", "ocr"))
+
+
+class TestBuildExe(unittest.TestCase):
+    """build_exe.py 是 build.ps1 / build.cmd 的唯一参数来源。"""
+
+    def test_argv_contains_derived_collect_all(self):
+        import build_exe
+        orig = pydeps.module_pairs
+        pydeps.module_pairs = lambda *a, **k: [("opencv-contrib-python", "cv2"),
+                                               ("scikit-learn", "sklearn")]
+        try:
+            onedir = build_exe.pyinstaller_argv(False)
+            onefile = build_exe.pyinstaller_argv(True)
+        finally:
+            pydeps.module_pairs = orig
+        self.assertIn("--onedir", onedir)
+        self.assertIn("--onefile", onefile)
+        for arg in ("--collect-all", "cv2", "sklearn", "run_ocr_win.py"):
+            self.assertIn(arg, onedir)
+        self.assertEqual(onedir.count("cv2"), 1)          # 同一个模块只收一次
+        self.assertLessEqual(onedir.count("--collect-all"), 2)  # 基础模块不重复收集
+
+    def test_print_only_runs_offline(self):
+        import build_exe
+        rc = build_exe.main(["--print-only"])
+        # 沙箱里没装 paddlex[ocr] → 明确报退出码 4，而不是假装成功
+        self.assertEqual(rc, build_exe.EXIT_DEPENDENCY)
+
+
+class TestSelfCheckPipeline(unittest.TestCase):
+    """self-check 必须真初始化 pipeline（0031 的第二个缺陷）。"""
+
+    def setUp(self):
+        self.calls = []
+        self._orig_ver = cli._ver
+        self._orig_req = pydeps.requirement_names
+        self._orig_miss = pydeps.missing_modules
+        self._orig_pipe = engine_mod.PaddleEngine
+
+        cli._ver = lambda m: "9.9.9" if m in ("pymupdf", "PIL", "paddlex", "paddle") else None
+        pydeps.requirement_names = lambda *a, **k: ["einops", "opencv-contrib-python"]
+        pydeps.missing_modules = lambda *a, **k: []
+
+        outer = self
+
+        class FakePipeline:
+            def __init__(self, device="cpu"):
+                outer.calls.append(device)
+
+            def ensure_ready(self):
+                outer.calls.append("ensure_ready")
+
+        engine_mod.PaddleEngine = FakePipeline
+
+    def tearDown(self):
+        cli._ver = self._orig_ver
+        pydeps.requirement_names = self._orig_req
+        pydeps.missing_modules = self._orig_miss
+        engine_mod.PaddleEngine = self._orig_pipe
+
+    def test_pipeline_initialized_by_default(self):
+        rc, out = run_cli(["self-check"])
+        self.assertEqual(rc, cli.EXIT_OK, out)
+        self.assertIn("ensure_ready", self.calls)
+        self.assertIn("初始化成功", out)
+
+    def test_no_pipeline_skips_init(self):
+        rc, out = run_cli(["self-check", "--no-pipeline"])
+        self.assertEqual(rc, cli.EXIT_OK, out)
+        self.assertNotIn("ensure_ready", self.calls)
+        self.assertIn("已跳过", out)
+
+    def test_pipeline_failure_exits_4_with_package_names(self):
+        class Boom:
+            def __init__(self, device="cpu"):
+                pass
+
+            def ensure_ready(self):
+                raise RuntimeError("OCR requires additional dependencies, please install")
+
+        engine_mod.PaddleEngine = Boom
+        pydeps.missing_modules = lambda *a, **k: [("opencv-contrib-python", "cv2")]
+        rc, out = run_cli(["self-check"])
+        self.assertEqual(rc, cli.EXIT_DEPENDENCY, out)
+        self.assertIn("cv2", out)
+        self.assertIn("opencv-contrib-python", out)
+
+    def test_dash_self_check_alias(self):
+        """第一遍就被敲成 `--self-check`，必须容忍而不是报 run 缺 --input。"""
+        rc, out = run_cli(["--self-check", "--no-pipeline"])
+        self.assertEqual(rc, cli.EXIT_OK, out)
+        self.assertIn("self-check 版本", out)
+
+    def test_frozen_bundle_skips_metadata_check(self):
+        """打包产物里没有 dist-info：跳过清单核对，但流水线必须照样真初始化。"""
+        sys.frozen = True
+        try:
+            rc, out = run_cli(["self-check"])
+        finally:
+            del sys.frozen
+        self.assertEqual(rc, cli.EXIT_OK, out)
+        self.assertIn("dist-info", out)
+        self.assertIn("ensure_ready", self.calls)
+
+    def test_missing_extra_reports_before_pipeline(self):
+        pydeps.missing_modules = lambda *a, **k: [("scikit-learn", "sklearn")]
+        rc, out = run_cli(["self-check"])
+        self.assertEqual(rc, cli.EXIT_DEPENDENCY, out)
+        self.assertIn("scikit-learn", out)
+        self.assertNotIn("ensure_ready", self.calls)
+
 
 
 if __name__ == "__main__":

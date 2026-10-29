@@ -57,32 +57,26 @@ Write-Host "安装/更新打包依赖（首次约 1-2 GB，耗时较长，请勿
 Invoke-Native -Exe $venvPython -Arguments @("-m", "pip", "install", "-U", "pip")
 Invoke-Native -Exe $venvPython -Arguments @("-m", "pip", "install", "-r", "requirements.txt", "-r", "requirements-build.txt")
 
-$mode = if ($OneFile) { "--onefile" } else { "--onedir" }
+# PyInstaller 参数与 OCR 依赖收集都在 build_exe.py 里生成（与 build.cmd 共用同一份），
+# 这里只负责建 venv / 装依赖 / 调用它 / 冒烟自检 —— 参数只有一处，两边不可能再不一致。
+# 依赖清单从 paddlex 的包元数据派生（ocrwin/pydeps.py），不硬编码包名。
+$buildArgs = @("build_exe.py")
+if ($OneFile) { $buildArgs += "--onefile" }
 
-# paddlex / paddle 的模型加载走动态导入，需要显式收集；
-# 参数写成数组逐个传，避免任何续行符（这是 0029 修掉解析错误的根本做法）。
-$pyiArgs = @(
-    "-m", "PyInstaller",
-    $mode,
-    "--name", "ocr-win",
-    "--clean", "--noconfirm",
-    "--collect-submodules", "paddlex",
-    "--collect-data", "paddlex",
-    "--collect-data", "paddlex.deploy",
-    "--collect-submodules", "paddle",
-    "--hidden-import", "onnxruntime",
-    "--hidden-import", "PIL.Image",
-    "run_ocr_win.py"
-)
-
-Write-Host "打包中（PyInstaller）..."
-Invoke-Native -Exe $venvPython -Arguments $pyiArgs
+Write-Host "打包中（PyInstaller，产物约 1.5-2 GB，请勿关闭窗口）..."
+Invoke-Native -Exe $venvPython -Arguments $buildArgs
 
 $exe = if ($OneFile) { Join-Path $here "dist\ocr-win.exe" } else { Join-Path $here "dist\ocr-win\ocr-win.exe" }
 if (-not (Test-Path $exe)) {
     throw "打包命令返回成功但产物不存在：$exe"
 }
 
+# 冒烟断言（0031）：产物必须能真正初始化 OCR 流水线，否则本节以失败收场，
+# 不许再出现「打包完成但产物跑不起来」。
 Write-Host ""
-Write-Host "打包完成：$exe"
-Write-Host ('验证："{0}" self-check' -f $exe)
+Write-Host "冒烟自检：$exe self-check（会真初始化 OCR 流水线）"
+Invoke-Native -Exe $exe -Arguments @("self-check")
+
+Write-Host ""
+Write-Host "打包完成，且冒烟自检通过：$exe"
+Write-Host ('下一步："{0}" self-check --server <站点地址> --token <API Key>' -f $exe)

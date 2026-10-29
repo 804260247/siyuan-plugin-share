@@ -1,6 +1,8 @@
 @echo off
 rem Build the Windows exe (PyInstaller). Double-click this file.
 rem ASCII-only on purpose: cmd.exe codepage varies, keep messages readable everywhere.
+rem PyInstaller arguments live in build_exe.py (shared with build.ps1), and the OCR
+rem dependency list is derived from paddlex metadata - never hardcode it here.
 setlocal
 cd /d "%~dp0"
 
@@ -11,7 +13,7 @@ set "PY="
 where py >nul 2>nul
 if not errorlevel 1 set "PY=py -3"
 if not defined PY set "PY=python"
-echo [1/4] Creating virtual env .venv ...
+echo [1/5] Creating virtual env .venv ...
 %PY% -m venv .venv
 if errorlevel 1 goto failed
 
@@ -22,23 +24,36 @@ if not exist "%PYEXE%" (
     goto failed
 )
 
-echo [2/4] Upgrading pip ...
+echo [2/5] Upgrading pip ...
 "%PYEXE%" -m pip install -U pip
 if errorlevel 1 goto failed
 
-echo [3/4] Installing dependencies ^(first run: 1-2 GB, be patient^) ...
+echo [3/5] Installing dependencies ^(first run: 1-2 GB, be patient^) ...
 "%PYEXE%" -m pip install -r requirements.txt -r requirements-build.txt
 if errorlevel 1 goto failed
 
-echo [4/4] Packaging with PyInstaller ...
-"%PYEXE%" -m PyInstaller --onedir --name ocr-win --clean --noconfirm --collect-submodules paddlex --collect-data paddlex --collect-data paddlex.deploy --collect-submodules paddle --hidden-import onnxruntime --hidden-import PIL.Image run_ocr_win.py
+echo [4/5] Packaging with PyInstaller ^(OCR deps derived from paddlex metadata^) ...
+"%PYEXE%" build_exe.py
 if errorlevel 1 goto failed
+
+echo [5/5] Smoke test: dist\ocr-win\ocr-win.exe self-check ...
+"dist\ocr-win\ocr-win.exe" self-check
+if errorlevel 1 goto smokefailed
 
 echo.
 echo Done: %CD%\dist\ocr-win\ocr-win.exe
-echo Verify: dist\ocr-win\ocr-win.exe self-check
+echo Next: generate an API Key at /dashboard, then run:
+echo       dist\ocr-win\ocr-win.exe self-check --server ^<site-url^> --token ^<key^>
 pause
 exit /b 0
+
+:smokefailed
+echo.
+echo [FAILED] The packaged exe failed self-check - it cannot initialize the OCR pipeline.
+echo          PyInstaller missed runtime dependencies. Do NOT ship dist\ocr-win.
+echo          Scroll up for the missing package names, screenshot the whole output.
+pause
+exit /b 1
 
 :failed
 echo.
