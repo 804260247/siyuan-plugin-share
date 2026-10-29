@@ -61,15 +61,18 @@ if ($exampleCentralStatsUrl !== null) {
     $config['central_stats_url'] = $exampleCentralStatsUrl;
 }
 
-$sessionDays = (int)($config['session_lifetime_days'] ?? 30);
-if ($sessionDays <= 0) {
-    $sessionDays = 30;
+if (PHP_SAPI !== 'cli') {
+    $sessionDays = (int)($config['session_lifetime_days'] ?? 30);
+    if ($sessionDays <= 0) {
+        $sessionDays = 30;
+    }
+    $sessionLifetime = $sessionDays * 86400;
+    ini_set('session.gc_maxlifetime', (string)$sessionLifetime);
+    ini_set('session.cookie_lifetime', (string)$sessionLifetime);
+    session_set_cookie_params($sessionLifetime, '/', '', false, true);
+    session_start();
 }
-$sessionLifetime = $sessionDays * 86400;
-ini_set('session.gc_maxlifetime', (string)$sessionLifetime);
-ini_set('session.cookie_lifetime', (string)$sessionLifetime);
-session_set_cookie_params($sessionLifetime, '/', '', false, true);
-session_start();
+
 date_default_timezone_set('UTC');
 
 if (function_exists('date_default_timezone_set')) {
@@ -207,6 +210,9 @@ function db(): PDO {
     $pdo = new PDO($dsn);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $pdo->exec('PRAGMA foreign_keys = ON;');
+    $pdo->exec('PRAGMA journal_mode = WAL;');
+    $pdo->exec('PRAGMA busy_timeout = 30000;');
+    $pdo->exec('PRAGMA synchronous = NORMAL;');
     migrate($pdo);
     return $pdo;
 }
@@ -495,6 +501,321 @@ function migrate(PDO $pdo): void {
     ensure_column($pdo, 'share_assets', 'size_bytes', 'INTEGER NOT NULL DEFAULT 0');
     ensure_column($pdo, 'share_assets', 'asset_hash', 'TEXT');
 
+    // Netdisk (Cloudreve) integration: per-share settings
+    ensure_column($pdo, 'shares', 'netdisk_enabled', 'INTEGER NOT NULL DEFAULT 0');
+    ensure_column($pdo, 'shares', 'netdisk_root', 'TEXT');
+    ensure_column($pdo, 'shares', 'netdisk_permission', 'TEXT NOT NULL DEFAULT "view"');
+    ensure_column($pdo, 'shares', 'netdisk_config_id', 'INTEGER NOT NULL DEFAULT 0');
+
+    // Netdisk: multiple Cloudreve connection configs
+    $pdo->exec('CREATE TABLE IF NOT EXISTS cloudreve_configs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        email TEXT NOT NULL,
+        password TEXT NOT NULL,
+        viewer_id TEXT NOT NULL DEFAULT "",
+        default_root TEXT NOT NULL DEFAULT "cloudreve://my",
+        office_engine TEXT NOT NULL DEFAULT "auto",
+        office_ext_map TEXT NOT NULL DEFAULT "{}",
+        office_collabora_url TEXT NOT NULL DEFAULT "",
+        office_onlyoffice_url TEXT NOT NULL DEFAULT "",
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );');
+    ensure_column($pdo, 'cloudreve_configs', 'office_engine', 'TEXT NOT NULL DEFAULT "auto"');
+    ensure_column($pdo, 'cloudreve_configs', 'office_ext_map', 'TEXT NOT NULL DEFAULT "{}"');
+    ensure_column($pdo, 'cloudreve_configs', 'office_collabora_url', 'TEXT NOT NULL DEFAULT ""');
+    ensure_column($pdo, 'cloudreve_configs', 'office_onlyoffice_url', 'TEXT NOT NULL DEFAULT ""');
+    // 连接级全文索引配置（空字符串 = 未配置，走全局默认；与分享绑定该连接时生效）
+    ensure_column($pdo, 'cloudreve_configs', 'index_ocr_enabled', 'TEXT NOT NULL DEFAULT ""');
+    ensure_column($pdo, 'cloudreve_configs', 'index_ocr_concurrency', 'TEXT NOT NULL DEFAULT ""');
+    ensure_column($pdo, 'cloudreve_configs', 'index_ocr_dpi_start', 'TEXT NOT NULL DEFAULT ""');
+    ensure_column($pdo, 'cloudreve_configs', 'index_ocr_dpi_max', 'TEXT NOT NULL DEFAULT ""');
+    ensure_column($pdo, 'cloudreve_configs', 'index_ocr_quality_threshold', 'TEXT NOT NULL DEFAULT ""');
+    ensure_column($pdo, 'cloudreve_configs', 'index_ocr_max_mb', 'TEXT NOT NULL DEFAULT ""');
+    ensure_column($pdo, 'cloudreve_configs', 'index_ocr_low_max_mb', 'TEXT NOT NULL DEFAULT ""');
+    ensure_column($pdo, 'cloudreve_configs', 'index_refresh_ttl', 'TEXT NOT NULL DEFAULT ""');
+    ensure_column($pdo, 'cloudreve_configs', 'index_skip_exts', 'TEXT NOT NULL DEFAULT ""');
+
+    // WOPI 应用（文件预览）全局表：与分享绑定无关
+    $pdo->exec('CREATE TABLE IF NOT EXISTS office_apps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        engine TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );');
+    ensure_column($pdo, 'office_apps', 'url_template', 'TEXT NOT NULL DEFAULT ""');
+
+    // 下载规则：某个分享允许下载的文件/文件夹（is_folder=1 表示包含其下所有文件）
+    $pdo->exec('CREATE TABLE IF NOT EXISTS share_download_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        share_id INTEGER NOT NULL,
+        uri TEXT NOT NULL,
+        is_folder INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    );');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_share_dl_rules_share ON share_download_rules(share_id)');
+
+    // 网盘目录列表 / 搜索结果短期缓存表
+    $pdo->exec('CREATE TABLE IF NOT EXISTS netdisk_cache (
+        cache_key TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        expires INTEGER NOT NULL
+    );');
+
+    // 网盘全文索引表：本地保存文件名/路径/抽取正文，加速检索并摆脱对 Cloudreve FTS 的依赖
+    $pdo->exec('CREATE TABLE IF NOT EXISTS netdisk_index (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        share_id INTEGER NOT NULL,
+        uri TEXT NOT NULL,
+        name TEXT NOT NULL,
+        is_folder INTEGER NOT NULL DEFAULT 0,
+        ext TEXT NOT NULL DEFAULT "",
+        size INTEGER NOT NULL DEFAULT 0,
+        parent_path TEXT NOT NULL DEFAULT "",
+        text TEXT NOT NULL DEFAULT "",
+        indexed_at INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT "",
+        UNIQUE(share_id, uri)
+    );');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_netdisk_index_share ON netdisk_index(share_id)');
+    // 旧库补齐 updated_at（Cloudreve 文件更新时间，用于增量重建跳过未变化文件）
+    $ndIndexCols = $pdo->query('PRAGMA table_info(netdisk_index)')->fetchAll(PDO::FETCH_ASSOC);
+    if (!in_array('updated_at', array_column($ndIndexCols, 'name'), true)) {
+        $pdo->exec('ALTER TABLE netdisk_index ADD COLUMN updated_at TEXT NOT NULL DEFAULT ""');
+    }
+
+    $pdo->exec('CREATE TABLE IF NOT EXISTS netdisk_index_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        share_id INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT "pending",
+        files INTEGER NOT NULL DEFAULT 0,
+        folders INTEGER NOT NULL DEFAULT 0,
+        texts INTEGER NOT NULL DEFAULT 0,
+        errors INTEGER NOT NULL DEFAULT 0,
+        ocr_skipped INTEGER NOT NULL DEFAULT 0,
+        processed_dirs INTEGER NOT NULL DEFAULT 0,
+        total_dirs INTEGER NOT NULL DEFAULT 0,
+        total_files INTEGER NOT NULL DEFAULT 0,
+        current_dir TEXT NOT NULL DEFAULT "",
+        current_uri TEXT NOT NULL DEFAULT "",
+        current_name TEXT NOT NULL DEFAULT "",
+        current_detail TEXT NOT NULL DEFAULT "",
+        ocr_done_count INTEGER NOT NULL DEFAULT 0,
+        ocr_total INTEGER NOT NULL DEFAULT 0,
+        queue_remaining INTEGER NOT NULL DEFAULT 0,
+        ocr_files_total INTEGER NOT NULL DEFAULT 0,
+        ocr_files_done INTEGER NOT NULL DEFAULT 0,
+        heartbeat_at INTEGER NOT NULL DEFAULT 0,
+        notes TEXT NOT NULL DEFAULT "",
+        error TEXT NOT NULL DEFAULT "",
+        attempts INTEGER NOT NULL DEFAULT 0,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL DEFAULT 0,
+        started_at INTEGER NOT NULL DEFAULT 0,
+        finished_at INTEGER NOT NULL DEFAULT 0
+    );');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_nd_jobs_share_status ON netdisk_index_jobs(share_id, status)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_nd_jobs_status_created ON netdisk_index_jobs(status, created_at)');
+
+    // 兼容旧库：为 netdisk_index_jobs 补齐 OCR 统计列
+    $jobCols = $pdo->query('PRAGMA table_info(netdisk_index_jobs)')->fetchAll(PDO::FETCH_ASSOC);
+    $jobColNames = array_column($jobCols, 'name');
+    if (!in_array('ocr_done', $jobColNames, true)) {
+        $pdo->exec('ALTER TABLE netdisk_index_jobs ADD COLUMN ocr_done INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!in_array('ocr_queued', $jobColNames, true)) {
+        $pdo->exec('ALTER TABLE netdisk_index_jobs ADD COLUMN ocr_queued INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!in_array('total_files', $jobColNames, true)) {
+        $pdo->exec('ALTER TABLE netdisk_index_jobs ADD COLUMN total_files INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!in_array('attempts', $jobColNames, true)) {
+        $pdo->exec('ALTER TABLE netdisk_index_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!in_array('cancel_requested', $jobColNames, true)) {
+        $pdo->exec('ALTER TABLE netdisk_index_jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0');
+    }
+    // 细粒度进度字段（当前文件/页/排队/心跳）
+    $extraJobCols = [
+        'current_uri' => 'TEXT NOT NULL DEFAULT ""',
+        'current_name' => 'TEXT NOT NULL DEFAULT ""',
+        'current_detail' => 'TEXT NOT NULL DEFAULT ""',
+        'ocr_done_count' => 'INTEGER NOT NULL DEFAULT 0',
+        'ocr_total' => 'INTEGER NOT NULL DEFAULT 0',
+        'queue_remaining' => 'INTEGER NOT NULL DEFAULT 0',
+        'ocr_files_total' => 'INTEGER NOT NULL DEFAULT 0',
+        'ocr_files_done' => 'INTEGER NOT NULL DEFAULT 0',
+        'heartbeat_at' => 'INTEGER NOT NULL DEFAULT 0',
+        'force_ocr' => 'INTEGER NOT NULL DEFAULT 0',
+        // 0019: worker 崩溃循环保护计数（fatal 退出 +1，成功完成清零；≥2 → job 标 failed 不再自动重拾）
+        'crash_count' => 'INTEGER NOT NULL DEFAULT 0',
+    ];
+    foreach ($extraJobCols as $col => $def) {
+        if (!in_array($col, $jobColNames, true)) {
+            $pdo->exec('ALTER TABLE netdisk_index_jobs ADD COLUMN ' . $col . ' ' . $def);
+        }
+    }
+
+    // 低优先级 OCR 队列：>max_mb 且 ≤low_max_mb 的图片/扫描件，由 worker 空闲时处理
+    $pdo->exec('CREATE TABLE IF NOT EXISTS netdisk_ocr_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        share_id INTEGER NOT NULL,
+        config_id INTEGER NOT NULL DEFAULT 0,
+        uri TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT "",
+        ext TEXT NOT NULL DEFAULT "",
+        size INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT "pending",
+        attempts INTEGER NOT NULL DEFAULT 0,
+        error TEXT NOT NULL DEFAULT "",
+        created_at INTEGER NOT NULL DEFAULT 0,
+        started_at INTEGER NOT NULL DEFAULT 0,
+        finished_at INTEGER NOT NULL DEFAULT 0
+    );');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ocr_queue_status ON netdisk_ocr_queue(status, id)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ocr_queue_share ON netdisk_ocr_queue(share_id)');
+    // 旧库补齐 config_id（按 share 绑定连接回填，未绑定为 0）
+    $ocrQCols = $pdo->query('PRAGMA table_info(netdisk_ocr_queue)')->fetchAll(PDO::FETCH_ASSOC);
+    if (!in_array('config_id', array_column($ocrQCols, 'name'), true)) {
+        $pdo->exec('ALTER TABLE netdisk_ocr_queue ADD COLUMN config_id INTEGER NOT NULL DEFAULT 0');
+        $pdo->exec('UPDATE netdisk_ocr_queue SET config_id = (SELECT netdisk_config_id FROM shares WHERE shares.id = netdisk_ocr_queue.share_id) WHERE config_id = 0');
+    }
+
+    // OCR 文件级状态表（增量索引）：记录每个 OCR 候选文件的最近一次识别结果，
+    // 重建时据此跳过已达标文件（status=done 且 quality>=0.6 且 chars>=20 且云端未更新），
+    // 失败/无效文件 attempts>=3 后不再重试；强制重跑（force_ocr=1）忽略全部跳过判定。
+    $pdo->exec('CREATE TABLE IF NOT EXISTS netdisk_ocr_files (
+        share_id INTEGER NOT NULL,
+        uri TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT "",
+        size INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT "pending",
+        quality REAL NOT NULL DEFAULT 0,
+        chars INTEGER NOT NULL DEFAULT 0,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT "",
+        dpi INTEGER NOT NULL DEFAULT 0,
+        pages_total INTEGER NOT NULL DEFAULT 0,
+        pages_done INTEGER NOT NULL DEFAULT 0,
+        engine TEXT NOT NULL DEFAULT "",
+        elapsed_ms INTEGER NOT NULL DEFAULT 0,
+        pages_per_min REAL NOT NULL DEFAULT 0,
+        first_at INTEGER NOT NULL DEFAULT 0,
+        finished_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (share_id, uri)
+    );');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ocr_files_status ON netdisk_ocr_files(share_id, status)');
+    // 0018: 旧库补列（CREATE IF NOT EXISTS 不给已存在表加列）
+    $ocrFCols = array_column($pdo->query('PRAGMA table_info(netdisk_ocr_files)')->fetchAll(PDO::FETCH_ASSOC), 'name');
+    if (!in_array('elapsed_ms', $ocrFCols, true)) {
+        $pdo->exec('ALTER TABLE netdisk_ocr_files ADD COLUMN elapsed_ms INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!in_array('pages_per_min', $ocrFCols, true)) {
+        $pdo->exec('ALTER TABLE netdisk_ocr_files ADD COLUMN pages_per_min REAL NOT NULL DEFAULT 0');
+    }
+
+    // 0024: OCR 结果内容寻址表——识别正文按 (content_hash, params_key) 绑定文件内容而非路径。
+    // 改名/移动/重命名父目录后内容哈希不变 → 直接复用旧正文，不再重新 OCR；
+    // params_key 变化（DPI/max_side/profile/引擎换代）→ 视为未命中重扫，旧行保留（改回可复用）。
+    // PC 端（tools/ocr-win）扫描结果经 POST /admin/netdisk/ocr/import 写入本表（source='win'），
+    // NAS 遍历到同哈希文件时命中复用（source='nas' 为 NAS 直扫）。
+    $pdo->exec('CREATE TABLE IF NOT EXISTS netdisk_ocr_results (
+        content_hash TEXT NOT NULL,
+        params_key   TEXT NOT NULL,
+        size         INTEGER NOT NULL DEFAULT 0,
+        pages        INTEGER NOT NULL DEFAULT 0,
+        chars        INTEGER NOT NULL DEFAULT 0,
+        quality      REAL    NOT NULL DEFAULT 0,
+        engine       TEXT    NOT NULL DEFAULT "",
+        text         TEXT    NOT NULL DEFAULT "",
+        source       TEXT    NOT NULL DEFAULT "",
+        created_at   INTEGER NOT NULL DEFAULT 0,
+        last_hit_at  INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(content_hash, params_key)
+    );');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_ocr_results_hit ON netdisk_ocr_results(last_hit_at)');
+    // 0024: 两张路径键老表各补 content_hash 列（走 ensure_column，对已有库无损；不写无条件 ALTER）
+    ensure_column($pdo, 'netdisk_index', 'content_hash', 'TEXT NOT NULL DEFAULT ""');
+    ensure_column($pdo, 'netdisk_ocr_files', 'content_hash', 'TEXT NOT NULL DEFAULT ""');
+
+    // 迁移旧版每配置的 office 引擎地址到全局 office_apps（去重）
+    $officeCount = (int)$pdo->query('SELECT COUNT(*) FROM office_apps')->fetchColumn();
+    if ($officeCount === 0) {
+        $legacyApps = $pdo->query('SELECT name, office_collabora_url, office_onlyoffice_url, enabled FROM cloudreve_configs')->fetchAll(PDO::FETCH_ASSOC);
+        $insOffice = $pdo->prepare('INSERT OR IGNORE INTO office_apps (name, engine, base_url, enabled, created_at, updated_at) VALUES (:n, :e, :b, 1, :t, :t)');
+        foreach ($legacyApps as $la) {
+            $legacyName = trim((string)($la['name'] ?? ''));
+            $cb = rtrim(trim((string)($la['office_collabora_url'] ?? '')), '/');
+            $oo = rtrim(trim((string)($la['office_onlyoffice_url'] ?? '')), '/');
+            if ($cb !== '') {
+                $insOffice->execute([':n' => ($legacyName !== '' ? $legacyName : '默认') . ' Collabora', ':e' => 'collabora', ':b' => $cb, ':t' => now()]);
+            }
+            if ($oo !== '') {
+                $insOffice->execute([':n' => ($legacyName !== '' ? $legacyName : '默认') . ' OnlyOffice', ':e' => 'onlyoffice', ':b' => $oo, ':t' => now()]);
+            }
+        }
+    }
+
+    // 迁移旧版“站点设置”里的单条 Cloudreve 连接为一个默认配置
+    $configCount = (int)$pdo->query('SELECT COUNT(*) FROM cloudreve_configs')->fetchColumn();
+    if ($configCount === 0) {
+        $legacyBase = (string)fetch_setting($pdo, 'cloudreve_base_url');
+        $legacyEmail = (string)fetch_setting($pdo, 'cloudreve_email');
+        $legacyPass = (string)fetch_setting($pdo, 'cloudreve_password');
+        $legacyViewer = (string)fetch_setting($pdo, 'cloudreve_viewer_id');
+        if ($legacyBase !== '' && $legacyEmail !== '') {
+            $legacyPassEnc = netdisk_encrypt_secret($legacyPass);
+            $ins = $pdo->prepare('INSERT INTO cloudreve_configs (name, base_url, email, password, viewer_id, default_root, enabled, created_at, updated_at)
+                VALUES (:n, :b, :e, :p, :v, :r, 1, :t, :t)');
+            $ins->execute([
+                ':n' => '默认配置',
+                ':b' => $legacyBase,
+                ':e' => $legacyEmail,
+                ':p' => $legacyPassEnc !== '' ? $legacyPassEnc : $legacyPass,
+                ':v' => $legacyViewer,
+                ':r' => 'cloudreve://my',
+                ':t' => now(),
+            ]);
+        }
+    }
+
+    // 一次性把历史明文密码加密为 enc:v1（密钥见 storage/.netdisk_secret）
+    if (fetch_setting($pdo, 'cloudreve_pw_enc_v1') !== '1') {
+        $allOk = true;
+        $pwRows = $pdo->query('SELECT id, password FROM cloudreve_configs')->fetchAll(PDO::FETCH_ASSOC);
+        $pwUpd = $pdo->prepare('UPDATE cloudreve_configs SET password = :p WHERE id = :id');
+        foreach ($pwRows as $pwRow) {
+            $pw = (string)($pwRow['password'] ?? '');
+            if ($pw === '' || str_starts_with($pw, 'enc:v1:')) {
+                continue;
+            }
+            $enc = netdisk_encrypt_secret($pw);
+            if ($enc === '') {
+                $allOk = false;
+                continue;
+            }
+            $pwUpd->execute([':p' => $enc, ':id' => (int)$pwRow['id']]);
+        }
+        // 旧版单连接密码已被迁移到 cloudreve_configs，清除设置表中的明文副本
+        $pdo->exec("UPDATE settings SET value = '' WHERE key = 'cloudreve_password'");
+        if ($allOk) {
+            ensure_setting($pdo, 'cloudreve_pw_enc_v1', '1');
+        }
+    }
+
+    // 旧版已开启网盘、但未绑定连接配置的分享，自动绑定到默认连接
+    $defaultCfg = (int)$pdo->query('SELECT id FROM cloudreve_configs WHERE enabled = 1 ORDER BY id ASC LIMIT 1')->fetchColumn();
+    if ($defaultCfg > 0) {
+        $pdo->prepare('UPDATE shares SET netdisk_config_id = :cfg WHERE netdisk_enabled = 1 AND netdisk_config_id = 0')
+            ->execute([':cfg' => $defaultCfg]);
+    }
+
     seed_default_settings($pdo);
     seed_default_admin($pdo);
 }
@@ -565,6 +886,14 @@ function seed_default_settings(PDO $pdo): void {
     ensure_setting($pdo, 'access_stats_default_enabled', '1');
     ensure_setting($pdo, 'access_stats_default_retention_days', '7');
     ensure_setting($pdo, 'site_tips', '');
+    // Cloudreve 网盘连接配置
+    ensure_setting($pdo, 'cloudreve_base_url', '');
+    ensure_setting($pdo, 'cloudreve_email', '');
+    ensure_setting($pdo, 'cloudreve_password', '');
+    ensure_setting($pdo, 'cloudreve_viewer_id', '');
+    ensure_setting($pdo, 'cloudreve_access_token', '');
+    ensure_setting($pdo, 'cloudreve_refresh_token', '');
+    ensure_setting($pdo, 'cloudreve_token_expires', '0');
 }
 
 function seed_default_admin(PDO $pdo): void {
@@ -805,6 +1134,35 @@ function extract_snippet(string $text, string $word, int $radius = 40): string {
     $start = max(0, $pos - $radius);
     $length = min(string_len($plain) - $start, $radius * 2 + string_len($word));
     return string_sub($plain, $start, $length);
+}
+
+function extract_snippet_at(string $text, int $pos, int $radius = 40): string {
+    $len = mb_strlen($text);
+    $start = max(0, $pos - $radius);
+    $end = min($len, $pos + $radius);
+    $seg = mb_substr($text, $start, $end - $start);
+    return ($start > 0 ? '…' : '') . $seg . ($end < $len ? '…' : '');
+}
+
+function extract_snippets_multi(string $text, string $q, int $maxCount = 30): array {
+    $out = [];
+    $searchFrom = 0;
+    $textLen = mb_strlen($text);
+    $qLen = mb_strlen($q);
+    $count = 0;
+    while ($searchFrom < $textLen && $count < $maxCount) {
+        $pos = mb_stripos($text, $q, $searchFrom);
+        if ($pos === false) {
+            break;
+        }
+        $out[] = [
+            'offset' => $pos,
+            'text' => extract_snippet_at($text, $pos),
+        ];
+        $searchFrom = $pos + $qLen;
+        $count++;
+    }
+    return $out;
 }
 
 function parse_expires_at($raw): ?int {
@@ -1343,6 +1701,7 @@ function render_page(string $title, string $content, ?array $user = null, string
                 ['key' => 'admin-reports', 'label' => '举报管理', 'href' => $base . '/admin#reports', 'badge' => $reportBadge],
                 ['key' => 'admin-users', 'label' => '用户管理', 'href' => $base . '/admin#users'],
                 ['key' => 'admin-shares', 'label' => '分享管理', 'href' => $base . '/admin#shares'],
+                ['key' => 'admin-netdisk', 'label' => '网盘配置', 'href' => $base . '/admin#netdisk'],
                 ['key' => 'admin-chunks', 'label' => '分片清理', 'href' => $base . '/admin#chunks'],
                 ['key' => 'admin-scan', 'label' => '违禁词扫描', 'href' => $base . '/admin#scan'],
             ];
@@ -1685,18 +2044,109 @@ function get_user_limit_bytes(array $user): int {
     return default_storage_limit_bytes();
 }
 
+// 单行存在性检查的统一写法：取值后立即关游标，避免连接持读快照期间再发写语句
+// （SQLite WAL 下的"读升级写"死锁：database is locked 立即返回，busy_timeout 不生效）。
+function pdo_fetch_exists(PDOStatement $stmt): bool {
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
+    return $row !== false;
+}
+
 function recalculate_user_storage(int $userId): int {
     $pdo = db();
     $stmt = $pdo->prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM shares WHERE user_id = :uid AND deleted_at IS NULL');
     $stmt->execute([':uid' => $userId]);
     $shareTotal = (int)($stmt->fetch(PDO::FETCH_ASSOC)['total'] ?? 0);
+    // 单行 fetch 后必须关游标：连接保持读快照时再发 UPDATE 属"读升级写"，
+    // 若此刻 nd-worker 等其它写者持锁，SQLite 立即报 database is locked，busy_timeout 不生效。
+    $stmt->closeCursor();
     $logStmt = $pdo->prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM share_access_logs WHERE user_id = :uid');
     $logStmt->execute([':uid' => $userId]);
     $logTotal = (int)($logStmt->fetch(PDO::FETCH_ASSOC)['total'] ?? 0);
+    $logStmt->closeCursor();
     $total = $shareTotal + $logTotal;
-    $update = $pdo->prepare('UPDATE users SET storage_used_bytes = :total WHERE id = :id');
-    $update->execute([':total' => $total, ':id' => $userId]);
+    try {
+        netdisk_exec_retry(function () use ($pdo, $total, $userId) {
+            $update = $pdo->prepare('UPDATE users SET storage_used_bytes = :total WHERE id = :id');
+            $update->execute([':total' => $total, ':id' => $userId]);
+            $update->closeCursor();
+        }, 6);
+    } catch (Throwable $e) {
+        // 重试耗尽（多为页面渲染路径撞后台写锁）：降级返回库中已存值，绝不向上抛，
+        // 存储数显示可能短暂滞后，下一次成功重算即校正。
+        $fallback = $pdo->prepare('SELECT storage_used_bytes FROM users WHERE id = :id');
+        $fallback->execute([':id' => $userId]);
+        $stored = (int)($fallback->fetchColumn() ?: 0);
+        $fallback->closeCursor();
+        return $stored;
+    }
     return $total;
+}
+
+// 批量重算多个用户的已用存储：整批 1 次 UNION ALL 聚合 + 1 次已存值查询，
+// 仅对值发生变化的用户补 1 次 CASE UPDATE（数字正确时零写入）。
+// 供控制台用户列表等渲染场景使用，避免逐用户"读后写"在 SQLite WAL 下触发升级死锁。
+// 返回 [userId => total]；UPDATE 重试耗尽时降级读取库中已存值，绝不向上抛。
+function recalculate_users_storage_batch(array $userIds): array {
+    $ids = array_values(array_unique(array_filter(array_map('intval', $userIds), static fn($v) => $v > 0)));
+    if (empty($ids)) {
+        return [];
+    }
+    $pdo = db();
+    $ph = implode(',', array_fill(0, count($ids), '?'));
+    $totals = [];
+    $agg = $pdo->prepare("SELECT user_id, COALESCE(SUM(size_bytes), 0) AS total FROM (
+            SELECT user_id, size_bytes FROM shares WHERE deleted_at IS NULL AND user_id IN ($ph)
+            UNION ALL
+            SELECT user_id, size_bytes FROM share_access_logs WHERE user_id IN ($ph)
+        ) GROUP BY user_id");
+    $agg->execute(array_merge($ids, $ids));
+    foreach ($agg->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $totals[(int)$row['user_id']] = (int)$row['total'];
+    }
+    $agg->closeCursor();
+    // 已存列值：用于跳过无变化的 UPDATE（控制台每次刷新都重算，大多数用户值不变，
+    // 跳过写入才能从根源上减少渲染路径与 nd-worker 撞锁的机会）；写锁耗尽时也用它降级。
+    $stored = [];
+    $st = $pdo->prepare("SELECT id, storage_used_bytes FROM users WHERE id IN ($ph)");
+    $st->execute($ids);
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $stored[(int)$row['id']] = (int)$row['storage_used_bytes'];
+    }
+    $st->closeCursor();
+    foreach ($ids as $uid) {
+        if (!isset($totals[$uid])) {
+            $totals[$uid] = 0;
+        }
+    }
+    $dirty = [];
+    foreach ($totals as $uid => $total) {
+        if ($total !== ($stored[$uid] ?? $total)) {
+            $dirty[$uid] = $total;
+        }
+    }
+    if ($dirty) {
+        // id/total 均为 int 强转后拼接，无注入面
+        $cases = [];
+        foreach ($dirty as $uid => $total) {
+            $cases[] = "WHEN $uid THEN $total";
+        }
+        $sql = 'UPDATE users SET storage_used_bytes = CASE id ' . implode(' ', $cases)
+            . ' ELSE storage_used_bytes END WHERE id IN (' . implode(',', array_keys($dirty)) . ')';
+        try {
+            netdisk_exec_retry(function () use ($pdo, $sql) {
+                $upd = $pdo->prepare($sql);
+                $upd->execute();
+                $upd->closeCursor();
+            }, 6);
+        } catch (Throwable $e) {
+            // 写锁耗尽：降级为库中已存值（渲染路径，不允许抛错中断页面；下次成功重算自校正）
+            foreach ($dirty as $uid => $total) {
+                $totals[$uid] = $stored[$uid] ?? $total;
+            }
+        }
+    }
+    return $totals;
 }
 
 function adjust_user_storage(int $userId, int $delta): void {
@@ -1826,6 +2276,5550 @@ function http_post_json(string $url, array $payload): ?array {
     return null;
 }
 
+/* ============================================================
+ * Cloudreve 网盘集成（Netdisk）
+ * ------------------------------------------------------------
+ * 将 Cloudreve 作为“网盘”嵌入到分享页。管理员在后台配置
+ * Cloudreve 连接（服务账号），并为指定分享开启网盘、指定根目录
+ * 与权限（view/edit）。访客在分享页浏览/预览，office/PDF 通过
+ * Cloudreve 的 WOPI（OnlyOffice / Collabora）在线编辑。
+ * ============================================================ */
+
+function cloudreve_configs_all(?PDO $pdo = null): array {
+    if ($pdo === null) {
+        $pdo = db();
+    }
+    $stmt = $pdo->query('SELECT * FROM cloudreve_configs ORDER BY id ASC');
+    return $stmt ? $stmt->fetchAll(PDO::FETCH_ASSOC) : [];
+}
+
+function cloudreve_config_get(int $id, ?PDO $pdo = null): ?array {
+    if ($pdo === null) {
+        $pdo = db();
+    }
+    $stmt = $pdo->prepare('SELECT * FROM cloudreve_configs WHERE id = :id');
+    $stmt->execute([':id' => $id]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
+    return $row ?: null;
+}
+
+// 网盘密钥：优先环境变量，其次 storage/.netdisk_secret（0600，首次自动生成）。
+// 密钥与 SQLite 分离存放，避免数据库备份泄露时连带泄露账号密码。
+function netdisk_secret_key(): string {
+    static $key = null;
+    if ($key !== null) {
+        return $key;
+    }
+    $env = getenv('NETDISK_SECRET');
+    if (is_string($env) && strlen($env) >= 32) {
+        $key = substr(hash('sha256', $env, true), 0, 32);
+        return $key;
+    }
+    $storage = dirname((string)($GLOBALS['config']['db_path'] ?? (__DIR__ . '/storage/app.db')));
+    $path = $storage . '/.netdisk_secret';
+    $raw = @file_get_contents($path);
+    if (is_string($raw) && strlen($raw) >= 32) {
+        $key = substr($raw, 0, 32);
+        return $key;
+    }
+    if (!is_dir($storage)) {
+        @mkdir($storage, 0770, true);
+    }
+    $new = random_bytes(32);
+    if (@file_put_contents($path, $new, LOCK_EX) === false) {
+        error_log('[netdisk] 无法写入密钥文件 ' . $path . '，网盘密码将无法加密保存');
+        $key = '';
+        return $key;
+    }
+    @chmod($path, 0600);
+    $key = $new;
+    return $key;
+}
+
+function netdisk_encrypt_secret(string $plain): string {
+    if ($plain === '') {
+        return '';
+    }
+    $key = netdisk_secret_key();
+    if ($key === '' || !function_exists('openssl_encrypt')) {
+        return '';
+    }
+    $iv = random_bytes(12);
+    $tag = '';
+    $cipher = openssl_encrypt($plain, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag);
+    if ($cipher === false) {
+        return '';
+    }
+    return 'enc:v1:' . base64_encode($iv . $tag . $cipher);
+}
+
+function netdisk_decrypt_secret(string $value): string {
+    if ($value === '' || !str_starts_with($value, 'enc:v1:')) {
+        return $value;
+    }
+    $raw = base64_decode(substr($value, 7), true);
+    if (!is_string($raw) || strlen($raw) < 29) {
+        return '';
+    }
+    $key = netdisk_secret_key();
+    if ($key === '' || !function_exists('openssl_decrypt')) {
+        return '';
+    }
+    $plain = openssl_decrypt(substr($raw, 28), 'aes-256-gcm', $key, OPENSSL_RAW_DATA, substr($raw, 0, 12), substr($raw, 12, 16));
+    return is_string($plain) ? $plain : '';
+}
+
+function cloudreve_conn(array $cfg): array {
+    return [
+        'id' => (int)($cfg['id'] ?? 0),
+        'base_url' => rtrim((string)($cfg['base_url'] ?? ''), '/'),
+        'email' => (string)($cfg['email'] ?? ''),
+        'password' => netdisk_decrypt_secret((string)($cfg['password'] ?? '')),
+        'viewer_id' => (string)($cfg['viewer_id'] ?? ''),
+    ];
+}
+
+function cloudreve_enabled(): bool {
+    $cfgs = cloudreve_configs_all();
+    foreach ($cfgs as $cfg) {
+        if ((int)($cfg['enabled'] ?? 0) === 1 && trim((string)($cfg['base_url'] ?? '')) !== '' && trim((string)($cfg['email'] ?? '')) !== '') {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 网盘标签渲染状态：与分享页侧边栏门槛完全同口径（netdisk_share_config + cloudreve_enabled），
+// 并额外细分「为什么没按钮」，供控制台「分享绑定 → 网盘标签」列直接展示诊断结果，
+// 避免分享页静默隐藏（既不渲染按钮也不报错）让用户自己猜。
+// $docCounts: 可选的 share_id => 文档数 映射（多分享场景批量预取，避免循环内逐条查询）。
+function netdisk_tab_state(array $share, ?array $docCounts = null, ?PDO $pdo = null): array {
+    $base = netdisk_share_config($share, $pdo);
+    if (!$base['enabled']) {
+        return ['show' => false, 'reason' => '未开启'];
+    }
+    if (!cloudreve_enabled()) {
+        return ['show' => false, 'reason' => '无可用 Cloudreve 连接（需启用且填写地址与邮箱）'];
+    }
+    if (!$base['cfg']) {
+        if ((int)($base['config_id'] ?? 0) <= 0) {
+            return ['show' => false, 'reason' => '未绑定连接，且启用中的连接不唯一，请在「绑定连接」中选择'];
+        }
+        return ['show' => false, 'reason' => '绑定的连接不存在，请重新绑定'];
+    }
+    if ((int)($base['cfg']['enabled'] ?? 0) !== 1) {
+        return ['show' => false, 'reason' => '绑定的连接已停用'];
+    }
+    if (trim((string)($base['cfg']['base_url'] ?? '')) === '' || trim((string)($base['cfg']['email'] ?? '')) === '') {
+        return ['show' => false, 'reason' => '绑定连接缺少地址或邮箱'];
+    }
+    if ((string)($share['type'] ?? '') === 'doc' && $docCounts !== null) {
+        $count = (int)($docCounts[(int)($share['id'] ?? 0)] ?? 0);
+        if ($count <= 1) {
+            return ['show' => false, 'reason' => '单文档分享页不显示网盘标签'];
+        }
+    }
+    return ['show' => true, 'reason' => '可显示'];
+}
+
+function cloudreve_http_request(string $method, string $url, ?array $json = null, array $headers = []): ?array {
+    cloudreve_http_set_last_error('', 0);
+    $headerLines = array_merge([
+        'User-Agent: SiyuanShareNetdisk',
+        'Content-Type: application/json',
+    ], $headers);
+    // 用 curl 实现，保证连接/传输可靠超时（file_get_contents 的 http.timeout 在 DNS/SSL 阶段可能不生效，
+    // 曾导致 worker 在遍历目录时永久挂起、心跳停止）。
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CUSTOMREQUEST => $method,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => 20,
+            CURLOPT_HTTPHEADER => $headerLines,
+            CURLOPT_POSTFIELDS => $json === null ? '' : json_encode($json, JSON_UNESCAPED_UNICODE),
+        ]);
+        curl_setopt($ch, CURLOPT_HEADER, false);
+        $raw = @curl_exec($ch);
+        $err = curl_error($ch);
+        $errno = curl_errno($ch);
+        $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($raw === false || $raw === '') {
+            if ($errno !== 0 || $err !== '') {
+                // curl 错误文案归一化成 netdisk_office_http_classify 认识的关键词
+                $norm = $err;
+                if ($errno === 6) { $norm = 'Could not resolve host: ' . $err; }
+                elseif ($errno === 7) { $norm = 'Connection refused: ' . $err; }
+                elseif ($errno === 28) { $norm = 'Connection timed out: ' . $err; }
+                elseif ($errno === 35 || $errno === 60 || $errno === 51 || $errno === 58 || $errno === 59 || $errno === 53) { $norm = 'SSL certificate problem: ' . $err; }
+                cloudreve_http_set_last_error($norm !== '' ? $norm : ('curl 错误号 ' . $errno), $httpCode);
+            } elseif ($httpCode >= 400) {
+                cloudreve_http_set_last_error('HTTP 状态码异常：' . $httpCode, $httpCode);
+            }
+            return null;
+        }
+        if ($httpCode >= 400) {
+            cloudreve_http_set_last_error('HTTP 状态码异常：' . $httpCode, $httpCode);
+        }
+        $decoded = json_decode($raw, true);
+        return is_array($decoded) ? $decoded : null;
+    }
+    $ctx = [
+        'http' => [
+            'method' => $method,
+            'timeout' => 20,
+            'ignore_errors' => true,
+            'header' => implode("\r\n", $headerLines) . "\r\n",
+            'content' => $json === null ? '' : json_encode($json, JSON_UNESCAPED_UNICODE),
+        ],
+    ];
+    $lastErr = '';
+    set_error_handler(function ($no, $msg) use (&$lastErr) { $lastErr = $msg; return true; });
+    $raw = @file_get_contents($url, false, stream_context_create($ctx));
+    restore_error_handler();
+    $statusLine = isset($http_response_header[0]) && is_string($http_response_header[0]) ? $http_response_header[0] : '';
+    if ($raw === false) {
+        if ($lastErr !== '') {
+            cloudreve_http_set_last_error($lastErr, 0);
+        }
+        return null;
+    }
+    if (preg_match('#HTTP/\S+\s+([1-5]\d\d)#', $statusLine, $sm) && (int)$sm[1] >= 400) {
+        cloudreve_http_set_last_error('HTTP 状态码异常：' . $statusLine, (int)$sm[1]);
+        $decoded4 = json_decode($raw, true);
+        if (is_array($decoded4)) { return $decoded4; }
+        return null;
+    }
+    $decoded = json_decode($raw, true);
+    return is_array($decoded) ? $decoded : null;
+}
+
+// 最近一次 cloudreve_http_request 的传输层错误（连接/DNS/超时/TLS），成功或未捕获时为空串
+function cloudreve_http_last_error(): string {
+    return (string)($GLOBALS['__cloudreve_http_last_error'] ?? '');
+}
+
+function cloudreve_http_set_last_error(string $msg, int $httpCode = 0): void {
+    $GLOBALS['__cloudreve_http_last_error'] = $msg;
+    $GLOBALS['__cloudreve_http_last_code'] = $httpCode;
+}
+
+// 最近一次 cloudreve_http_request 失败的 HTTP 状态码（0 表示未拿到响应）
+function cloudreve_http_last_code(): int {
+    return (int)($GLOBALS['__cloudreve_http_last_code'] ?? 0);
+}
+
+// 对应某条连接配置的 token 缓存键
+function cloudreve_token_key(int $id, string $part): string {
+    return 'cloudreve_token_' . $id . '_' . $part;
+}
+
+function cloudreve_login(array $cfg): bool {
+    $id = (int)($cfg['id'] ?? 0);
+    $c = cloudreve_conn($cfg);
+    if ($c['base_url'] === '' || $c['email'] === '' || $c['password'] === '') {
+        return false;
+    }
+    $resp = cloudreve_http_request('POST', $c['base_url'] . '/api/v4/session/token', [
+        'email' => $c['email'],
+        'password' => $c['password'],
+    ]);
+    if (!$resp || (int)($resp['code'] ?? 1) !== 0) {
+        return false;
+    }
+    $token = $resp['data']['token'] ?? null;
+    if (!is_array($token) || empty($token['access_token'])) {
+        return false;
+    }
+    cloudreve_store_login_tokens($id, $token);
+    return true;
+}
+
+// cloudreve_login 的带原因版本：返回 ['ok'=>bool, 'reason'=>string]，reason 供控制台「测试连接」透传，
+// 绝不包含密码或 token。细分四类：解密失败（口令字段无法还原）/ 服务不可访问 / 账号或密码错误（带 Cloudreve msg 与状态码）/ 响应异常。
+function cloudreve_login_detailed(array $cfg): array {
+    $id = (int)($cfg['id'] ?? 0);
+    $stored = trim((string)($cfg['password'] ?? ''));
+    $c = cloudreve_conn($cfg);
+    if ($stored !== '' && $c['password'] === '') {
+        return ['ok' => false, 'reason' => '已存密码解密失败（storage/.netdisk_secret 与加密时不一致），请编辑连接后重新输入密码'];
+    }
+    if ($c['base_url'] === '' || $c['email'] === '' || $c['password'] === '') {
+        return ['ok' => false, 'reason' => '地址/账号/密码不能为空'];
+    }
+    $resp = cloudreve_http_request('POST', $c['base_url'] . '/api/v4/session/token', [
+        'email' => $c['email'],
+        'password' => $c['password'],
+    ]);
+    if (!$resp || (int)($resp['code'] ?? 1) !== 0) {
+        $code = (int)cloudreve_http_last_code();
+        $transport = cloudreve_http_last_error();
+        $srvMsg = is_array($resp) ? trim((string)($resp['msg'] ?? '')) : '';
+        // 401/403：服务可达但凭据被拒 —— 优先按账号密码错误报，不要被传输层文案掩盖
+        if ($code === 401 || $code === 403) {
+            return ['ok' => false, 'reason' => '账号或密码错误（HTTP ' . $code . '）' . ($srvMsg !== '' ? '：' . $srvMsg : '')];
+        }
+        if ($transport !== '') {
+            return ['ok' => false, 'reason' => '服务不可访问：' . netdisk_office_http_classify($transport)];
+        }
+        if (is_array($resp)) {
+            return ['ok' => false, 'reason' => '登录被拒绝' . ($code ? '（HTTP ' . $code . '）' : '') . ($srvMsg !== '' ? '：' . $srvMsg : '')];
+        }
+        return ['ok' => false, 'reason' => '登录请求失败：未能收到有效 JSON 响应'];
+    }
+    $token = $resp['data']['token'] ?? null;
+    if (!is_array($token) || empty($token['access_token'])) {
+        return ['ok' => false, 'reason' => '登录响应异常：未返回 access_token'];
+    }
+    cloudreve_store_login_tokens($id, $token);
+    return ['ok' => true, 'reason' => ''];
+}
+
+// 登录成功后写入某条连接的 access/refresh token 缓存（cloudreve_login 与 cloudreve_login_detailed 共用）
+function cloudreve_store_login_tokens(int $id, array $token): void {
+    set_setting(cloudreve_token_key($id, 'access'), netdisk_encrypt_secret((string)$token['access_token']));
+    set_setting(cloudreve_token_key($id, 'refresh'), netdisk_encrypt_secret((string)($token['refresh_token'] ?? '')));
+    $exp = strtotime((string)($token['access_expires'] ?? ''));
+    set_setting(cloudreve_token_key($id, 'expires'), (string)($exp ? $exp : 0));
+}
+
+function cloudreve_access_token(array $cfg): string {
+    $id = (int)($cfg['id'] ?? 0);
+    $token = netdisk_decrypt_secret((string)get_setting(cloudreve_token_key($id, 'access'), ''));
+    $expires = (int)get_setting(cloudreve_token_key($id, 'expires'), '0');
+    if ($token !== '' && ($expires === 0 || $expires > time() + 120)) {
+        return $token;
+    }
+    $c = cloudreve_conn($cfg);
+    if ($c['base_url'] !== '') {
+        $refresh = netdisk_decrypt_secret((string)get_setting(cloudreve_token_key($id, 'refresh'), ''));
+        if ($refresh !== '') {
+            $resp = cloudreve_http_request('POST', $c['base_url'] . '/api/v4/session/token/refresh', ['refresh_token' => $refresh]);
+            if ($resp && (int)($resp['code'] ?? 1) === 0) {
+                $tok = $resp['data']['token'] ?? $resp['data'] ?? null;
+                if (is_array($tok) && !empty($tok['access_token'])) {
+                    set_setting(cloudreve_token_key($id, 'access'), netdisk_encrypt_secret((string)$tok['access_token']));
+                    if (!empty($tok['refresh_token'])) {
+                        set_setting(cloudreve_token_key($id, 'refresh'), netdisk_encrypt_secret((string)$tok['refresh_token']));
+                    }
+                    $e = strtotime((string)($tok['access_expires'] ?? ''));
+                    set_setting(cloudreve_token_key($id, 'expires'), (string)($e ? $e : 0));
+                    return (string)$tok['access_token'];
+                }
+            }
+        }
+        if (cloudreve_login($cfg)) {
+            return netdisk_decrypt_secret((string)get_setting(cloudreve_token_key($id, 'access'), ''));
+        }
+    }
+    return '';
+}
+
+function cloudreve_api(array $cfg, string $method, string $path, ?array $json = null): ?array {
+    $c = cloudreve_conn($cfg);
+    $token = cloudreve_access_token($cfg);
+    if ($token === '' || $c['base_url'] === '') {
+        return null;
+    }
+    return cloudreve_http_request($method, $c['base_url'] . '/api/v4' . $path, $json, [
+        'Authorization: Bearer ' . $token,
+    ]);
+}
+
+function netdisk_share_config(array $share, ?PDO $pdo = null): array {
+    $configId = (int)($share['netdisk_config_id'] ?? 0);
+    $cfg = $configId > 0 ? cloudreve_config_get($configId, $pdo) : null;
+    // 未绑定连接时，若恰好只有一个启用中的连接，则自动使用它（单连接场景免绑定）
+    if (!$cfg) {
+        $all = cloudreve_configs_all($pdo);
+        $enabledList = array_values(array_filter($all, fn($c) => (int)($c['enabled'] ?? 0) === 1));
+        if (count($enabledList) === 1) {
+            $cfg = $enabledList[0];
+            $configId = (int)$cfg['id'];
+        }
+    }
+    $root = trim((string)($share['netdisk_root'] ?? ''));
+    if ($root === '' && $cfg) {
+        $root = trim((string)($cfg['default_root'] ?? ''));
+    }
+    return [
+        'enabled' => (int)($share['netdisk_enabled'] ?? 0) === 1,
+        'config_id' => $configId,
+        'root' => $root,
+        'permission' => ((string)($share['netdisk_permission'] ?? 'view') === 'edit') ? 'edit' : 'view',
+        'cfg' => $cfg,
+    ];
+}
+
+function netdisk_default_root_uri(): string {
+    return 'cloudreve://my';
+}
+
+function netdisk_normalize_root(?string $root): string {
+    $root = trim((string)$root);
+    if ($root === '') {
+        return netdisk_default_root_uri();
+    }
+    return rtrim($root, '/');
+}
+
+function cloudreve_list_folder(array $cfg, string $uri): ?array {
+    $resp = cloudreve_api($cfg, 'GET', '/file?uri=' . rawurlencode($uri) . '&page_size=1000&order_by=name&order_direction=asc');
+    if (!$resp || (int)($resp['code'] ?? 1) !== 0) {
+        return null;
+    }
+    return $resp['data'] ?? null;
+}
+
+// 网盘短期缓存：目录列表 / 搜索结果 / 文件名-uri 解析（SQLite，TTL 由调用方指定）
+function netdisk_cache_get(string $key): ?string {
+    $stmt = db()->prepare('SELECT payload FROM netdisk_cache WHERE cache_key = :k AND expires > :now');
+    $stmt->execute([':k' => $key, ':now' => time()]);
+    $v = $stmt->fetchColumn();
+    return $v === false ? null : (string)$v;
+}
+
+function netdisk_cache_set(string $key, string $payload, int $ttl): void {
+    $pdo = db();
+    $stmt = $pdo->prepare('INSERT INTO netdisk_cache (cache_key, payload, expires) VALUES (:k, :p, :e)
+        ON CONFLICT(cache_key) DO UPDATE SET payload = :p2, expires = :e2');
+    $stmt->execute([':k' => $key, ':p' => $payload, ':e' => time() + $ttl, ':p2' => $payload, ':e2' => time() + $ttl]);
+}
+
+function netdisk_cache_clear(): void {
+    db()->exec('DELETE FROM netdisk_cache');
+}
+
+// 目录列表带缓存：同一分享/配置的目录 60s 内复用，避免重复检索时反复请求 Cloudreve
+function cloudreve_list_folder_cached(array $cfg, string $uri, int $ttl = 60): ?array {
+    $connId = (int)($cfg['cfg'] ? ($cfg['cfg']['id'] ?? 0) : ($cfg['id'] ?? 0));
+    $key = 'nd_dir_' . $connId . '_' . md5($uri);
+    $cached = netdisk_cache_get($key);
+    if ($cached !== null) {
+        $data = json_decode($cached, true);
+        if (is_array($data)) {
+            return $data;
+        }
+    }
+    $data = cloudreve_list_folder($cfg['cfg'] ?? $cfg, $uri);
+    if (is_array($data)) {
+        netdisk_cache_set($key, json_encode($data, JSON_UNESCAPED_UNICODE), $ttl);
+    }
+    return $data;
+}
+
+// 批量并行拉取多个目录（curl_multi），返回 uri => data|null
+function cloudreve_list_folder_multi(array $cfg, array $uris, int $ttl = 60): array {
+    $out = [];
+    if (empty($uris)) {
+        return $out;
+    }
+    $conn = $cfg['cfg'] ?? $cfg;
+    $connId = (int)($conn['id'] ?? 0);
+    $base = (string)($conn['base_url'] ?? '');
+    $token = cloudreve_access_token($conn);
+    if ($base === '' || $token === '') {
+        foreach ($uris as $u) {
+            $out[$u] = null;
+        }
+        return $out;
+    }
+    // 先查缓存
+    $todo = [];
+    foreach ($uris as $u) {
+        $key = 'nd_dir_' . $connId . '_' . md5($u);
+        $cached = netdisk_cache_get($key);
+        if ($cached !== null) {
+            $data = json_decode($cached, true);
+            $out[$u] = is_array($data) ? $data : null;
+        } else {
+            $todo[$u] = $key;
+        }
+    }
+    if (empty($todo)) {
+        return $out;
+    }
+    // curl_multi 并发拉取未命中目录
+    $mh = curl_multi_init();
+    $handles = [];
+    foreach ($todo as $u => $key) {
+        $ch = curl_init($base . '/api/v4/file?uri=' . rawurlencode($u) . '&page_size=1000&order_by=name&order_direction=asc');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => [
+                'Authorization: Bearer ' . $token,
+                'User-Agent: SiyuanShareNetdisk',
+                'Content-Type: application/json',
+            ],
+            CURLOPT_TIMEOUT => 20,
+        ]);
+        curl_multi_add_handle($mh, $ch);
+        $handles[(int)$ch] = ['ch' => $ch, 'uri' => $u, 'key' => $key];
+    }
+    $running = null;
+    do {
+        curl_multi_exec($mh, $running);
+        if ($running) {
+            curl_multi_select($mh, 0.2);
+        }
+    } while ($running > 0);
+    foreach ($handles as $h) {
+        $raw = curl_multi_getcontent($h['ch']);
+        curl_multi_remove_handle($mh, $h['ch']);
+        curl_close($h['ch']);
+        $decoded = is_string($raw) ? json_decode($raw, true) : null;
+        $data = (is_array($decoded) && (int)($decoded['code'] ?? 1) === 0) ? ($decoded['data'] ?? null) : null;
+        $out[$h['uri']] = is_array($data) ? $data : null;
+        if (is_array($data)) {
+            netdisk_cache_set($h['key'], json_encode($data, JSON_UNESCAPED_UNICODE), $ttl);
+        }
+    }
+    curl_multi_close($mh);
+    return $out;
+}
+
+// 判断是否为可本地抓取正文的纯文本类型
+function netdisk_is_local_text_ext(string $name): bool {
+    return netdisk_is_text_ext(netdisk_file_ext($name));
+}
+
+function netdisk_is_text_ext(string $ext): bool {
+    $ext = strtolower(ltrim($ext, '.'));
+    $textExts = ['txt', 'md', 'markdown', 'csv', 'log', 'json', 'xml', 'yaml', 'yml', 'ini', 'conf', 'cfg', 'srt', 'vtt',
+        'py', 'js', 'ts', 'html', 'htm', 'css', 'sql', 'sh', 'bash', 'java', 'c', 'cpp', 'h', 'go', 'rb', 'php', 'env', 'properties'];
+    return in_array($ext, $textExts, true);
+}
+
+// 抓取单个纯文本文件正文（供本地文本兜底检索），失败返回 null
+function netdisk_fetch_text_content(array $cfg, string $uri, string $name): ?string {
+    $urls = cloudreve_get_file_urls($cfg, [$uri]);
+    if (empty($urls) || empty($urls[0]['url'])) {
+        return null;
+    }
+    $fileUrl = (string)$urls[0]['url'];
+    if (function_exists('curl_init')) {
+        $ch = curl_init($fileUrl);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 10,
+            CURLOPT_TIMEOUT => 20,
+            CURLOPT_FOLLOWLOCATION => true,
+        ]);
+        $raw = @curl_exec($ch);
+        curl_close($ch);
+    } else {
+        $ctx = stream_context_create([
+            'http' => ['timeout' => 15, 'ignore_errors' => true, 'follow_location' => 1],
+        ]);
+        $raw = @file_get_contents($fileUrl, false, $ctx);
+    }
+    if ($raw === false) {
+        return null;
+    }
+    return netdisk_text_body_to_utf8((string)$raw);
+}
+
+// 把原始字节按文本解码为 UTF-8；非文本/无法识别返回 null
+function netdisk_text_body_to_utf8(string $raw): ?string {
+    if ($raw === '') {
+        return null;
+    }
+    if (!mb_check_encoding($raw, 'UTF-8')) {
+        $detected = mb_detect_encoding($raw, ['UTF-8', 'GB18030', 'GBK', 'BIG-5', 'ASCII'], true);
+        if ($detected !== false) {
+            $raw = mb_convert_encoding($raw, 'UTF-8', $detected);
+        } else {
+            return null;
+        }
+    }
+    return $raw;
+}
+
+// 批量并行抓取多个纯文本文件正文（一次 /file/url + curl_multi 并发），返回 uri => body|null
+function netdisk_fetch_text_content_multi(array $cfg, array $uris): array {
+    $out = [];
+    if (empty($uris)) {
+        return $out;
+    }
+    $uris = array_values($uris);
+    $urls = cloudreve_get_file_urls($cfg, $uris);
+    if (!is_array($urls)) {
+        foreach ($uris as $u) {
+            $out[$u] = null;
+        }
+        return $out;
+    }
+    $mh = curl_multi_init();
+    $handles = [];
+    foreach ($uris as $i => $u) {
+        $fileUrl = (string)($urls[$i]['url'] ?? '');
+        if ($fileUrl === '') {
+            $out[$u] = null;
+            continue;
+        }
+        $ch = curl_init($fileUrl);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 15,
+            CURLOPT_FOLLOWLOCATION => true,
+        ]);
+        curl_multi_add_handle($mh, $ch);
+        $handles[(int)$ch] = ['ch' => $ch, 'uri' => $u];
+    }
+    $running = null;
+    do {
+        curl_multi_exec($mh, $running);
+        if ($running) {
+            curl_multi_select($mh, 0.2);
+        }
+    } while ($running > 0);
+    foreach ($handles as $h) {
+        $raw = curl_multi_getcontent($h['ch']);
+        curl_multi_remove_handle($mh, $h['ch']);
+        curl_close($h['ch']);
+        $out[$h['uri']] = is_string($raw) ? netdisk_text_body_to_utf8($raw) : null;
+    }
+    curl_multi_close($mh);
+    return $out;
+}
+
+// 下载单文件原始字节（供正文抽取/OCR），失败返回 null
+function netdisk_fetch_raw_bytes(array $cfg, string $uri): ?string {
+    $urls = cloudreve_get_file_urls($cfg, [$uri]);
+    if (empty($urls) || empty($urls[0]['url'])) {
+        return null;
+    }
+    // 用 curl 下载：连接/总超时比 file_get_contents 更可靠，避免单文件下载挂起拖死整个遍历
+    $ch = curl_init((string)$urls[0]['url']);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT => 45,
+        CURLOPT_USERAGENT => 'SiyuanShareNetdisk',
+    ]);
+    $raw = curl_exec($ch);
+    $err = curl_error($ch);
+    curl_close($ch);
+    if ($raw === false) {
+        return null;
+    }
+    return is_string($raw) ? $raw : null;
+}
+
+// 从 docx/xlsx/pptx/odt（ZipArchive）抽取纯文本
+function netdisk_extract_office_text(string $ext, string $raw): string {
+    $ext = strtolower(ltrim($ext, '.'));
+    $out = [];
+    $tmp = tempnam(sys_get_temp_dir(), 'ndx_');
+    if ($tmp === false) {
+        return '';
+    }
+    @file_put_contents($tmp, $raw);
+    $zip = new ZipArchive();
+    if (@$zip->open($tmp) !== true) {
+        @unlink($tmp);
+        return '';
+    }
+    try {
+        if ($ext === 'docx' || $ext === 'docm' || $ext === 'dotx') {
+            $xml = $zip->getFromName('word/document.xml');
+            if ($xml !== false) {
+                $out[] = strip_tags($xml);
+            }
+        } elseif ($ext === 'xlsx' || $ext === 'xlsm') {
+            // 共享字符串 + 单元格
+            $ss = $zip->getFromName('xl/sharedStrings.xml');
+            if ($ss !== false) {
+                preg_match_all('#<t[^>]*>(.*?)</t>#s', $ss, $m);
+                $out[] = implode(' ', array_map('html_entity_decode', $m[1]));
+            }
+            for ($i = 1; $i <= 32; $i++) {
+                $sheet = $zip->getFromName('xl/worksheets/sheet' . $i . '.xml');
+                if ($sheet === false) {
+                    break;
+                }
+                preg_match_all('#<t[^>]*>(.*?)</t>#s', $sheet, $m);
+                $out[] = implode(' ', array_map('html_entity_decode', $m[1]));
+            }
+        } elseif ($ext === 'pptx' || $ext === 'pptm') {
+            for ($i = 1; $i <= 64; $i++) {
+                $slide = $zip->getFromName('ppt/slides/slide' . $i . '.xml');
+                if ($slide === false) {
+                    break;
+                }
+                $out[] = strip_tags($slide);
+            }
+        } elseif ($ext === 'odt' || $ext === 'ods' || $ext === 'odp') {
+            $content = $zip->getFromName('content.xml');
+            if ($content !== false) {
+                $out[] = strip_tags($content);
+            }
+        }
+    } finally {
+        $zip->close();
+        @unlink($tmp);
+    }
+    return trim(preg_replace('/\s+/u', ' ', implode(' ', $out)));
+}
+
+// 从 PDF（文本层）用 pdftotext 抽取；返回 '' 表示无文本或工具不可用
+function netdisk_extract_pdf_text(string $raw): string {
+    $bin = trim((string)shell_exec('command -v pdftotext 2>/dev/null'));
+    if ($bin === '') {
+        return '';
+    }
+    $tmpPdf = tempnam(sys_get_temp_dir(), 'ndp_');
+    $tmpTxt = tempnam(sys_get_temp_dir(), 'ndt_');
+    if ($tmpPdf === false || $tmpTxt === false) {
+        @unlink($tmpPdf);
+        @unlink($tmpTxt);
+        return '';
+    }
+    @file_put_contents($tmpPdf, $raw);
+    $cmd = escapeshellarg($bin) . ' ' . escapeshellarg($tmpPdf) . ' ' . escapeshellarg($tmpTxt) . ' 2>/dev/null';
+    @shell_exec($cmd);
+    $text = '';
+    if (is_file($tmpTxt)) {
+        $text = (string)@file_get_contents($tmpTxt);
+    }
+    @unlink($tmpPdf);
+    @unlink($tmpTxt);
+    return trim(preg_replace('/\s+/u', ' ', $text));
+}
+
+// OCR 渲染分辨率（pdftoppm DPI）：PaddleOCR 识别精度对 DPI 不敏感，200 足够且降低内存峰值，
+// 避免 300 整页大图在低内存 NAS 上触发 onnxruntime 推理崩溃。
+const NETDISK_OCR_DPI = 200;
+// OCR 外部命令超时（秒）：防止 pdftoppm/tesseract 挂起拖死 worker
+const NETDISK_OCR_CMD_TIMEOUT = 60;
+
+// 用 proc_open 执行外部命令并设超时；超时强制终止。返回 true 表示命令已结束（成功与否见文件），false 表示超时终止。
+function netdisk_run_cmd_timeout(string $cmd, int $timeoutSec): bool {
+    $proc = proc_open($cmd, [
+        0 => ['file', '/dev/null', 'r'],
+        1 => ['file', '/dev/null', 'w'],
+        2 => ['file', '/dev/null', 'w'],
+    ], $pipes);
+    if (!is_resource($proc)) {
+        return false;
+    }
+    $started = time();
+    while (true) {
+        $st = @proc_get_status($proc);
+        if (!$st || !$st['running']) {
+            break;
+        }
+        if (time() - $started >= $timeoutSec) {
+            @proc_terminate($proc);
+            usleep(100000);
+            @proc_terminate($proc, 9);
+            @proc_close($proc);
+            return false;
+        }
+        usleep(100000);
+    }
+    @proc_close($proc);
+    return true;
+}
+
+// OCR 候选扩展名
+function netdisk_is_ocr_candidate(string $ext): bool {
+    $ext = strtolower(ltrim($ext, '.'));
+    return in_array($ext, ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tif', 'tiff', 'pdf'], true);
+}
+
+// ---- OCR sidecar（rapidocr/PP-OCR）集成 ----
+// 独立容器常驻 HTTP 服务识别共享 volume 中的页 PNG，精度远高于 tesseract。
+// 可用性检测缓存；sidecar 不可用时自动回退本地 tesseract，保证功能不中断。
+
+const NETDISK_OCR_SIDECAR_WORKDIR = '/ocr';
+
+// PaddleOCR 官方 serving 地址：优先环境变量，默认 http://ocr:8080（服务名/端口与 compose 的 ocr 服务、deploy/ocr/init.sh 的 OCR_PORT 统一；也可通过 NETDISK_OCR_SIDECAR_URL 显式指定）
+function netdisk_ocr_sidecar_base(): string {
+    return rtrim((string)(getenv('NETDISK_OCR_SIDECAR_URL') ?: 'http://ocr:8080'), '/');
+}
+
+function netdisk_ocr_sidecar_enabled(): bool {
+    return (string)(getenv('NETDISK_OCR_SIDECAR') ?: '') === '1';
+}
+
+function netdisk_ocr_sidecar_available(): bool {
+    static $cache = null;
+    if ($cache !== null) {
+        return $cache;
+    }
+    $ok = false;
+    if (function_exists('curl_init')) {
+        // PaddleOCR 官方 serving（paddlex --serve）基于 FastAPI，无 /health；
+        // 用批量探测：root（200）或 /openapi.json（FastAPI 默认）均视为存活。
+        foreach (['/openapi.json', '/docs', ''] as $path) {
+            $code = 0;
+            $ch = curl_init(netdisk_ocr_sidecar_base() . $path);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_CONNECTTIMEOUT => 3,
+                CURLOPT_TIMEOUT => 5,
+                CURLOPT_CUSTOMREQUEST => 'GET',
+            ]);
+            @curl_exec($ch);
+            $code = (int)@curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            if ($code > 0 && $code < 500) {
+                $ok = true;
+                break;
+            }
+        }
+    }
+    $cache = $ok;
+    return $ok;
+}
+
+// ===== 0019: OCR 内存预算守卫 =====
+// 背景：worker 在真机三次 `Allowed memory size of 1073741824 bytes exhausted`——
+// 旧 netdisk_ocr_image_resize_b64() 的"超预算图先降采样"分支会先把整幅图 imagecreatefromstring，
+// 巨图（≈1.23 亿像素、真彩解码 ≈470MB）恰好在"防 OOM"那一步触发 PHP Fatal。
+// GD 没有流式解码，唯一安全做法：解码前先算解码需求，超预算拒绝解码并记 invalid。
+
+// 解析 php.ini 简写字节（"1G"/"256M"/"-1"）；-1/0 返回 -1（不限语义），空/非法返回 0。
+function netdisk_ocr_parse_bytes(string $v): int {
+    $v = trim($v);
+    if ($v === '') {
+        return 0;
+    }
+    $n = (int)$v;
+    if ($n <= 0 && !is_numeric($v)) {
+        return 0;
+    }
+    if ($n < 0) {
+        return -1;
+    }
+    $unit = strtolower(substr($v, -1));
+    if ($unit === 'g') {
+        $n *= 1024 * 1024 * 1024;
+    } elseif ($unit === 'm') {
+        $n *= 1024 * 1024;
+    } elseif ($unit === 'k') {
+        $n *= 1024;
+    }
+    return $n;
+}
+
+// 读 cgroup 内存上限（字节）；0 = 未知或不限。v2 优先，v1 兜底（v1 无限制时为近 2^63 哨兵值）。
+function netdisk_ocr_cgroup_limit(): int {
+    if (isset($GLOBALS['ND_OCR_CGROUP_LIMIT'])) { // 桩测钩子：生产环境不设该 GLOBALS
+        return (int)$GLOBALS['ND_OCR_CGROUP_LIMIT'];
+    }
+    foreach (['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes'] as $f) {
+        if (is_readable($f)) {
+            $s = trim((string)@file_get_contents($f));
+            if ($s === 'max' || $s === '') {
+                continue;
+            }
+            $n = (int)$s;
+            if ($n > 0 && $n < (1 << 50)) {
+                return $n;
+            }
+        }
+    }
+    return 0;
+}
+
+// 读 cgroup 当前内存用量（字节）；0 = 未知。
+function netdisk_ocr_cgroup_current(): int {
+    if (isset($GLOBALS['ND_OCR_CGROUP_CURRENT'])) { // 桩测钩子：生产环境不设该 GLOBALS
+        return (int)$GLOBALS['ND_OCR_CGROUP_CURRENT'];
+    }
+    foreach (['/sys/fs/cgroup/memory.current', '/sys/fs/cgroup/memory/memory.usage_in_bytes'] as $f) {
+        if (is_readable($f)) {
+            $n = (int)trim((string)@file_get_contents($f));
+            if ($n > 0) {
+                return $n;
+            }
+        }
+    }
+    return 0;
+}
+
+// OCR 解码可用内存预算（字节）：
+//  - memory_limit > 0  → limit − 当前进程已用；
+//  - memory_limit = -1 → cgroup 上限 − max(进程已用, cgroup 用量)（worker 解除 1G 上限后
+//    容器仍受 compose mem_limit 约束，不能再按"无限"或 256MB 兜底乱算）；
+//  - 两者都拿不到 → 保守 256MB 兜底。
+// 最后乘 60% 安全系数：imagecopyresampled 目标副本、JPEG 编码与 base64 峰值都要留余量。
+function netdisk_ocr_memory_budget(): int {
+    $lim = netdisk_ocr_parse_bytes((string)ini_get('memory_limit'));
+    $used = memory_get_usage(true);
+    $avail = 0;
+    if ($lim > 0) {
+        $avail = $lim - $used;
+    } elseif ($lim < 0) {
+        $cg = netdisk_ocr_cgroup_limit();
+        if ($cg > 0) {
+            $avail = $cg - max($used, netdisk_ocr_cgroup_current());
+        }
+    }
+    if ($avail <= 0) {
+        $avail = 268435456;
+    }
+    return (int)max(1048576, floor($avail * 0.6));
+}
+
+// 记录"该图片无法安全解码"的原因（按文件路径为键；文件删除后仍可查）。
+// 状态行落库时读取：status='invalid' + last_error=原因，不再笼统记 failed。
+function netdisk_ocr_invalid_mark(string $path, string $reason): void {
+    if (!isset($GLOBALS['ND_OCR_INVALID']) || !is_array($GLOBALS['ND_OCR_INVALID'])) {
+        $GLOBALS['ND_OCR_INVALID'] = [];
+    }
+    $GLOBALS['ND_OCR_INVALID'][$path] = $reason;
+}
+
+function netdisk_ocr_invalid_reason(string $path): string {
+    return (string)($GLOBALS['ND_OCR_INVALID'][$path] ?? '');
+}
+
+// ===== 0020: sidecar 服务端失败归因 =====
+// 与 ND_OCR_INVALID（文件自身问题 → status='invalid'）区分：sidecar 5xx/超时/连接失败/解析失败
+// 是服务端问题，文件本身不坏 → 状态行仍落 failed（交 0018 的连续失败计数管，≥3 熔断），
+// last_error 记具体原因（状态码 + body 摘要）替代笼统的「OCR 返回空文本」。
+function netdisk_ocr_fail_mark(string $path, string $reason): void {
+    if (!isset($GLOBALS['ND_OCR_FAIL']) || !is_array($GLOBALS['ND_OCR_FAIL'])) {
+        $GLOBALS['ND_OCR_FAIL'] = [];
+    }
+    $GLOBALS['ND_OCR_FAIL'][$path] = $reason;
+}
+
+function netdisk_ocr_fail_reason(string $path): string {
+    return (string)($GLOBALS['ND_OCR_FAIL'][$path] ?? '');
+}
+
+// 0020: body/异常信息单行化 + 按字符截断——防日志注入（body 里的 \r\n 会伪造日志行）
+// 与超长 body 刷爆状态表。口径比任务书的「\r\n→\n」更严：\n 同样断行，一律换成空格。
+function netdisk_ocr_log_oneline(string $s, int $maxChars = 200): string {
+    $s = str_replace(["\r\n", "\r", "\n", "\t"], ' ', $s);
+    $s = trim((string)preg_replace('/ {2,}/', ' ', $s));
+    if (function_exists('mb_substr')) {
+        $s = mb_substr($s, 0, max(1, $maxChars), 'UTF-8');
+    } else {
+        $s = substr($s, 0, max(1, $maxChars) * 3);
+    }
+    return $s;
+}
+
+// 0019: pdftoppm 栅格化 DPI 源头夹取——按 pdfinfo 页面尺寸(pts)估算单页真彩解码需求
+// （像素×4 字节），超预算则按 50 步长下调 DPI，下限 150（再低识别率显著下降，宁可交给
+// 预算守卫跳过）。不让 GD 事后处理超预算数据；同时是 0021 DPI 自动定档的实现基础。
+function netdisk_ocr_pdf_clamp_dpi(string $pdfPath, int $dpi): int {
+    $req = max(1, (int)$dpi);
+    $wPt = 595.0;
+    $hPt = 842.0; // pdfinfo 缺失/不可解析时按 A4 兜底
+    $info = @shell_exec('pdfinfo ' . escapeshellarg($pdfPath) . ' 2>/dev/null');
+    if (is_string($info) && preg_match('/Page size:\s+([\d.]+)\s+x\s+([\d.]+)/', $info, $m)) {
+        $wPt = max(1.0, (float)$m[1]);
+        $hPt = max(1.0, (float)$m[2]);
+    }
+    $budget = netdisk_ocr_memory_budget();
+    $out = $req;
+    while ($out > 150) {
+        $pxW = $wPt / 72.0 * $out;
+        $pxH = $hPt / 72.0 * $out;
+        if ($pxW * $pxH * 4 <= $budget) {
+            break;
+        }
+        $out -= 50;
+    }
+    $out = max(150, $out);
+    if ($out !== $req) {
+        @error_log('[nd-ocr] pdf page dpi clamped ' . $req . '->' . $out . ' (' . basename($pdfPath) . ')');
+    }
+    return $out;
+}
+
+// 0019: 统一的 pdftoppm 栅格化入口：DPI 源头夹取 + 超时保护 + 超时删除半截产物。
+// 超时（旧实现直接 glob 半截 PNG 送 sidecar，触发 libpng "PNG input buffer is incomplete"
+// → serving 500）后本轮所有页 PNG 一律删除并返回 false，绝不把半截文件喂给下游。
+// $timeoutSec<=0 时按页数自适应：max(NETDISK_OCR_CMD_TIMEOUT, 页数×2s)（整本大 PDF 60s 不够）。
+function netdisk_ocr_pdf_render(string $ppm, string $pdfPath, string $outPrefix, int $dpi, string $pageOpt = '', int $timeoutSec = 0): bool {
+    $dpi = netdisk_ocr_pdf_clamp_dpi($pdfPath, $dpi);
+    $timeout = $timeoutSec;
+    if ($timeout <= 0) {
+        $timeout = NETDISK_OCR_CMD_TIMEOUT;
+        $info = @shell_exec('pdfinfo ' . escapeshellarg($pdfPath) . ' 2>/dev/null');
+        if (is_string($info) && preg_match('/Pages:\s+(\d+)/', $info, $m)) {
+            $timeout = max(NETDISK_OCR_CMD_TIMEOUT, ((int)$m[1]) * 2);
+        }
+    }
+    $ok = netdisk_run_cmd_timeout(escapeshellarg($ppm) . $pageOpt . ' -r ' . (int)$dpi . ' -png ' . escapeshellarg($pdfPath) . ' ' . escapeshellarg($outPrefix) . ' 2>/dev/null', $timeout);
+    if (!$ok) {
+        foreach (glob($outPrefix . '-*.png') ?: [] as $part) {
+            @unlink($part);
+        }
+    }
+    return $ok;
+}
+
+// 将图片缩放(长边≤阈值)并返回 base64：PDF 页 200DPI 大图(1654×2339)直接传 serving 会触发
+// onnxruntime 内存峰值崩溃，缩放后体积/边长下降，识别精度几乎不损。
+function netdisk_ocr_image_resize_b64(string $imgPath, int $maxSide = 960, int $quality = 85): string {
+    // 0019: 解码前预算守卫——先算"整幅真彩解码需要多少字节"，超预算直接拒绝并记 invalid。
+    // 旧实现在"超预算先降采样"分支里先整幅 imagecreatefromstring（巨图 ≈470MB 解码需求），
+    // 恰好在防 OOM 的保护代码处触发 Allowed memory exhausted，worker 三连崩。
+    $budget = netdisk_ocr_memory_budget();
+    $fsize = (int)@filesize($imgPath);
+    if ($fsize > $budget) {
+        netdisk_ocr_invalid_mark($imgPath, 'file too large: ' . round($fsize / 1048576, 1) . 'MB (budget ' . round($budget / 1048576, 1) . 'MB)');
+        return '';
+    }
+    $imgSz = @getimagesize($imgPath);
+    $sw = $imgSz ? (int)$imgSz[0] : 0;
+    $sh = $imgSz ? (int)$imgSz[1] : 0;
+    if ($sw > 0 && $sh > 0 && ($sw * $sh * 4) > $budget) {
+        netdisk_ocr_invalid_mark($imgPath, 'image too large: ' . $sw . 'x' . $sh . ' (~' . round($sw * $sh * 4 / 1048576) . 'MB needed, budget ' . round($budget / 1048576, 1) . 'MB)');
+        return '';
+    }
+    if (function_exists('imagecreatefromstring')) {
+        $decoded = @file_get_contents($imgPath);
+        if (!is_string($decoded) || $decoded === '') {
+            return '';
+        }
+        $src = @imagecreatefromstring($decoded);
+        unset($decoded); // 0019: 解码后立即释放原始字节，降低峰值
+        if ($src !== false) {
+            $w = imagesx($src);
+            $h = imagesy($src);
+            $scale = 1.0;
+            if ($w > $maxSide || $h > $maxSide) {
+                $scale = $w >= $h ? ($maxSide / $w) : ($maxSide / $h);
+            }
+            $nw = (int)max(1, round($w * $scale));
+            $nh = (int)max(1, round($h * $scale));
+            $dst = imagecreatetruecolor($nw, $nh);
+            imagecopyresampled($dst, $src, 0, 0, 0, 0, $nw, $nh, $w, $h);
+            ob_start();
+            imagejpeg($dst, null, $quality);
+            $jpg = (string)ob_get_clean();
+            imagedestroy($dst);
+            imagedestroy($src);
+            if ($jpg !== '') {
+                return base64_encode($jpg);
+            }
+        }
+    }
+    // GD 不可用/处理失败时退回原文件
+    return base64_encode((string)@file_get_contents($imgPath));
+}
+
+// 调用 PaddleOCR 官方 serving 识别一张图片（base64 传 /ocr，fileType=1）。
+// 返回 ['text'=>, 'avg_conf'=>, 'low_conf_pct'=>, 'n'=>]；失败返回 null。
+function netdisk_ocr_sidecar_recognize(string $imgPath, int $dpi = 0): ?array {
+    if (!function_exists('curl_init')) {
+        return null;
+    }
+    $b64 = '';
+    if (preg_match('#^data:[a-zA-Z0-9/\-+.]+;base64,#', $imgPath, $m)) {
+        $b64 = substr($imgPath, strlen($m[0]));
+    } elseif (is_file($imgPath)) {
+        $b64 = netdisk_ocr_image_resize_b64($imgPath);
+    } else {
+        return null;
+    }
+    if ($b64 === '') {
+        // 0019: 入参为空（预算守卫拒绝解码/文件不可读）→ 绝不把空串发给 sidecar；
+        // 记录原因供调用方状态行归因 invalid（HTTP/解析逻辑不动）
+        if (is_file($imgPath) && netdisk_ocr_invalid_reason($imgPath) === '') {
+            netdisk_ocr_invalid_mark($imgPath, 'empty image payload (unreadable or zero-length)');
+        }
+        return null;
+    }
+    $payload = json_encode(['file' => $b64, 'fileType' => 1], JSON_UNESCAPED_UNICODE);
+    // 0020: sidecar 5xx 与 curl 超时/连接失败自动重试 1 次（间隔 2s，桩测经 GLOBALS 缩短）；
+    // 4xx、空 body、JSON 解析失败不重试（客户端/协议侧问题，重试无益）。
+    // 任何异常一律就地捕获 → 记 last_error 并 return null，绝不外泄到池循环/逐文件 finalize。
+    // 请求构造（curl_setopt_array 各项）保持原样，只改响应处理。
+    $raw = false;
+    $err = '';
+    $httpCode = 0;
+    try {
+        for ($attempt = 0; $attempt < 2; $attempt++) {
+            if ($attempt > 0) {
+                usleep((int)($GLOBALS['ND_OCR_SIDECAR_RETRY_DELAY_US'] ?? 2000000));
+            }
+            $ch = curl_init(netdisk_ocr_sidecar_base() . '/ocr');
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_POST => true,
+                CURLOPT_POSTFIELDS => $payload,
+                // 显式禁用 Expect: 100-continue：PHP curl 对大 body 默认发 100-continue，
+                // 与 uvicorn/FastAPI 处理大 base64 时握手异常，导致 Empty reply from server。
+                CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Expect:'],
+                CURLOPT_CONNECTTIMEOUT => 5,
+                CURLOPT_TIMEOUT => 300,
+                CURLOPT_LOW_SPEED_LIMIT => 1,
+                CURLOPT_LOW_SPEED_TIME => 120,
+            ]);
+            $raw = @curl_exec($ch);
+            $err = curl_error($ch);
+            $httpCode = (int)@curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+            // 传输层拿到响应且非 5xx → 结束重试（4xx 属客户端问题同样不重试）
+            if ($raw !== false && $httpCode > 0 && $httpCode < 500) {
+                break;
+            }
+        }
+    } catch (Throwable $e) {
+        netdisk_ocr_fail_mark($imgPath, 'sidecar exception: ' . netdisk_ocr_log_oneline($e->getMessage(), 200));
+        return null;
+    }
+    if ($raw === false) {
+        // curl 超时/连接失败（含重试后仍失败）
+        netdisk_ocr_fail_mark($imgPath, 'sidecar transport error: ' . netdisk_ocr_log_oneline($err !== '' ? $err : 'curl exec failed (timeout or connection refused)', 200));
+        return null;
+    }
+    if ($httpCode >= 400) {
+        // 4xx/5xx 最终失败：状态码 + body 摘要（单行化截断，防日志注入）
+        netdisk_ocr_fail_mark($imgPath, 'sidecar HTTP ' . $httpCode . ': ' . netdisk_ocr_log_oneline((string)$raw, 200));
+        return null;
+    }
+    if ($raw === '') {
+        netdisk_ocr_fail_mark($imgPath, 'sidecar HTTP ' . $httpCode . ': (empty body)');
+        return null;
+    }
+    $j = json_decode($raw, true);
+    if (!is_array($j) || (int)($j['errorCode'] ?? 0) !== 0) {
+        // JSON 解析失败 / 业务错误码非 0：不重试（循环已保证 2xx 才会走到这里）
+        netdisk_ocr_fail_mark($imgPath, 'sidecar HTTP ' . $httpCode . ': ' . netdisk_ocr_log_oneline((string)$raw, 200));
+        return null;
+    }
+    // 官方 serving 响应：result.ocrResults[i].prunedResult.{rec_texts[], rec_scores[]}
+    $recs = [];
+    $scores = [];
+    $ors = $j['result']['ocrResults'] ?? [];
+    foreach ((array)$ors as $or) {
+        $pr = $or['prunedResult'] ?? $or;
+        $rt = $pr['rec_texts'] ?? [];
+        $rs = $pr['rec_scores'] ?? [];
+        foreach ((array)$rt as $t) {
+            $recs[] = (string)$t;
+        }
+        foreach ((array)$rs as $s) {
+            if (is_numeric($s)) {
+                $scores[] = (float)$s * 100.0; // 官方 0~1，统一为 0~100
+            }
+        }
+    }
+    $text = implode(' ', $recs);
+    $n = count($scores);
+    if ($n === 0) {
+        return ['text' => trim($text), 'avg_conf' => 0.0, 'low_conf_pct' => 0.0, 'n' => 0];
+    }
+    $sum = 0.0;
+    $low = 0;
+    foreach ($scores as $s) {
+        $sum += $s;
+        if ($s < 60.0) {
+            $low++;
+        }
+    }
+    return [
+        'text' => trim($text),
+        'avg_conf' => round($sum / $n, 1),
+        'low_conf_pct' => round($low * 100 / $n, 1),
+        'n' => $n,
+    ];
+}
+
+// 将一张任意路径图片复制进共享 volume，返回 sidecar 视角的容器内路径；失败返回 null。
+function netdisk_ocr_sidecar_stage(string $srcImg): ?string {
+    $work = NETDISK_OCR_SIDECAR_WORKDIR;
+    if (!is_dir($work) || !is_writable($work)) {
+        return null;
+    }
+    $name = 'nd_' . bin2hex(random_bytes(6)) . '.png';
+    $dst = rtrim($work, '/') . '/' . $name;
+    if (!@copy($srcImg, $dst)) {
+        return null;
+    }
+    return $dst;
+}
+
+// 将任意路径文件复制进共享 volume（供 /ocr/pdf 整本识别），返回容器内路径；失败 null。
+function netdisk_ocr_sidecar_stage_file(string $srcFile): ?string {
+    $work = NETDISK_OCR_SIDECAR_WORKDIR;
+    if (!is_dir($work) || !is_writable($work)) {
+        return null;
+    }
+    $ext = strtolower(pathinfo($srcFile, PATHINFO_EXTENSION));
+    $ext = $ext === '' ? 'bin' : $ext;
+    $name = 'nd_' . bin2hex(random_bytes(6)) . '.' . $ext;
+    $dst = rtrim($work, '/') . '/' . $name;
+    if (!@copy($srcFile, $dst)) {
+        return null;
+    }
+    return $dst;
+}
+
+// 统一"单张图片 → 识别文本+置信度"入口：优先 PaddleOCR serving，回退 tesseract TSV。
+// 返回 ['text'=>, 'avg'=>, 'low_pct'=>, 'n'=>]（与 tesseract 口径统一，置信度 0-100）。
+function netdisk_ocr_recognize_image(string $imgPath, int $dpi = 0): ?array {
+    // 1) 官方 serving 优先（base64 POST /ocr，fileType=1）
+    if (netdisk_ocr_sidecar_enabled() && netdisk_ocr_sidecar_available()) {
+        $res = netdisk_ocr_sidecar_recognize($imgPath, $dpi);
+        if ($res !== null) {
+            return [
+                'text' => $res['text'],
+                'avg' => $res['avg_conf'],
+                'low_pct' => $res['low_conf_pct'],
+                'n' => $res['n'],
+            ];
+        }
+    }
+    // 2) tesseract fallback
+    $tess = trim((string)shell_exec('command -v tesseract 2>/dev/null'));
+    if ($tess === '') {
+        return null;
+    }
+    $outTxt = tempnam(sys_get_temp_dir(), 'ndor_');
+    $cmd = escapeshellarg($tess) . ' ' . escapeshellarg($imgPath) . ' ' . escapeshellarg($outTxt) . ' -l chi_sim+eng -c tessedit_create_txt=1 -c tessedit_create_tsv=1 2>/dev/null';
+    @shell_exec($cmd);
+    $text = '';
+    $tsv = '';
+    if ($outTxt !== false && is_file($outTxt . '.txt')) {
+        $text = (string)@file_get_contents($outTxt . '.txt');
+        @unlink($outTxt . '.txt');
+    }
+    if ($outTxt !== false && is_file($outTxt . '.tsv')) {
+        $tsv = (string)@file_get_contents($outTxt . '.tsv');
+        @unlink($outTxt . '.tsv');
+    }
+    @unlink($outTxt);
+    $stats = netdisk_ocr_tsv_parse($tsv);
+    return [
+        'text' => $text,
+        'avg' => $stats['avg'],
+        'low_pct' => $stats['low_pct'],
+        'n' => $stats['n'],
+    ];
+}
+
+// 统一"整本 PDF → 识别文本+置信度"入口：优先 PaddleOCR serving（PHP 侧 pdftoppm 逐页转图，
+// 每页 base64 POST /ocr），回退 pdftoppm+tesseract。
+// $f/$l：页范围（1-based；l<=0 表示到末页）。返回 ['text'=>, 'avg'=>, 'low_pct'=>, 'n'=>, 'pages'=>]；失败返回 null。
+function netdisk_ocr_recognize_pdf(string $pdfPath, int $dpi = 300, int $f = 1, int $l = 0): ?array {
+    $ppm = trim((string)shell_exec('command -v pdftoppm 2>/dev/null'));
+    if ($ppm === '') {
+        return null;
+    }
+    $tmpPdf = $pdfPath . '.scan.pdf';
+    if (!is_file($tmpPdf)) {
+        @copy($pdfPath, $tmpPdf);
+    }
+    $pageOpt = ($f > 1 || $l > 0) ? (' -f ' . max(1, (int)$f) . ' -l ' . (($l > 0) ? (int)$l : 9999)) : '';
+    // 0019: DPI 源头夹取 + 超时删半截产物；超时返回 false 时 glob 必为空（旧实现会把半截 PNG 送 sidecar）
+    $renderOk = netdisk_ocr_pdf_render($ppm, $tmpPdf, $tmpPdf . '_pg', $dpi, $pageOpt);
+    $pages = $renderOk ? (glob($tmpPdf . '_pg-*.png') ?: []) : [];
+    @unlink($tmpPdf);
+    // 0019: 页级进度（成功识别页数）按原始路径记入 GLOBALS，供状态行 pages_done 落库（0021 定档/断点观测）
+    $pagesDone = 0;
+    $sidecarActive = netdisk_ocr_sidecar_enabled() && netdisk_ocr_sidecar_available();
+    $text = '';
+    $tsvAll = '';
+    $avgAcc = 0.0;
+    $lowAcc = 0;
+    $nAcc = 0;
+    foreach ($pages as $pg) {
+        if ($sidecarActive) {
+            // 官方 serving 每页 base64；页间短暂间隔避免连续大图导致 onnxruntime 内存峰值崩溃。
+            // 0021: 页级外层重试收敛为单层——sidecar_recognize 内部已对 5xx/超时/连接失败
+            // 重试 1 次并记 fail 原因，外层再叠一次会放大到单页最多 4 次 /ocr 请求；
+            // sidecar 挂死（接受连接但不响应，非拒连）时单页最坏 4×300s≈20 分钟，
+            // 20 页 PDF 可拖到 6 小时。仅当内层未记 fail 原因（空入参守卫等非服务端
+            // 失败，函数内层重试帮不上、外层隔 300ms 再试仍可能有效）才保留外层重试。
+            $res = netdisk_ocr_sidecar_recognize($pg, $dpi);
+            if ($res === null && netdisk_ocr_fail_reason($pg) === '') {
+                usleep(300000); // 300ms 后重试一次（仅内层无 fail 记录时）
+                $res = netdisk_ocr_sidecar_recognize($pg, $dpi);
+            }
+            if ($res !== null) {
+                $pagesDone++;
+                $text .= ' ' . $res['text'];
+                $nAcc += $res['n'];
+                $avgAcc += $res['avg_conf'] * $res['n'];
+                $lowAcc += round($res['low_conf_pct'] / 100 * $res['n']);
+                @unlink($pg);
+                usleep(150000); // 页间 150ms 喘息
+                continue;
+            }
+            // 0020: 本页 sidecar 两次均失败 → 失败原因上移到原始 PDF 路径
+            //（页 PNG 随即删除，状态行 last_error 按 tmp/pdf 路径读取）
+            $pgFail = netdisk_ocr_fail_reason($pg);
+            if ($pgFail !== '') {
+                netdisk_ocr_fail_mark($pdfPath, $pgFail);
+            }
+        }
+        // tesseract fallback：TSV 每页
+        $pageText = ''; // 0020: 本页文本（增量计数用，不再拿累计 $text 判空）
+        $tess = trim((string)shell_exec('command -v tesseract 2>/dev/null'));
+        if ($tess !== '') {
+            $outTxt = tempnam(sys_get_temp_dir(), 'ndor_');
+            $cmd = escapeshellarg($tess) . ' ' . escapeshellarg($pg) . ' ' . escapeshellarg($outTxt) . ' -l chi_sim+eng -c tessedit_create_txt=1 -c tessedit_create_tsv=1 2>/dev/null';
+            @shell_exec($cmd);
+            if ($outTxt !== false && is_file($outTxt . '.txt')) {
+                $pageText = (string)@file_get_contents($outTxt . '.txt');
+                $text .= ' ' . $pageText;
+                @unlink($outTxt . '.txt');
+            }
+            if ($outTxt !== false && is_file($outTxt . '.tsv')) {
+                $tsvAll .= "\n" . (string)@file_get_contents($outTxt . '.tsv');
+                @unlink($outTxt . '.tsv');
+            }
+            @unlink($outTxt);
+        }
+        // 0020: 本页增量计数——仅本页文本非空才 +1。旧实现拿累计 $text 判空：
+        // 首个非空页之后所有空页也会被计入，pages_done 虚高。
+        if (trim($pageText) !== '') {
+            $pagesDone++;
+        }
+        @unlink($pg);
+    }
+    if (!isset($GLOBALS['ND_OCR_PAGES_DONE']) || !is_array($GLOBALS['ND_OCR_PAGES_DONE'])) {
+        $GLOBALS['ND_OCR_PAGES_DONE'] = [];
+    }
+    $GLOBALS['ND_OCR_PAGES_DONE'][$pdfPath] = max((int)($GLOBALS['ND_OCR_PAGES_DONE'][$pdfPath] ?? 0), $pagesDone);
+    if ($sidecarActive && $nAcc > 0) {
+        $stats = netdisk_ocr_tsv_parse($tsvAll); // 仅占位（空）；用 sidecar 聚合统计
+        return [
+            'text' => trim($text),
+            'avg' => round($avgAcc / $nAcc, 1),
+            'low_pct' => round($lowAcc * 100 / $nAcc, 1),
+            'n' => $nAcc,
+            'pages' => count($pages),
+            'pages_done' => $pagesDone,
+        ];
+    }
+    $stats = netdisk_ocr_tsv_parse($tsvAll);
+    return [
+        'text' => trim($text),
+        'avg' => $stats['avg'],
+        'low_pct' => $stats['low_pct'],
+        'n' => $stats['n'],
+        'pages' => count($pages),
+        'pages_done' => $pagesDone,
+    ];
+}
+
+// sidecar /ocr/pdf 调用
+// OCR 文本规范化：合并空白；去除 CJK/全角字符之间的空格（tesseract 对扫描中文常在字间插入空格，
+// 导致 LIKE 检索匹配不到）。保留英文单词间的空格（如 "GJB 150.11A"、数字型号）。
+function netdisk_normalize_ocr_text(string $t): string {
+    $t = preg_replace('/\s+/u', ' ', $t);
+    $t = preg_replace('/([\x{4e00}-\x{9fff}\x{3000}-\x{303f}\x{ff00}-\x{ffef}])\s+(?=[\x{4e00}-\x{9fff}\x{3000}-\x{303f}\x{ff00}-\x{ffef}])/u', '$1', $t);
+    return trim($t);
+}
+
+// OCR 形近错字容错匹配：在 $text 中查找与 $q 相近（编辑距离 ≤ 阈值）的所有位置。
+// tesseract 对扫描件的中文常整体替换错字（如"退刀槽"→"退刀模/退刀枝/退刀槐"），
+// 也可能漏字（"退刀槽"→"退刀"）或多字（"退刀槽的"→"退刀摸的X"）。
+// 此处使用 Levenshtein 编辑距离（支持替换/插入/删除），比纯逐字符差异（Hamming，仅替换）
+// 更通用；阈值按"每 3 个字符允许 1 次编辑"自动计算，Windows/CLI 均有 mb 字符级支持。
+function netdisk_ocr_fuzzy_positions(string $text, string $q, int $maxEdits = 0): array {
+    $qLen = mb_strlen($q);
+    if ($qLen < 2 || $qLen > 12) {
+        return [];
+    }
+    $chars = preg_split('//u', $text, -1, PREG_SPLIT_NO_EMPTY);
+    $query = preg_split('//u', $q, -1, PREG_SPLIT_NO_EMPTY);
+    $n = count($chars);
+    if ($n < $qLen - 1) {
+        return [];
+    }
+    // 默认编辑次数：每 3 字允许 1 次编辑（2 字至少允许 1），最多 3 次
+    $maxEdits = $maxEdits > 0 ? $maxEdits : (int)max(1, min(3, (int)ceil($qLen / 3)));
+    $res = [];
+    // 滑动窗口：窗口长度允许 qLen±maxEdits（覆盖插删），用 Levenshtein 计算编辑距离
+    $winBase = max(1, $qLen - 1);
+    $winMax = $qLen + 2 <= 40 ? $qLen + 2 : $qLen + $maxEdits;
+    $prev = [];
+    $stripPunct = function (string $c): bool {
+        // 忽略中英文标点/空白对距离的影响（OCR 易在字间插入标点或空格）
+        return (bool)preg_match('/[\x{3000}-\x{303f}\x{ff00}-\x{ffef}\x{2000}-\x{206f}\s,.;:!?，。；：！？、()（）\/\\-]/u', $c);
+    };
+    for ($winLen = $winBase; $winLen <= $winMax; $winLen++) {
+        for ($i = 0; $i + $winLen <= $n; $i++) {
+            // 跳过已覆盖区域（近似去重：若起始位置已被更短窗口命中则不再重复）
+            $startIn = $i;
+            $skip = false;
+            foreach ($res as $rp) {
+                if ($rp === $startIn) {
+                    $skip = true;
+                    break;
+                }
+            }
+            if ($skip) {
+                continue;
+            }
+            $window = array_slice($chars, $i, $winLen);
+            // 快速剪枝：若窗口与 query 共有字符太少则直接跳过（避免大量全量 DP）
+            $common = 0;
+            foreach ($query as $qc) {
+                if (in_array($qc, $window, true)) {
+                    $common++;
+                }
+            }
+            if ((int)$common < max(1, $qLen - $maxEdits)) {
+                continue;
+            }
+            // Levenshtein（字符级，忽略标点空格差异按相等处理）
+            $dp = array_fill(0, $winLen + 1, 0);
+            for ($j = 0; $j <= $winLen; $j++) {
+                $dp[$j] = $j;
+            }
+            for ($r = 1; $r <= count($query); $r++) {
+                $prevRow = $dp;
+                $dp[0] = $r;
+                for ($j = 1; $j <= $winLen; $j++) {
+                    $cost = ($query[$r - 1] === $window[$j - 1] || ($stripPunct($query[$r - 1]) && $stripPunct($window[$j - 1]))) ? 0 : 1;
+                    $dp[$j] = min($prevRow[$j] + 1, $dp[$j - 1] + 1, $prevRow[$j - 1] + $cost);
+                }
+            }
+            if ($dp[$winLen] <= $maxEdits) {
+                $res[] = $i;
+                if (count($res) >= 60) {
+                    return $res;
+                }
+            }
+        }
+    }
+    // 排序去重（滑动可能产生相邻重叠，保留起始位置即可）
+    $res = array_values(array_unique($res));
+    sort($res);
+    return $res;
+}
+
+// OCR 形近错字容错检索：对 $text 中所有与 $q 相近的位置生成 snippet（与精确检索同构），
+// 用于 contentHits 在精确命中不足时补充召回。返回 ['uri'=>, 'snippets'=>...] 追加进 contentHits 的逻辑由调用方处理。
+function netdisk_ocr_fuzzy_snippets(string $text, string $q, int $limit = 8): array {
+    $positions = netdisk_ocr_fuzzy_positions($text, $q);
+    $qLen = mb_strlen($q);
+    $textLen = mb_strlen($text);
+    $snippets = [];
+    // 相邻窗口归并：滑动窗口会在同一处产生多个接近的起始偏移（如 55/56、150/151/152），
+    // 若两处 offset 相差 <qLen 视为同一处命中，只保留最先一个，避免 snippet 重复。
+    $merged = [];
+    foreach ($positions as $pos) {
+        if ($merged === [] || $pos - end($merged) >= $qLen) {
+            $merged[] = $pos;
+        }
+    }
+    foreach (array_slice($merged, 0, $limit) as $pos) {
+        $sStart = max(0, $pos - 30);
+        $sLen = min(120, $textLen - $sStart);
+        $snippets[] = [
+            'offset' => $pos,
+            'text' => '…' . mb_substr($text, $sStart, $sLen) . '…',
+            'fuzzy_terms' => [mb_substr($text, $pos, $qLen)],
+        ];
+    }
+    return $snippets;
+}
+
+// OCR 识别质量评估：返回 0~1 的有效中文比率。
+// 统计识别文本中的 CJK 字符数占"总可读字符（CJK+ASCII字母数字+常见标点）"的比例；
+// 乱码/噪声字符（孤立符号、畸形序列）不计数，用于判断是否值得升级 DPI 重试。
+function netdisk_ocr_quality(string $text): float {
+    $text = trim($text);
+    if ($text === '') {
+        return 0.0;
+    }
+    $cjk = preg_match_all('/[\x{4e00}-\x{9fff}]/u', $text);
+    $alnum = preg_match_all('/[A-Za-z0-9]/u', $text);
+    $punct = preg_match_all('/[\x{3000}-\x{303f}\x{ff00}-\x{ffef}\x{2000}-\x{206f},.。，、；：！？（）()\/\\-]/u', $text);
+    $readable = $cjk + $alnum + $punct;
+    $total = mb_strlen($text);
+    if ($total <= 0) {
+        return 0.0;
+    }
+    $ratio = $readable / $total;
+    // 中文为绝对主体的文档：可读率主要由 CJK 决定；英文/数字混合文档也计入 alnum。
+    return (float)max(0.0, min(1.0, $ratio));
+}
+
+function netdisk_ocr_index_quality_ok(?string $text, int $minChars = 20, float $minRatio = 0.6): bool {
+    $text = trim((string)$text);
+    if ($text === '') {
+        return false;
+    }
+    $cjk = preg_match_all('/[\x{4e00}-\x{9fff}]/u', $text);
+    $alnum = preg_match_all('/[A-Za-z0-9]/u', $text);
+    if ($cjk + $alnum < $minChars) {
+        return false;
+    }
+    return netdisk_ocr_quality($text) >= $minRatio;
+}
+
+// 从 tesseract TSV 输出解析 word 级识别文本与置信度统计。
+// 输入：多页 tesseract -c tessedit_create_tsv=1 生成的原始 TSV 文本（可跨页拼接）。
+// 返回 ['text'=>合并后的原始文本, 'avg'=>平均置信度0-100, 'low_pct'=>置信<60 的 word 占比(0-100), 'n'=>有效 word 数]。
+// word 级 confidence 反映"识别确定度"：低 DPI 错字识别不确定 → conf 低、低置信占比高，
+// 比"字符是否 CJK"更能区分错别字文本（错别字也是 CJK，纯占比判定会误判达标）。
+function netdisk_ocr_tsv_parse(string $tsv): array {
+    $text = '';
+    $sum = 0.0;
+    $n = 0;
+    $low = 0;
+    foreach (explode("\n", $tsv) as $line) {
+        $cols = explode("\t", $line);
+        // 结构：level page block par line word left top width height conf text
+        if (count($cols) < 12 || (int)$cols[0] !== 5) {
+            continue;
+        }
+        $conf = (float)$cols[10];
+        if ($conf < 0) {
+            continue;
+        }
+        $n++;
+        $sum += $conf;
+        if ($conf < 60) {
+            $low++;
+        }
+        $text .= ' ' . $cols[11];
+    }
+    if ($n === 0) {
+        return ['text' => trim($text), 'avg' => 0.0, 'low_pct' => 0.0, 'n' => 0];
+    }
+    return [
+        'text' => trim($text),
+        'avg' => round($sum / $n, 1),
+        'low_pct' => round($low * 100 / $n, 1),
+        'n' => $n,
+    ];
+}
+
+// confidence 版质量判定：返回 0~1 质量分。
+// avg<55 → 0（很差）；avg>=80 且低置信占比<=20% → 1（很好）；中间线性插值，低置信占比高时扣分。
+function netdisk_ocr_quality_conf(array $stats): float {
+    $avg = (float)($stats['avg'] ?? 0);
+    $lowPct = (float)($stats['low_pct'] ?? 100);
+    $n = (int)($stats['n'] ?? 0);
+    if ($n === 0 || $avg <= 0) {
+        return 0.0;
+    }
+    $score = ($avg - 55) / 25;          // avg 55→0.0, 80→1.0
+    $score -= $lowPct * 0.012;          // 低置信占比 20%→扣0.24, 40%→扣0.48
+    return (float)max(0.0, min(1.0, $score));
+}
+
+// 连接级索引配置值：configId>0 时优先取该连接的 index_* 列（非空），否则回退全局 settings。
+function netdisk_index_cfg_value(int $configId, string $cfgCol, string $settingKey, string $default, bool $refresh = false): string {
+    if ($configId > 0) {
+        try {
+            $cfg = netdisk_index_cfg_cached($configId, $refresh);
+            if ($cfg !== null) {
+                $v = (string)($cfg[$cfgCol] ?? '');
+                if ($v !== '' && $v !== null) {
+                    return $v;
+                }
+            }
+        } catch (Throwable $e) {
+            // fallthrough
+        }
+    }
+    // 已取消全局默认设置：未配置的连接级字段一律使用硬编码默认值
+    return $default;
+}
+
+// 连接配置行缓存（进程内，避免同函数内多次查库）
+// 0030: $refresh=true 跳过进程内静态缓存，供长驻 worker 中途重读连接配置
+// （worker 一轮只跑一次，旧实现缓存到进程死，运行中改配置永远读不到）
+function netdisk_index_cfg_cached(int $configId, bool $refresh = false): ?array {
+    static $cache = [];
+    if (!$refresh && isset($cache[$configId])) {
+        return $cache[$configId];
+    }
+    try {
+        $row = cloudreve_config_get($configId);
+        $cache[$configId] = $row;
+        return $row;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+// OCR 起点/上限 DPI 与质量阈值（可后台调整；configId>0 时按连接独立）
+function netdisk_index_ocr_dpi_start(?int $configId = 0): int {
+    $v = netdisk_index_cfg_value((int)$configId, 'index_ocr_dpi_start', 'netdisk_index_ocr_dpi_start', '200');
+    return max(50, (int)$v);
+}
+function netdisk_index_ocr_dpi_max(?int $configId = 0): int {
+    $v = netdisk_index_cfg_value((int)$configId, 'index_ocr_dpi_max', 'netdisk_index_ocr_dpi_max', '600');
+    return max(100, (int)$v);
+}
+function netdisk_index_ocr_quality_threshold(?int $configId = 0): float {
+    $v = (float)netdisk_index_cfg_value((int)$configId, 'index_ocr_quality_threshold', 'netdisk_index_ocr_quality_threshold', '0.3');
+    return max(0.0, min(1.0, $v));
+}
+
+// 自适应 DPI 重试：对 OCR 文本质量不足的文件，用更高 DPI 重新栅格化 + OCR。
+// 输入 $task = ['uri'=>, 'tmp'=>已落盘文件, 'ext'=>]；返回规范化后的识别文本（失败/无识别返回 ''）。
+// 注意：此函数用于图片与 PDF 的统一重试；PDF 通过 pdftoppm 按 DPI 栅格化，图片直接喂 tesseract
+// （低质量时可在重试阶段用 tesseract 的分辨率参数放缩，这里统一交给调用方决定 DPI 语义）。
+function netdisk_ocr_retry_upgrade(string $ext, string $tmpIn, int $dpi): string {
+    $ext = strtolower(ltrim($ext, '.'));
+    $tess = trim((string)shell_exec('command -v tesseract 2>/dev/null'));
+    if ($tess === '') {
+        return '';
+    }
+    $ppm = trim((string)shell_exec('command -v pdftoppm 2>/dev/null'));
+    $out = '';
+    $doOcr = function (string $imgFile) use ($tess, &$out) {
+        $outTxt = tempnam(sys_get_temp_dir(), 'ndor_');
+        $cmd = escapeshellarg($tess) . ' ' . escapeshellarg($imgFile) . ' ' . escapeshellarg($outTxt) . ' -l chi_sim+eng 2>/dev/null';
+        @shell_exec($cmd);
+        if ($outTxt !== false && is_file($outTxt . '.txt')) {
+            $out .= ' ' . (string)@file_get_contents($outTxt . '.txt');
+            @unlink($outTxt . '.txt');
+        }
+        @unlink($outTxt);
+    };
+    if ($ext === 'pdf') {
+        if ($ppm === '') {
+            return '';
+        }
+        // 0019: 统一渲染入口（夹 DPI + 超时删半截产物）
+        netdisk_ocr_pdf_render($ppm, $tmpIn, $tmpIn . '_pg' . $dpi, $dpi);
+        foreach (glob($tmpIn . '_pg' . $dpi . '-*.png') ?: [] as $png) {
+            $doOcr($png);
+            @unlink($png);
+        }
+    } else {
+        $doOcr($tmpIn);
+    }
+    return netdisk_normalize_ocr_text($out);
+}
+
+// 单文件 OCR（图片或扫描 PDF）。输入为已落盘的临时文件路径，返回识别文本。
+function netdisk_ocr_extract_file(string $ext, string $tmpIn): string {
+    $ext = strtolower(ltrim($ext, '.'));
+    $out = '';
+    $doOcr = function (string $imgFile) use (&$out) {
+        $res = netdisk_ocr_recognize_image($imgFile);
+        if ($res !== null && trim($res['text']) !== '') {
+            $out .= ' ' . $res['text'];
+        }
+    };
+    if ($ext === 'pdf') {
+        $res = netdisk_ocr_recognize_pdf($tmpIn, NETDISK_OCR_DPI, 1, 0);
+        if ($res !== null) {
+            return netdisk_normalize_ocr_text($res['text']);
+        }
+        // sidecar 不可用时回退 tesseract
+        $ppm = trim((string)shell_exec('command -v pdftoppm 2>/dev/null'));
+        if ($ppm === '') {
+            return '';
+        }
+        // 超时保护：防止 pdftoppm 对异常/超大 PDF 挂起；0019: 统一渲染入口（夹 DPI + 超时删半截产物）
+        netdisk_ocr_pdf_render($ppm, $tmpIn, $tmpIn . '_pg', NETDISK_OCR_DPI);
+        foreach (glob($tmpIn . '_pg-*.png') ?: [] as $png) {
+            $doOcr($png);
+            @unlink($png);
+        }
+    } else {
+        $doOcr($tmpIn);
+    }
+    return netdisk_normalize_ocr_text($out);
+}
+
+// 并发 OCR 进程池：同时最多运行 $concurrency 个 tesseract（图片 1 槽；扫描 PDF 先 pdftoppm
+// 逐页转 PNG，每页 1 槽）。输入为 ['uri'=>..., 'tmp'=>临时文件路径, 'ext'=>...]。
+// 采用惰性栅格化：每次只栅格化一个 PDF 并逐页消费，页 PNG 用完即删，避免 /tmp 累积。
+// PDF 首次仅栅格化前 5 页作质量样本（finalize 预判 DPI 后整本终扫）；原始 PDF 字节保留给 finalize。
+// $jobId>0 时上报页级进度与心跳（节流 ≥2s），并对单进程加超时（180s）防止挂死。
+// $jobPdo 可选：传入则复用该连接写 job 进度（与调用方共用单一连接，避免同进程多连接交叉写锁）。
+// 返回 ['results'=>uri=>text, 'done'=>int, 'texts'=>int, 'errors'=>int]。
+function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PDO $jobPdo = null): array {
+    $results = [];
+    $done = 0;
+    $texts = 0;
+    $errors = 0;
+    $lastHb = 0;
+    if (empty($jobs) || $concurrency < 1) {
+        return ['results' => $results, 'done' => 0, 'texts' => 0, 'errors' => 0];
+    }
+    // sidecar 优先：模型常驻、识别精度高。sidecar 自身串行，无需 PHP 侧并发；
+    // PDF 最终由 finalize 用 /ocr/pdf 整本重扫（更准），此处仅同步识别图片与 PDF 前 5 页样本。
+    if (netdisk_ocr_sidecar_enabled() && netdisk_ocr_sidecar_available()) {
+        $ocrPoolCfgId = 0;
+        foreach ($jobs as $jj) {
+            if (isset($jj['config_id'])) {
+                $ocrPoolCfgId = (int)$jj['config_id'];
+                break;
+            }
+        }
+        $dpiStart = netdisk_index_ocr_dpi_start($ocrPoolCfgId);
+        $poolOff = false; // 0030: 运行中被关掉 OCR
+        foreach ($jobs as $j) {
+            // 0030: 每个文件前重读开关（$refresh=true 穿透进程内配置缓存）；关掉即停手，剩余 tmp 由调用方清理
+            if (netdisk_index_ocr_enabled($ocrPoolCfgId, true) === false) {
+                $poolOff = true;
+                break;
+            }
+            if ($jobId > 0 && netdisk_index_job_cancelled($jobId, $jobPdo)) {
+                foreach ($jobs as $jj) {
+                    if (isset($jj['tmp']) && is_file($jj['tmp'])) {
+                        @unlink($jj['tmp']);
+                    }
+                }
+                break;
+            }
+            $uri = (string)($j['uri'] ?? '');
+            $ext = strtolower(ltrim((string)($j['ext'] ?? ''), '.'));
+            $tmp = (string)($j['tmp'] ?? '');
+            if ($tmp === '' || !is_file($tmp)) {
+                $errors++;
+                continue;
+            }
+            if ($jobId > 0 && ($nowHb = time()) - $lastHb >= 2) {
+                $lastHb = $nowHb;
+                netdisk_index_job_update($jobId, [
+                    'current_uri' => $uri,
+                    'current_name' => (string)($j['name'] ?? ''),
+                    'current_detail' => 'OCR 处理中',
+                    'queue_remaining' => max(0, count($jobs) - (int)array_search($j, $jobs, true) - 1),
+                    'heartbeat_at' => $nowHb,
+                ], $jobPdo);
+            }
+            if ($ext === 'pdf') {
+                // 前 5 页样本识别（finalize 会整本重扫，这里只保证 finalize 有初始 quality 依据）
+                $res = netdisk_ocr_recognize_pdf($tmp, $dpiStart, 1, 5);
+                // PDF：保留原始 tmp 给 finalize 做整本重扫（OCR 全部页），不删除
+            } else {
+                $res = netdisk_ocr_recognize_image($tmp, $dpiStart);
+                @unlink($tmp);
+            }
+            $done++;
+            if ($res !== null && trim($res['text']) !== '') {
+                $results[$uri] = trim(preg_replace('/\s+/u', ' ', $res['text']));
+                $texts++;
+            } else {
+                $errors++;
+            }
+        }
+        return ['results' => $results, 'done' => $done, 'texts' => $texts, 'errors' => $errors, 'ocr_off' => $poolOff];
+    }
+    $tess = trim((string)shell_exec('command -v tesseract 2>/dev/null'));
+    if ($tess === '') {
+        return ['results' => $results, 'done' => count($jobs), 'texts' => 0, 'errors' => count($jobs)];
+    }
+    $ppm = trim((string)shell_exec('command -v pdftoppm 2>/dev/null'));
+    // 自适应 DPI：起点、上限、质量阈值（每次调用读取配置，默认 100/600/0.3）。
+    // configId 取自任务数组（同池任务归属同一连接；无则全局默认）。
+    $ocrPoolCfgId = 0;
+    foreach ($jobs as $jj) {
+        if (isset($jj['config_id'])) {
+            $ocrPoolCfgId = (int)$jj['config_id'];
+            break;
+        }
+    }
+    $dpiStart = netdisk_index_ocr_dpi_start($ocrPoolCfgId);
+    $dpiMax = netdisk_index_ocr_dpi_max($ocrPoolCfgId);
+    $qualityThreshold = netdisk_index_ocr_quality_threshold($ocrPoolCfgId);
+    // 每次调用固定用起点 DPI 栅格化（惰性逐页）；池结束后由 netdisk_ocr_finalize_results
+    // 做质量评估 + 自适应升级重试 + 文本规范化。
+    $curDpi = $dpiStart;
+    $poolOff = false; // 0030: 运行中被关掉 OCR（已起跑的 tesseract 自然收尾，不再取新文件）
+
+    $jobIdx = 0;
+    $totalJobs = count($jobs);
+    $activePages = null; // ['uri'=>, 'pages'=>[png,...], 'pi'=>int] 当前正在消费页的 PDF
+    $toClean = [];       // 每个 job 结束清理：图片 tmp / PDF 副本
+
+    // 取下一个待 tesseract 的输入文件；返回 null 表示没有更多
+    $lastOffChk = 0.0; // 0030: 页内重读开关的节流时间戳（每页查一次库太重，≥1s 才复查一次）
+    $nextInput = function () use (&$jobIdx, &$totalJobs, $jobs, $ppm, &$activePages, &$errors, &$toClean, &$curDpi, &$poolOff, $ocrPoolCfgId, &$results, &$lastOffChk) {
+        // 0030: 页内循环也要能停——大 PDF 一本几百页，只在换文件时检查等于关不掉。
+        // 已关则丢弃该文件已出的半截页结果（绝不写半本正文），页 PNG 一并清理。
+        if (microtime(true) - $lastOffChk >= 1.0) {
+            $lastOffChk = microtime(true);
+            if (netdisk_index_ocr_enabled($ocrPoolCfgId, true) === false) {
+                if ($activePages !== null) {
+                    foreach ($activePages['pages'] as $pg) {
+                        @unlink($pg);
+                    }
+                    unset($results[$activePages['uri']]);
+                    $activePages = null;
+                }
+                $poolOff = true;
+                return null;
+            }
+        }
+        if ($activePages !== null && $activePages['pi'] < count($activePages['pages'])) {
+            $pg = $activePages['pages'][$activePages['pi']];
+            $activePages['pi']++;
+            return ['uri' => $activePages['uri'], 'file' => $pg, 'temp' => false];
+        }
+        // 当前 PDF 页耗尽，删除其页 PNG
+        if ($activePages !== null) {
+            foreach ($activePages['pages'] as $pg) {
+                @unlink($pg);
+            }
+            $activePages = null;
+        }
+        while ($jobIdx < $totalJobs) {
+            // 0030: 每个新文件前重读开关；关掉即不再取新文件
+            if (netdisk_index_ocr_enabled($ocrPoolCfgId, true) === false) {
+                $poolOff = true;
+                break;
+            }
+            $j = $jobs[$jobIdx++];
+            $uri = (string)($j['uri'] ?? '');
+            $ext = strtolower(ltrim((string)($j['ext'] ?? ''), '.'));
+            $tmp = (string)($j['tmp'] ?? '');
+            if ($tmp === '' || !is_file($tmp)) {
+                $errors++;
+                continue;
+            }
+            if ($ext === 'pdf') {
+                if ($ppm === '') {
+                    $errors++;
+                    $toClean[] = $tmp;
+                    continue;
+                }
+                $tmpPdf = $tmp . '.pdf';
+                if (!is_file($tmpPdf)) {
+                    @copy($tmp, $tmpPdf);
+                }
+                // 首次仅栅格化前 5 页作质量样本（页数不足自动截断）；最终 DPI 由 finalize 预判后整本重扫
+                // 0019: 统一渲染入口（夹 DPI + 超时删半截产物）
+                netdisk_ocr_pdf_render($ppm, $tmpPdf, $tmpPdf . '_pg', $curDpi, ' -f 1 -l 5');
+                $pages = glob($tmpPdf . '_pg-*.png') ?: [];
+                // 只删栅格化副本；原始 PDF 字节保留（$toClean），供 finalize 用最终 DPI 整本重扫
+                @unlink($tmpPdf);
+                if (empty($pages)) {
+                    $errors++;
+                    $toClean[] = $tmp;
+                    continue;
+                }
+                $toClean[] = $tmp;
+                $activePages = ['uri' => $uri, 'pages' => $pages, 'pi' => 1];
+                return ['uri' => $uri, 'file' => $pages[0], 'temp' => false];
+            }
+            $toClean[] = $tmp;
+            return ['uri' => $uri, 'file' => $tmp, 'temp' => true];
+        }
+        return null;
+    };
+
+    $running = []; // ['proc'=>resource, 'uri'=>, 'outTxt'=>, 'file'=>, 'temp'=>bool, 'started'=>int]
+    while (true) {
+        // 填满并发槽
+        while (count($running) < $concurrency) {
+            $next = $nextInput();
+            if ($next === null) {
+                break;
+            }
+            $outTxt = tempnam(sys_get_temp_dir(), 'ndor_');
+            if ($outTxt === false) {
+                $errors++;
+                continue;
+            }
+            $cmd = escapeshellarg($tess) . ' ' . escapeshellarg($next['file']) . ' ' . escapeshellarg($outTxt) . ' -l chi_sim+eng 2>/dev/null';
+            $proc = proc_open($cmd, [
+                0 => ['file', '/dev/null', 'r'],
+                1 => ['file', '/dev/null', 'w'],
+                2 => ['file', '/dev/null', 'w'],
+            ], $pipes);
+            if (!is_resource($proc)) {
+                $errors++;
+                @unlink($outTxt);
+                continue;
+            }
+            $running[] = ['proc' => $proc, 'uri' => $next['uri'], 'outTxt' => $outTxt, 'file' => $next['file'], 'temp' => $next['temp'], 'started' => time()];
+        }
+        if (count($running) === 0) {
+            break;
+        }
+        usleep(200000);
+        $nowT = time();
+        // 心跳 + 页级进度上报（节流 ≥2s）
+        if ($jobId > 0 && ($nowT - $lastHb) >= 2) {
+            $lastHb = $nowT;
+            $detail = 'OCR 处理中';
+            $ocrTotal = 0;
+            $ocrDoneCount = 0;
+            $curUri = '';
+            $curName = '';
+            if ($activePages !== null) {
+                $curUri = (string)$activePages['uri'];
+                $ocrTotal = count($activePages['pages']);
+                $ocrDoneCount = $activePages['pi'] - 1;
+                $detail = 'OCR 第 ' . max(1, $activePages['pi']) . '/' . $ocrTotal . ' 页';
+            } elseif (!empty($running)) {
+                $curUri = (string)$running[0]['uri'];
+                $detail = 'OCR 处理中';
+            }
+            foreach ($jobs as $jj) {
+                if (isset($jj['uri']) && (string)$jj['uri'] === $curUri && isset($jj['name'])) {
+                    $curName = (string)$jj['name'];
+                    break;
+                }
+            }
+            netdisk_index_job_update($jobId, [
+                'current_uri' => $curUri,
+                'current_name' => $curName,
+                'current_detail' => $detail,
+                'ocr_done_count' => $ocrDoneCount,
+                'ocr_total' => $ocrTotal,
+                'queue_remaining' => max(0, $totalJobs - $jobIdx),
+                'heartbeat_at' => $nowT,
+            ], $jobPdo);
+        }
+        // 终止响应：用户请求取消 → 终止所有运行中的 tesseract 子进程并中断池
+        if ($jobId > 0 && netdisk_index_job_cancelled($jobId, $jobPdo)) {
+            foreach ($running as $rr) {
+                @proc_terminate($rr['proc']);
+                usleep(50000);
+                @proc_terminate($rr['proc'], 9);
+                @proc_close($rr['proc']);
+                if ($rr['outTxt'] !== '') {
+                    @unlink($rr['outTxt'] . '.txt');
+                    @unlink($rr['outTxt']);
+                }
+                if ($rr['temp'] && is_file($rr['file'])) {
+                    @unlink($rr['file']);
+                }
+            }
+            if ($activePages !== null) {
+                foreach ($activePages['pages'] as $pg) {
+                    @unlink($pg);
+                }
+            }
+            $running = [];
+            $activePages = null;
+            break;
+        }
+        foreach ($running as $i => $r) {
+            $st = @proc_get_status($r['proc']);
+            // 单进程超时保护：超过 180s 强制终止（先 SIGTERM，再升级 SIGKILL），避免永久挂死
+            if ($st && $st['running'] && ($nowT - $r['started']) > 180) {
+                @proc_terminate($r['proc']);
+                usleep(50000);
+                $st = @proc_get_status($r['proc']);
+                if ($st && $st['running']) {
+                    @proc_terminate($r['proc'], 9);
+                    usleep(50000);
+                    $st = @proc_get_status($r['proc']);
+                }
+            }
+            if (!$st || !$st['running']) {
+                @proc_close($r['proc']);
+                $txt = '';
+                if (is_file($r['outTxt'] . '.txt')) {
+                    $txt = (string)@file_get_contents($r['outTxt'] . '.txt');
+                    @unlink($r['outTxt'] . '.txt');
+                }
+                @unlink($r['outTxt']);
+                // 图片输入用完即删（PDF 页由 activePages 页耗尽时统一删）
+                if ($r['temp']) {
+                    @unlink($r['file']);
+                }
+                $uri = $r['uri'];
+                $trimmed = trim(preg_replace('/\s+/u', ' ', $txt));
+                if ($trimmed !== '') {
+                    $results[$uri] = isset($results[$uri]) ? $results[$uri] . ' ' . $trimmed : $trimmed;
+                }
+                unset($running[$i]);
+            }
+        }
+        $running = array_values($running);
+    }
+    if ($activePages !== null) {
+        foreach ($activePages['pages'] as $pg) {
+            @unlink($pg);
+        }
+    }
+    // 注意：$toClean 中的原始 tmp（图片/PDF 字节）在此保留，交给 netdisk_ocr_finalize_results
+    // 做自适应 DPI 重试后统一清理；仅 PDF 栅格化产生的页 PNG 已在上方清理。
+    $done = count($jobs);
+    foreach ($results as $t) {
+        if ($t !== '') {
+            $texts++;
+        }
+    }
+    return ['results' => $results, 'done' => $done, 'texts' => $texts, 'errors' => $errors, 'ocr_off' => $poolOff];
+}
+
+// 判断 OCR 结果是否含"汉字+空格+汉字"模式（旧版 tesseract 未做字间空格归一化，
+// 此类文本检索匹配不到，增量重建时应视为需重跑）。
+function netdisk_ocr_text_needs_reread(string $text): bool {
+    return (bool)preg_match('/\p{Han}\s+\p{Han}/u', $text);
+}
+
+// 用指定 DPI 扫描 PDF（$maxPages>0 时仅栅格化前 N 页作样本；null/0 表示整本），返回识别文本。
+// 供"前 5 页样本预判 DPI → 整本终扫"复用。超时由 NETDISK_OCR_CMD_TIMEOUT 保护。
+// $confStats（可选，引用）：返回 ['avg'=>, 'low_pct'=>, 'n'=>] 识别置信度统计，用于质量判定。
+function netdisk_ocr_pdf_scan(string $tmp, int $dpi, ?int $maxPages = null, ?array &$confStats = null): string {
+    // sidecar 优先：整本/前 N 页交给 rapidocr，精度高且一次性返回置信度
+    if (netdisk_ocr_sidecar_enabled() && netdisk_ocr_sidecar_available()) {
+        $res = netdisk_ocr_recognize_pdf($tmp, $dpi, 1, ($maxPages !== null && $maxPages > 0) ? $maxPages : 0);
+        if ($res !== null) {
+            $confStats = ['avg' => $res['avg'], 'low_pct' => $res['low_pct'], 'n' => $res['n']];
+            return $res['text'];
+        }
+    }
+    $tess = trim((string)shell_exec('command -v tesseract 2>/dev/null'));
+    $ppm = trim((string)shell_exec('command -v pdftoppm 2>/dev/null'));
+    if ($tess === '' || $ppm === '') {
+        return '';
+    }
+    $tmpPdf = $tmp . '.pdf';
+    if (!is_file($tmpPdf)) {
+        @copy($tmp, $tmpPdf);
+    }
+    $pageOpt = ($maxPages !== null && $maxPages > 0) ? (' -f 1 -l ' . (int)$maxPages) : '';
+    // 0019: 统一渲染入口（夹 DPI + 超时删半截产物）
+    netdisk_ocr_pdf_render($ppm, $tmpPdf, $tmpPdf . '_pg', $dpi, $pageOpt);
+    $pages = glob($tmpPdf . '_pg-*.png') ?: [];
+    @unlink($tmpPdf);
+    $out = '';
+    $tsvAll = '';
+    foreach ($pages as $pg) {
+        $outTxt = tempnam(sys_get_temp_dir(), 'ndor_');
+        // 同时输出文本与 TSV（word 级置信度）：需显式开启两个配置，否则 tesseract 只输出其一
+        $cmd = escapeshellarg($tess) . ' ' . escapeshellarg($pg) . ' ' . escapeshellarg($outTxt) . ' -l chi_sim+eng -c tessedit_create_txt=1 -c tessedit_create_tsv=1 2>/dev/null';
+        @shell_exec($cmd);
+        if ($outTxt !== false && is_file($outTxt . '.txt')) {
+            $out .= ' ' . (string)@file_get_contents($outTxt . '.txt');
+            @unlink($outTxt . '.txt');
+        }
+        if ($outTxt !== false && is_file($outTxt . '.tsv')) {
+            $tsvAll .= "\n" . (string)@file_get_contents($outTxt . '.tsv');
+            @unlink($outTxt . '.tsv');
+        }
+        @unlink($outTxt);
+        @unlink($pg);
+    }
+    // 调用方传入引用即代表需要置信度统计，无论传入值是否为 null 都回填
+    $parsed = netdisk_ocr_tsv_parse($tsvAll);
+    $confStats = ['avg' => $parsed['avg'], 'low_pct' => $parsed['low_pct'], 'n' => $parsed['n']];
+    return $out;
+}
+
+// 统一后处理 OCR 池结果：文本规范化 → 质量评估 → 自适应 DPI（PDF 前 5 页样本预判 → 整本终扫；
+// 页数 ≤5 直接全扫；图片放大重试）→ 清理临时文件。
+// $jobs: ['uri'=>, 'tmp'=>原始文件字节路径, 'ext'=>, 'name'=>]（tmp 未清理，供重试用）
+// $results: uri => 池内 OCR 原始文本（含字间空格）。
+// 返回规范化后的 results；同时清理每个 job 的 tmp。
+function netdisk_ocr_finalize_results(array $jobs, array $results): array {
+    $fcId = 0;
+    foreach ($jobs as $jj) {
+        if (isset($jj['config_id'])) {
+            $fcId = (int)$jj['config_id'];
+            break;
+        }
+    }
+    $dpiStart = netdisk_index_ocr_dpi_start($fcId);
+    $dpiMax = netdisk_index_ocr_dpi_max($fcId);
+    $qualityThreshold = netdisk_index_ocr_quality_threshold($fcId);
+    $tess = trim((string)shell_exec('command -v tesseract 2>/dev/null'));
+    $ppm = trim((string)shell_exec('command -v pdftoppm 2>/dev/null'));
+    $final = [];
+    // 0018: 逐文件耗时经 GLOBALS 透出（uri => ms），供状态表 elapsed_ms/pages_per_min 落库（0021 自动定档样本）。
+    // 不改函数签名：调用方读 $GLOBALS['ND_OCR_FINALIZE_TIMINGS']，缺失时退回池累计计时。
+    $GLOBALS['ND_OCR_FINALIZE_TIMINGS'] = [];
+    foreach ($jobs as $j) {
+        $fT0 = microtime(true);
+        $uri = (string)($j['uri'] ?? '');
+        $tmp = (string)($j['tmp'] ?? '');
+        $ext = strtolower(ltrim((string)($j['ext'] ?? ''), '.'));
+        $rawTxt = (string)($results[$uri] ?? '');
+        // 规范化（去字间空格）
+        $norm = netdisk_normalize_ocr_text($rawTxt);
+        $quality = netdisk_ocr_quality($norm);
+        $sidecarActive = netdisk_ocr_sidecar_enabled() && netdisk_ocr_sidecar_available();
+        if ($tmp !== '' && is_file($tmp) && ($tess !== '' || $sidecarActive)) {
+            if ($ext === 'pdf' && ($ppm !== '' || $sidecarActive)) {
+                // 检测总页数：≤5 时 run_pool 的前 5 页样本即全文，可直接采用/整本重扫；
+                // >5 或未知时采用"前 5 页样本预判 DPI → 整本终扫"。
+                $pagesCount = 0;
+                $pdfInfo = @shell_exec('pdfinfo ' . escapeshellarg($tmp) . ' 2>/dev/null');
+                if (is_string($pdfInfo) && preg_match('/Pages:\s+(\d+)/', $pdfInfo, $pm)) {
+                    $pagesCount = (int)$pm[1];
+                }
+                if ($pagesCount > 0 && $pagesCount <= 5) {
+                    // 页数少：起点 DPI 扫描即全文。sidecar（PaddleOCR）一次识别质量高，直接采用；
+                    // tesseract 才需要按置信度逐级升 DPI 重扫。
+                    $dpi = $dpiStart;
+                    $sampleStats = null;
+                    $fullTxt = netdisk_ocr_pdf_scan($tmp, $dpi, null, $sampleStats);
+                    $fullNorm = netdisk_normalize_ocr_text($fullTxt);
+                    if ($sidecarActive) {
+                        $norm = $fullNorm;
+                    } elseif (trim($fullTxt) === '' || netdisk_ocr_quality_conf($sampleStats ?? []) < $qualityThreshold) {
+                        while ($dpi < $dpiMax) {
+                            $nextDpi = min($dpiMax, $dpi + 100);
+                            $upStats = null;
+                            $fullTxt = netdisk_ocr_pdf_scan($tmp, $nextDpi, null, $upStats);
+                            if (trim($fullTxt) === '') {
+                                break;
+                            }
+                            $fullNorm = netdisk_normalize_ocr_text($fullTxt);
+                            if (netdisk_ocr_quality_conf($upStats ?? []) >= $qualityThreshold || $nextDpi >= $dpiMax) {
+                                $norm = $fullNorm;
+                                break;
+                            }
+                            $dpi = $nextDpi;
+                        }
+                    } else {
+                        $norm = $fullNorm;
+                    }
+                } else {
+                    // 前 5 页样本预判 DPI：sidecar 直接用起点 DPI 整本终扫；tesseract 才逐级升档预判
+                    $finalDpi = $dpiStart;
+                    if (!$sidecarActive) {
+                        $sampleStats = null;
+                        $sampleTxt = netdisk_ocr_pdf_scan($tmp, $dpiStart, 5, $sampleStats);
+                        $sampleNorm = netdisk_normalize_ocr_text($sampleTxt);
+                        if (trim($sampleTxt) === '' || netdisk_ocr_quality_conf($sampleStats ?? []) < $qualityThreshold) {
+                            $dpi = $dpiStart;
+                            while ($dpi < $dpiMax) {
+                                $nextDpi = min($dpiMax, $dpi + 100);
+                                $upStats = null;
+                                $sampleTxt = netdisk_ocr_pdf_scan($tmp, $nextDpi, 5, $upStats);
+                                if (trim($sampleTxt) === '') {
+                                    // 0 页（假 PDF/损坏）→ 无需更高 DPI，直接用当前空结果
+                                    $finalDpi = $nextDpi;
+                                    break;
+                                }
+                                $sampleNorm = netdisk_normalize_ocr_text($sampleTxt);
+                                $finalDpi = $nextDpi;
+                                if (netdisk_ocr_quality_conf($upStats ?? []) >= $qualityThreshold || $nextDpi >= $dpiMax) {
+                                    break;
+                                }
+                                $dpi = $nextDpi;
+                            }
+                        }
+                    }
+                    // 整本终扫（用预判确定的 DPI），得到完整全文
+                    $finalStats = null;
+                    $fullTxt = netdisk_ocr_pdf_scan($tmp, $finalDpi, null, $finalStats);
+                    $norm = netdisk_normalize_ocr_text($fullTxt);
+                }
+            } elseif ($ext !== 'pdf' && !$sidecarActive && $quality < $qualityThreshold) {
+                // 图片：sidecar 模式下 run_pool 已完整识别（PaddleOCR 质量高），此处不再重复；
+                // tesseract 才需要按置信度重试/ImageMagick 放大。
+                // 质量判定用置信度（比字符占比更能反映识别确定度）。
+                $dpi = $dpiStart;
+                while ($dpi < $dpiMax) {
+                    $nextDpi = min($dpiMax, $dpi + 100);
+                    $retryTxt = '';
+                    $retryStats = null;
+                    $imgFile = $tmp;
+                    if (trim((string)shell_exec('command -v convert 2>/dev/null')) !== '') {
+                        $bigger = $tmp . '_big.png';
+                        @exec("convert " . escapeshellarg($tmp) . " -density " . (int)$nextDpi . " -resize " . (int)$nextDpi . "% " . escapeshellarg($bigger) . ' 2>/dev/null');
+                        if (is_file($bigger)) {
+                            $imgFile = $bigger;
+                        }
+                    }
+                    $rec = netdisk_ocr_recognize_image($imgFile, $nextDpi);
+                    if (isset($bigger) && is_file($bigger)) {
+                        @unlink($bigger);
+                    }
+                    if ($rec !== null) {
+                        $retryTxt = $rec['text'];
+                        $retryStats = ['avg' => $rec['avg'], 'low_pct' => $rec['low_pct'], 'n' => $rec['n']];
+                    }
+                    $retryNorm = netdisk_normalize_ocr_text($retryTxt);
+                    if (netdisk_ocr_quality_conf($retryStats) >= $qualityThreshold || $nextDpi >= $dpiMax) {
+                        $norm = $retryNorm;
+                        break;
+                    }
+                    $dpi = $nextDpi;
+                }
+            }
+        }
+        if ($norm !== '') {
+            $final[$uri] = $norm;
+        }
+        // 清理 tmp（池内已保留至此，重试完成后删除）
+        if ($tmp !== '' && is_file($tmp)) {
+            @unlink($tmp);
+        }
+        $GLOBALS['ND_OCR_FINALIZE_TIMINGS'][$uri] = (int)round((microtime(true) - $fT0) * 1000);
+    }
+    return $final;
+}
+
+// 统一从文件字节抽取正文：按扩展名分层（文本/Office/PDF 文本层）。OCR 走并发池，不走本函数。
+function netdisk_extract_text_from_bytes(string $ext, string $raw, bool $allowOcr): string {
+    $ext = strtolower(ltrim($ext, '.'));
+    if (netdisk_is_text_ext($ext)) {
+        $t = netdisk_text_body_to_utf8($raw);
+        return $t !== null ? $t : '';
+    }
+    $officeExts = ['docx', 'docm', 'dotx', 'xlsx', 'xlsm', 'pptx', 'pptm', 'odt', 'ods', 'odp'];
+    if (in_array($ext, $officeExts, true)) {
+        $t = netdisk_extract_office_text($ext, $raw);
+        if ($t !== '') {
+            return $t;
+        }
+    }
+    if ($ext === 'pdf') {
+        return netdisk_extract_pdf_text($raw);
+    }
+    return '';
+}
+
+// 连接级全文索引配置（空字符串 = 使用全局默认）
+function netdisk_index_cfg_sql_assign(array $fields): string {
+    $out = '';
+    foreach ($fields as $col => $val) {
+        $out .= $col . '=:' . $col . ', ';
+    }
+    return $out;
+}
+function netdisk_index_cfg_params(array $fields): array {
+    $params = [];
+    foreach ($fields as $col => $val) {
+        $params[':' . $col] = $val;
+    }
+    return $params;
+}
+
+// 管理端：返回所有启用连接的索引配置快照（config_id => 关联数组，供前端展示/管理）
+function netdisk_admin_index_cfg_map(PDO $pdo): array {
+    $out = [];
+    try {
+        $rows = $pdo->query('SELECT id, name, index_ocr_enabled, index_ocr_concurrency, index_ocr_dpi_start, index_ocr_dpi_max, index_ocr_quality_threshold, index_ocr_max_mb, index_ocr_low_max_mb, index_refresh_ttl, index_skip_exts FROM cloudreve_configs ORDER BY id ASC')->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($rows as $r) {
+            $id = (int)$r['id'];
+            $out[$id] = [
+                'id' => $id,
+                'name' => (string)$r['name'],
+                'ocr_enabled' => trim((string)($r['index_ocr_enabled'] ?? '')) === '' ? netdisk_index_ocr_enabled(0) : (trim((string)$r['index_ocr_enabled']) !== '0'),
+                'concurrency' => (int)netdisk_index_cfg_value($id, 'index_ocr_concurrency', 'netdisk_index_ocr_concurrency', '4'),
+                'dpi_start' => (int)netdisk_index_cfg_value($id, 'index_ocr_dpi_start', 'netdisk_index_ocr_dpi_start', '200'),
+                'dpi_max' => (int)netdisk_index_cfg_value($id, 'index_ocr_dpi_max', 'netdisk_index_ocr_dpi_max', '600'),
+                'quality_threshold' => (float)netdisk_index_cfg_value($id, 'index_ocr_quality_threshold', 'netdisk_index_ocr_quality_threshold', '0.3'),
+                'max_mb' => (int)netdisk_index_cfg_value($id, 'index_ocr_max_mb', 'netdisk_index_ocr_max_mb', '10'),
+                'low_max_mb' => (int)netdisk_index_cfg_value($id, 'index_ocr_low_max_mb', 'netdisk_index_ocr_low_max_mb', '50'),
+                'refresh_ttl' => (int)netdisk_index_cfg_value($id, 'index_refresh_ttl', 'netdisk_index_refresh_ttl', '3600'),
+                'skip_exts' => implode(',', array_keys(netdisk_index_skip_exts($id))),
+                'uses_default' => trim((string)($r['index_ocr_enabled'] ?? '')) === ''
+                    && trim((string)($r['index_ocr_concurrency'] ?? '')) === ''
+                    && trim((string)($r['index_ocr_dpi_start'] ?? '')) === ''
+                    && trim((string)($r['index_ocr_dpi_max'] ?? '')) === ''
+                    && trim((string)($r['index_ocr_quality_threshold'] ?? '')) === ''
+                    && trim((string)($r['index_ocr_max_mb'] ?? '')) === ''
+                    && trim((string)($r['index_ocr_low_max_mb'] ?? '')) === ''
+                    && trim((string)($r['index_refresh_ttl'] ?? '')) === ''
+                    && trim((string)($r['index_skip_exts'] ?? '')) === '',
+            ];
+        }
+    } catch (Throwable $e) {
+        // ignore: 迁移尚未完成时
+    }
+    return $out;
+}
+
+// 管理端：某个连接的索引配置快照（单条，语义同 map）
+function netdisk_admin_index_cfg_snapshot(PDO $pdo, int $configId): ?array {
+    $map = netdisk_admin_index_cfg_map($pdo);
+    return $map[$configId] ?? null;
+}
+
+// 是否启用 OCR（扫描 PDF/图片），默认开启；configId>0 时按连接独立
+// 0030: $refresh=true 时穿透进程内配置缓存——长驻 worker 运行中关掉 OCR 也能立刻生效
+function netdisk_index_ocr_enabled(?int $configId = 0, bool $refresh = false): bool {
+    $v = netdisk_index_cfg_value((int)$configId, 'index_ocr_enabled', 'netdisk_index_ocr', '1', $refresh);
+    return trim((string)$v) !== '0';
+}
+
+// OCR 并发进程数：同时最多运行 N 个 tesseract（避免 NAS 满载），可后台调整
+function netdisk_index_ocr_concurrency(?int $configId = 0): int {
+    $v = netdisk_index_cfg_value((int)$configId, 'index_ocr_concurrency', 'netdisk_index_ocr_concurrency', '4');
+    return max(1, (int)$v);
+}
+
+// 正常优先级 OCR 的单文件体积上限（MB）：≤该值在重建时立即入池 OCR
+// 0028: 允许 0——0 表示没有任何文件进高优池，OCR 候选全部改走低优先级队列（由 worker 空闲时处理）
+function netdisk_index_ocr_max_mb(?int $configId = 0): int {
+    $v = netdisk_index_cfg_value((int)$configId, 'index_ocr_max_mb', 'netdisk_index_ocr_max_mb', '10');
+    return max(0, (int)$v);
+}
+
+// 低优先级 OCR 兜底上限（MB）：>max_mb 且 ≤该值的文件写入 netdisk_ocr_queue，
+// 由后台 worker 在空闲时 OCR；超过该值则跳过 OCR（仍按文件名索引）。
+// 0028: 允许 0——0 表示所有 OCR 候选一律跳过识别，本轮只下载/算哈希/建索引（等效「只建索引」开关）。
+// 旧实现 max(1, ...) 会把 0 抬成 1MB，设 0 后 ≤1MB 的扫描件照旧被 OCR，与用户意图相反。
+function netdisk_index_ocr_low_max_mb(?int $configId = 0): int {
+    $v = netdisk_index_cfg_value((int)$configId, 'index_ocr_low_max_mb', 'netdisk_index_ocr_low_max_mb', '50');
+    return max(0, (int)$v);
+}
+
+// 索引刷新 TTL（秒）：索引建好后长期有效；超过该时长后，搜索仍返回索引结果，
+// 同时后台排队一次刷新任务（增量）。默认 3600（1 小时）。
+function netdisk_index_refresh_ttl(?int $configId = 0): int {
+    $v = netdisk_index_cfg_value((int)$configId, 'index_refresh_ttl', 'netdisk_index_refresh_ttl', '3600');
+    return max(60, (int)$v);
+}
+
+// 索引黑名单扩展名（跳过下载正文/OCR，仍按文件名索引）。逗号分隔，默认 zip,dwg,rar。
+function netdisk_index_skip_exts(?int $configId = 0): array {
+    $raw = trim((string)netdisk_index_cfg_value((int)$configId, 'index_skip_exts', 'netdisk_index_skip_exts', 'zip,dwg,rar'));
+    $out = [];
+    foreach (preg_split('/[,，\s]+/', $raw) as $e) {
+        $e = strtolower(ltrim(trim($e), '.'));
+        if ($e !== '') {
+            $out[$e] = true;
+        }
+    }
+    return $out;
+}
+
+// 创建/追加一个后台重建 job。若该分享已有 running 或 pending 任务则复用返回其 id。
+function netdisk_index_job_create(int $shareId, bool $forceOcr = false, ?bool &$reusedRunning = null): int {
+    $pdo = db();
+    // 0030: $reusedRunning 通过引用回传「本次复用的是已经在跑的 running 行」——
+    // 旧实现无条件返回既有 job id，调用方无从区分「新建」与「复用 running」，
+    // 用户点重建后界面回成功、实际一个新任务都没建（静默空操作）。
+    $reusedRunning = false;
+    $ex = $pdo->prepare('SELECT id, status FROM netdisk_index_jobs WHERE share_id=:s AND status IN ("pending","running") ORDER BY id DESC LIMIT 1');
+    $ex->execute([':s' => $shareId]);
+    $existingRow = $ex->fetch(PDO::FETCH_ASSOC) ?: [];
+    $ex->closeCursor();
+    $existing = (int)($existingRow['id'] ?? 0);
+    if ($existing > 0) {
+        if ((string)($existingRow['status'] ?? '') === 'running') {
+            $reusedRunning = true;
+        }
+        // 0018: 复用未开始/进行中的 job 时，本次请求带强制重跑则升级标记（worker 拾取时读取）
+        // 0023: 复用 pending 行时一并刷新 created_at——其口径为「最后一次被触发的时间」，
+        //       worker 的「pending 超 6 小时判死」即「触发后 6 小时仍未被拾取」。旧实现不刷新，
+        //       隔日重触发会复用昨天的 created_at，worker 一进回收循环就误判「队列等待超时」。
+        //       running 行有心跳、语义是已开跑，不得刷新（仅 status="pending" 的行会被本 UPDATE 命中）。
+        if ($forceOcr) {
+            $pdo->prepare('UPDATE netdisk_index_jobs SET created_at=:t, force_ocr=1 WHERE id=:id AND status="pending"')->execute([':t' => time(), ':id' => $existing]);
+        } else {
+            $pdo->prepare('UPDATE netdisk_index_jobs SET created_at=:t WHERE id=:id AND status="pending"')->execute([':t' => time(), ':id' => $existing]);
+        }
+        return $existing;
+    }
+    $pdo->prepare('INSERT INTO netdisk_index_jobs (share_id, status, created_at, force_ocr) VALUES (:s, "pending", :t, :f)')
+        ->execute([':s' => $shareId, ':t' => time(), ':f' => $forceOcr ? 1 : 0]);
+    return (int)$pdo->lastInsertId();
+}
+
+// 通用锁重试执行：SQLite 在 WAL 下偶发 "database is locked"，重试数次并短暂等待。
+// 总等待窗口应覆盖所用连接的 busy_timeout：
+//   - db() 静态单例连接 = 30s（见 :214 PRAGMA busy_timeout = 30000）
+//   - netdisk_index_job_update 等自建的独立连接 = 15s（PRAGMA busy_timeout = 15000）
+// 默认 40×500ms=20s 对独立连接够用；走 db() 的关键写入应显式传更大 attempts。
+// 返回受影响行数；重试耗尽后抛出异常（由调用方决定降级）。
+// 注意：同连接"读快照未关游标 → 再写"的升级死锁会立即报错、busy_timeout 不生效，
+// 重试对该场景无效，调用方须先 closeCursor()。
+function netdisk_exec_retry(callable $fn, int $attempts = 40): mixed {
+    for ($i = 0; $i < $attempts; $i++) {
+        try {
+            return $fn();
+        } catch (Throwable $e) {
+            if ($i === $attempts - 1) {
+                throw $e;
+            }
+            usleep(500000); // 500ms，总窗口 40×500ms=20s
+        }
+    }
+    return null;
+}
+
+// 更新 job 进度（进程内使用）。遇到数据库锁等瞬时错误时静默忽略，避免中断重建主流程。
+// $pdo 可选：传入则复用该连接执行 UPDATE（与调用方共用单一连接，避免同进程多连接交叉写锁）。
+function netdisk_index_job_update(int $jobId, array $patch, ?PDO $pdo = null): void {
+    if ($jobId <= 0) {
+        return;
+    }
+    $allowed = ['status', 'files', 'folders', 'texts', 'errors', 'ocr_skipped', 'ocr_done', 'ocr_queued', 'processed_dirs', 'total_dirs', 'total_files', 'current_dir', 'current_uri', 'current_name', 'current_detail', 'ocr_done_count', 'ocr_total', 'queue_remaining', 'heartbeat_at', 'notes', 'error', 'started_at', 'finished_at', 'attempts', 'cancel_requested', 'ocr_files_total', 'ocr_files_done', 'crash_count'];
+    $sets = [];
+    $params = [':id' => $jobId];
+    foreach ($patch as $k => $v) {
+        if (!in_array($k, $allowed, true)) {
+            continue;
+        }
+        $sets[] = "$k = :p_$k";
+        $params[":p_$k"] = $v;
+    }
+    if (empty($sets)) {
+        return;
+    }
+    if ($pdo !== null) {
+        try {
+            $pdo->prepare('UPDATE netdisk_index_jobs SET ' . implode(', ', $sets) . ' WHERE id = :id')->execute($params);
+        } catch (Throwable $e) {
+            // 瞬时锁/写冲突：忽略本次进度上报，下次循环继续
+        }
+        return;
+    }
+    // 未传连接：用独立连接执行 UPDATE，避免与 db() 静态连接上其它活动语句（缓存/插入）冲突导致 bad parameter
+    try {
+        $updPdo = new PDO('sqlite:' . $GLOBALS['config']['db_path']);
+        $updPdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $updPdo->exec('PRAGMA busy_timeout = 15000;');
+        $updPdo->prepare('UPDATE netdisk_index_jobs SET ' . implode(', ', $sets) . ' WHERE id = :id')->execute($params);
+    } catch (Throwable $e) {
+        // 瞬时锁/写冲突：忽略本次进度上报，下次循环继续
+    }
+}
+
+// 取给定分享当前最 “活跃” 的 job 汇总；无则 null
+function netdisk_index_job_latest(int $shareId): ?array {
+    $stmt = db()->prepare('SELECT * FROM netdisk_index_jobs WHERE share_id=:s ORDER BY id DESC LIMIT 1');
+    $stmt->execute([':s' => $shareId]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    return $row === false ? null : $row;
+}
+
+// 检查 job 是否被请求终止。复用调用方连接查询（避免同进程多连接）。
+// 返回 true 表示应中断当前重建。
+function netdisk_index_job_cancelled(int $jobId, ?PDO $pdo = null): bool {
+    if ($jobId <= 0) {
+        return false;
+    }
+    try {
+        if ($pdo === null) {
+            $pdo = db();
+        }
+        $v = (int)$pdo->query('SELECT cancel_requested FROM netdisk_index_jobs WHERE id=' . (int)$jobId)->fetchColumn();
+        return $v === 1;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+// 预扫描分享目录树：只计数目录/文件数量（复用目录缓存，正式遍历直接命中缓存）。用于进度总量。
+function netdisk_scan_share_tree(array $cfg, string $root): array {
+    $conn = $cfg['cfg'] ?? $cfg;
+    $visited = 0;
+    $files = 0;
+    $folders = 0;
+    $currentLevel = [$root];
+    $seenDirs = [$root => true];
+    for ($depth = 0; $depth <= 5; $depth++) {
+        if (empty($currentLevel) || $visited >= 300) {
+            break;
+        }
+        $batch = [];
+        foreach ($currentLevel as $dirUri) {
+            if ($visited >= 300) {
+                break;
+            }
+            $visited++;
+            $batch[] = $dirUri;
+        }
+        $batchData = cloudreve_list_folder_multi($cfg, $batch, 300);
+        $nextLevel = [];
+        foreach ($batch as $dirUri) {
+            $data = $batchData[$dirUri] ?? null;
+            if (!is_array($data)) {
+                continue;
+            }
+            netdisk_register_redirect_aliases($conn, $root, $data);
+            foreach (($data['files'] ?? []) as $f) {
+                $isFolder = (int)($f['type'] ?? 0) === 1;
+                if ($isFolder) {
+                    $folders++;
+                    $redirect = (string)($f['metadata']['sys:shared_redirect'] ?? '');
+                    $childUri = $redirect !== '' ? $redirect : (string)($f['path'] ?? '');
+                    if ($childUri !== '' && netdisk_uri_within_root($root, $childUri, $conn) && !isset($seenDirs[$childUri])) {
+                        $seenDirs[$childUri] = true;
+                        $nextLevel[] = $childUri;
+                    }
+                } else {
+                    $files++;
+                }
+            }
+        }
+        $currentLevel = $nextLevel;
+    }
+    return ['files' => $files, 'folders' => $folders, 'dirs' => $visited];
+}
+
+// ===== 0024: OCR 结果内容寻址（content-addressed）=====
+// 识别正文按 sha256(原始文件字节) + params_key 绑定，而非 (share_id, uri) 路径键。
+// 价值：改名/移动/重命名父目录后内容不变 → 命中复用，不重新 OCR；同一内容挂多个分享只扫一次。
+// params_key 是 NAS 侧渲染/引擎参数指纹：任何预处理变更必须先动 render_ver 或相关字段，
+// 让旧结果自然失效（不做数据迁移）。PC 端导入须原样回传 params_key，不一致即拒收。
+
+// params_key 规格（单一来源；0024 写库与 0025 GET /admin/netdisk/ocr/params 必须调本函数）：
+//   engine_tag | profile | dpi | max_side | render_ver
+//   例：paddle5|high|300|960|r1
+// - engine_tag 固定 'paddle5'（引擎换代时才改）
+// - profile 取 OCR_PROFILE 环境变量（0022 解析后为 low/high；web 容器未设时记 'low'，
+//   与 ocr 容器实际档位可能不同——params_key 只需 NAS 侧自洽且稳定，PC 端原样回传即可）
+// - dpi 取连接级 index_ocr_dpi_start 实际值；max_side 取 netdisk_ocr_image_resize_b64 默认 960
+// - render_ver v1 固定 'r1'；缺失字段一律空串占位，不许省略（否则两侧拼出的字符串不一致且极难排查）
+function netdisk_ocr_params_key(?int $configId = 0): string {
+    $profile = strtolower(trim((string)(getenv('OCR_PROFILE') ?: 'low')));
+    if ($profile === '') {
+        $profile = 'low';
+    }
+    $dpi = netdisk_index_ocr_dpi_start((int)$configId);
+    $maxSide = 960; // 与 netdisk_ocr_image_resize_b64() 默认 maxSide 一致
+    return 'paddle5|' . $profile . '|' . $dpi . '|' . $maxSide . '|r1';
+}
+
+// 结果表查询：命中且达标（netdisk_ocr_index_quality_ok 同口径：chars>=20 且 quality>=0.6）返回行，
+// 未命中/不达标/异常返回 null。params_key 不一致视为未命中（不得静默复用旧参数结果）。
+// 达标门槛与 0018 状态行跳过判定同口径：不达标结果不传播，走重扫路径（重试语义与 0018 一致）。
+function netdisk_ocr_result_lookup(string $hash, string $paramsKey, ?PDO $pdo = null): ?array {
+    if ($hash === '' || $paramsKey === '') {
+        return null;
+    }
+    try {
+        $pdo = $pdo ?? db();
+        $st = $pdo->prepare('SELECT content_hash, params_key, size, pages, chars, quality, engine, text, source, created_at, last_hit_at
+            FROM netdisk_ocr_results WHERE content_hash=:h AND params_key=:k LIMIT 1');
+        $st->execute([':h' => $hash, ':k' => $paramsKey]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        $st->closeCursor();
+        if ($row === false || !netdisk_ocr_index_quality_ok((string)$row['text'])) {
+            return null;
+        }
+        return $row;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+// 结果表写入（upsert）：created_at 仅首次插入置值，重导入不覆盖；last_hit_at 每次刷新。
+// text 入库前过 netdisk_normalize_ocr_text()（与 NAS 直扫同口径）；chars/quality 服务端重算。
+function netdisk_ocr_result_save(string $hash, string $paramsKey, int $size, int $pages, string $text,
+    string $engine, string $source, ?PDO $pdo = null): bool {
+    if ($hash === '' || $paramsKey === '') {
+        return false;
+    }
+    $text = netdisk_normalize_ocr_text($text);
+    if ($text === '') {
+        return false;
+    }
+    try {
+        $pdo = $pdo ?? db();
+        $chars = string_len($text);
+        $quality = netdisk_ocr_quality($text);
+        $now = time();
+        $st = $pdo->prepare('INSERT INTO netdisk_ocr_results
+            (content_hash, params_key, size, pages, chars, quality, engine, text, source, created_at, last_hit_at)
+            VALUES (:h, :k, :z, :pg, :c, :q, :e, :t, :src, :now, :now)
+            ON CONFLICT(content_hash, params_key) DO UPDATE SET
+                size=excluded.size, pages=excluded.pages, chars=excluded.chars, quality=excluded.quality,
+                engine=excluded.engine, text=excluded.text, source=excluded.source, last_hit_at=excluded.last_hit_at');
+        $st->execute([':h' => $hash, ':k' => $paramsKey, ':z' => $size, ':pg' => $pages, ':c' => $chars,
+            ':q' => $quality, ':e' => $engine, ':t' => $text, ':src' => $source, ':now' => $now]);
+        return true;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+// GC（孤儿保留策略）：仍被任一 netdisk_index.content_hash 引用的结果行永不删除；
+// 孤儿行（无任何引用）按 last_hit_at 淘汰——超过 TTL 天删除，或孤儿总字节超上限时按 last_hit_at ASC 淘汰到阈值以下。
+// 触发点：索引重建收尾跑一次（不新增 cron、不加 worker 任务）。单次打一行 [nd-index] gc results deleted=N kept=M。
+// 孤儿策略的意义：PC 先扫后传场景下，导入结果在 NAS 遍历到该文件前没有引用，绝不能被当垃圾清掉。
+function netdisk_ocr_results_gc(?PDO $pdo = null): void {
+    try {
+        $pdo = $pdo ?? db();
+        $ttlDays = (int)(getenv('NETDISK_OCR_RESULTS_TTL') ?: '90');
+        if ($ttlDays <= 0) {
+            $ttlDays = 90;
+        }
+        $maxMb = (int)(getenv('NETDISK_OCR_RESULTS_MAX_MB') ?: '5120');
+        if ($maxMb <= 0) {
+            $maxMb = 5120;
+        }
+        $now = time();
+        $cutoff = $now - $ttlDays * 86400;
+        // 孤儿 = 不被任何 netdisk_index.content_hash 引用的结果行
+        $orphanCond = 'NOT EXISTS (SELECT 1 FROM netdisk_index i WHERE i.content_hash = netdisk_ocr_results.content_hash AND i.content_hash != "")';
+        // TTL 淘汰
+        $delTtl = $pdo->prepare('DELETE FROM netdisk_ocr_results WHERE ' . $orphanCond . ' AND last_hit_at < :cut');
+        $delTtl->execute([':cut' => $cutoff]);
+        $deleted = $delTtl->rowCount();
+        // 容量淘汰：孤儿总字节（LENGTH(text)）超上限 → 按 last_hit_at ASC 删到阈值以下
+        $capBytes = $maxMb * 1048576;
+        $sumSt = $pdo->query('SELECT COALESCE(SUM(LENGTH(CAST(text AS BLOB))),0) FROM netdisk_ocr_results WHERE ' . $orphanCond);
+        $orphanBytes = (int)$sumSt->fetchColumn();
+        $sumSt->closeCursor();
+        if ($orphanBytes > $capBytes) {
+            $selOrph = $pdo->query('SELECT content_hash, params_key, LENGTH(CAST(text AS BLOB)) AS tlen FROM netdisk_ocr_results
+                WHERE ' . $orphanCond . ' ORDER BY last_hit_at ASC');
+            $orphRows = $selOrph->fetchAll(PDO::FETCH_ASSOC);
+            $selOrph->closeCursor();
+            $delCap = $pdo->prepare('DELETE FROM netdisk_ocr_results WHERE content_hash=:h AND params_key=:k');
+            foreach ($orphRows as $or) {
+                if ($orphanBytes <= $capBytes) {
+                    break;
+                }
+                $delCap->execute([':h' => $or['content_hash'], ':k' => $or['params_key']]);
+                $deleted += $delCap->rowCount();
+                $orphanBytes -= (int)$or['tlen'];
+            }
+        }
+        $keptSt = $pdo->query('SELECT COUNT(*) FROM netdisk_ocr_results');
+        $kept = (int)$keptSt->fetchColumn();
+        $keptSt->closeCursor();
+        @error_log('[nd-index] gc results deleted=' . $deleted . ' kept=' . $kept);
+    } catch (Throwable $e) {
+        // GC 失败不影响本轮索引
+    }
+}
+
+// ===== 0025: OCR 参数导出 + PC 端结果回导 =====
+// 与 0024 内容寻址配套：PC 端（tools/ocr-win）启动先拉参数、扫完把原始文本回导。
+// 四条硬约束：
+//   1) params_key 只能由 netdisk_ocr_params_key() 生成——本文件禁止另写一份拼接（两侧指纹不一致极难排查）；
+//   2) 派生字段（chars / quality / status / attempts / pages_*）一律服务端重算，PC 只回传原始文本；
+//   3) 文本入库前单行化（与 0020 的 netdisk_ocr_log_oneline 同规则，但保留完整正文不截断）；
+//   4) 导入不触发索引重建：NAS 下一轮遍历按 0024 判定顺序②自会命中（唯一入口，不另开旁路）。
+
+// GET /admin/netdisk/ocr/params 的回包体（严格 8 个字段，不多给）。
+// profile / dpi / max_side / render_ver 直接从 params_key 拆出来，避免与写库口径出现第二份解析逻辑。
+// 不得返回文件路径 / uri / token / 容器内路径 / 数据库路径——此处只放渲染参数指纹相关的公开字段。
+function netdisk_ocr_params_payload(?int $configId = 0): array {
+    $key = netdisk_ocr_params_key($configId);
+    $parts = explode('|', $key);
+    return [
+        'v' => 1,
+        'engine' => 'paddle-ppocrv5',
+        'engine_version' => 'paddlex 3.0.3 / paddlepaddle 3.0.0',
+        'profile' => (string)($parts[1] ?? ''),
+        'dpi' => (int)($parts[2] ?? 0),
+        'max_side' => (int)($parts[3] ?? 0),
+        'render_ver' => (string)($parts[4] ?? ''),
+        'params_key' => $key,
+    ];
+}
+
+// 0025: JSON 直出（params / import 两端点专用）。与 api_response() 的差别：params 必须严格 8 字段、
+// import 必须顶层 accepted/rejected（任务书 3.1 / 3.2 的回包形状），不能被 {code,msg,data} 外层包住。
+// CORS 头沿用 api_response 口径，另加 X-CSRF-Token（PC 端预检可能带该头）。
+function netdisk_ocr_api_json(int $code, array $payload): void {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Access-Control-Allow-Origin: *');
+    header('Access-Control-Allow-Headers: Content-Type, X-Api-Key, Authorization, X-CSRF-Token');
+    header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+    http_response_code($code);
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+// 0025: 后台鉴权（沿用既有机制，不另造一套）——先按会话（current_user() + role=admin，与 require_admin()
+// 同一判定条件；差别只在失败时回 JSON 而不是 redirect 到 /login：本组端点是给程序调的 API），
+// 再按 API Key（api_user_from_key()，与 require_api_user() 同一判定与同一取 key 位置）。
+// 返回 ['user' => …, 'via' => 'session'|'apikey']；两个端点共用，避免两处鉴权判定漂移。
+function netdisk_ocr_api_user(): array {
+    $u = current_user();
+    if ($u) {
+        if ((int)($u['disabled'] ?? 0) === 1) {
+            netdisk_ocr_api_json(401, ['code' => 401, 'msg' => '账号已被禁用']);
+        }
+        if ((string)($u['role'] ?? '') !== 'admin') {
+            netdisk_ocr_api_json(403, ['code' => 403, 'msg' => 'Forbidden']);
+        }
+        touch_user_activity($u);
+        return ['user' => $u, 'via' => 'session'];
+    }
+    $key = (string)($_SERVER['HTTP_X_API_KEY'] ?? '');
+    if ($key === '') {
+        $auth = (string)($_SERVER['HTTP_AUTHORIZATION'] ?? '');
+        if (stripos($auth, 'bearer ') === 0) {
+            $key = trim(substr($auth, 7));
+        }
+    }
+    $u = api_user_from_key($key);
+    if ($u && (string)($u['role'] ?? '') === 'admin') {
+        touch_user_activity($u);
+        return ['user' => $u, 'via' => 'apikey'];
+    }
+    netdisk_ocr_api_json(401, ['code' => 401, 'msg' => '未登录或 API Key 无效']);
+}
+
+// 0025: 导入端点的 CSRF 校验。会话通道（cookie 认证）必须带 csrf——表单字段或 X-CSRF-Token 头，
+// 与后台 check_csrf() 同一 $_SESSION['csrf'] 值、同一 hash_equals 比较（失败回 JSON 而非纯文本）；
+// API Key 通道不走 cookie，跨站表单无法设置 X-Api-Key / Authorization 头，CSRF 面不存在，故免除。
+function netdisk_ocr_import_csrf_ok(string $via): bool {
+    if ($via !== 'session') {
+        return true;
+    }
+    $tok = (string)($_POST['csrf'] ?? ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? ''));
+    return $tok !== '' && hash_equals((string)($_SESSION['csrf'] ?? ''), $tok);
+}
+
+// 0025: 单行校验 + 组装（逐行失败不影响整批其他行）。返回 ['ok'=>true, hash/size/pages/engine/text]
+// 或 ['ok'=>false, 'reason'=>…]。size / updated_at 与「已知记录」比对：已知记录 = 同 content_hash 的
+// netdisk_ocr_files 或 netdisk_index 行（PC 端不知道云端 updated_at，故仅在该行已存在且字段非空时比对），
+// 比对不上判 size_mismatch / stale，拒绝写入——防 PC 端扫的是旧副本、文本与库里内容错配。
+function netdisk_ocr_import_item(array $it, string $expectedKey, ?PDO $pdo = null): array {
+    $hash = strtolower(trim((string)($it['content_hash'] ?? '')));
+    if (!preg_match('/^[0-9a-f]{64}$/', $hash)) {
+        return ['ok' => false, 'reason' => 'bad_hash'];
+    }
+    $itemKey = trim((string)($it['params_key'] ?? ''));
+    if ($itemKey !== '' && $itemKey !== $expectedKey) {
+        return ['ok' => false, 'reason' => 'params_mismatch'];
+    }
+    $text = (string)($it['text'] ?? '');
+    if (strlen($text) > 4 * 1048576) {
+        return ['ok' => false, 'reason' => 'text_too_large'];
+    }
+    // 单行化：复用 0020 的 netdisk_ocr_log_oneline（\r\n/\r/\n/\t → 空格、多空格合并、trim），
+    // maxChars 取本串长度+1 —— 该函数的截断是为日志服务的，识别正文必须完整保留。
+    $text = netdisk_ocr_log_oneline($text, max(200, string_len($text) + 1));
+    // 全角空格（U+3000）既不在 PCRE \s 内、trim() 也去不掉——纯全角空白的「正文」等同空文本，
+    // 否则会往结果表塞一行永远不达标的垃圾（chars<20 永不命中，只占容量）。
+    if ($text === '' || trim(str_replace("\u{3000}", '', $text)) === '') {
+        return ['ok' => false, 'reason' => 'empty_text'];
+    }
+    $size = (int)($it['size'] ?? 0);
+    if ($size < 0) {
+        $size = 0;
+    }
+    $pages = (int)($it['pages'] ?? 0);
+    if ($pages < 0) {
+        $pages = 0;
+    }
+    if ($pages > 100000) {
+        $pages = 100000;
+    }
+    // engine 只作溯源标记，不参与命中判定；单行化 + 截 64 字符，空则记 'paddle5'
+    $engine = netdisk_ocr_log_oneline((string)($it['engine'] ?? ''), 64);
+    if ($engine === '') {
+        $engine = 'paddle5';
+    }
+    try {
+        $pdo = $pdo ?? db();
+        $known = false;
+        $st = $pdo->prepare('SELECT size, updated_at FROM netdisk_ocr_files WHERE content_hash=:h AND content_hash != "" LIMIT 1');
+        $st->execute([':h' => $hash]);
+        $known = $st->fetch(PDO::FETCH_ASSOC);
+        $st->closeCursor();
+        if (!is_array($known)) {
+            $st2 = $pdo->prepare('SELECT size, updated_at FROM netdisk_index WHERE content_hash=:h AND content_hash != "" LIMIT 1');
+            $st2->execute([':h' => $hash]);
+            $known = $st2->fetch(PDO::FETCH_ASSOC);
+            $st2->closeCursor();
+        }
+        if (is_array($known)) {
+            $kSize = (int)($known['size'] ?? 0);
+            if ($kSize > 0 && $size > 0 && $kSize !== $size) {
+                return ['ok' => false, 'reason' => 'size_mismatch'];
+            }
+            $kUpd = trim((string)($known['updated_at'] ?? ''));
+            $iUpd = trim((string)($it['updated_at'] ?? ''));
+            if ($kUpd !== '' && $iUpd !== '' && $kUpd !== $iUpd) {
+                return ['ok' => false, 'reason' => 'stale'];
+            }
+        }
+    } catch (Throwable $e) {
+        // 比对查询异常不阻断导入：size/updated_at 只是防错配保护，不能因此丢结果
+    }
+    return ['ok' => true, 'hash' => $hash, 'size' => $size, 'pages' => $pages, 'engine' => $engine, 'text' => $text];
+}
+
+// 从 Cloudreve 文件项 metadata 探测 sha256（大小写归一 + 去 'sha256:' 前缀 + 64hex 校验）。
+// 候选键名按优先级探测；命中返回小写 hex 并打 source=metadata 日志，未命中返回 ''（打降级日志带 reason）。
+// 注意：只在快速路径未命中后才调用（判定顺序①优先——快速路径命中时哈希函数零调用）。
+function netdisk_ocr_file_hash_meta(array $f, string $uri, string &$reason = ''): string {
+    if (isset($GLOBALS['ND_CA_HASH_CALLS'])) {
+        $GLOBALS['ND_CA_HASH_CALLS']++;
+    }
+    $md = $f['metadata'] ?? null;
+    $reason = 'metadata-absent';
+    if (!is_array($md) || empty($md)) {
+        @error_log('[nd-index] hash source=download reason=metadata-absent uri=' . netdisk_ocr_log_oneline($uri, 200));
+        return '';
+    }
+    foreach (['sys:sha256', 'sha256', 'sys:hash', 'hash', 'sys:checksum', 'checksum'] as $k) {
+        if (!array_key_exists($k, $md)) {
+            continue;
+        }
+        $v = strtolower(trim((string)$md[$k]));
+        if (str_starts_with($v, 'sha256:')) {
+            $v = substr($v, 7);
+        }
+        if (preg_match('/^[a-f0-9]{64}$/', $v)) {
+            @error_log('[nd-index] hash source=metadata uri=' . netdisk_ocr_log_oneline($uri, 200));
+            return $v;
+        }
+        $reason = 'metadata-algo-unknown';
+    }
+    @error_log('[nd-index] hash source=download reason=' . $reason . ' uri=' . netdisk_ocr_log_oneline($uri, 200));
+    return '';
+}
+
+// 降级路径：对已下载字节算 sha256（不为算哈希单独多下一次文件——复用调用方已持有的 $raw）。
+function netdisk_ocr_file_hash_bytes(string $raw, string $uri): string {
+    if (isset($GLOBALS['ND_CA_HASH_CALLS'])) {
+        $GLOBALS['ND_CA_HASH_CALLS']++;
+    }
+    $h = hash('sha256', $raw);
+    @error_log('[nd-index] hash source=download uri=' . netdisk_ocr_log_oneline($uri, 200));
+    return $h;
+}
+
+// 重建/刷新某分享的网盘本地全文索引（增量：按 Cloudreve updated_at 跳过未变化文件，不重复下载）
+// 返回 ['files'=>int, 'folders'=>int, 'texts'=>int, 'errors'=>int, 'skipped'=>int, 'notes'=>string,
+//        'ocr_done'=>int, 'ocr_queued'=>int, 'ocr_oversize'=>int]
+function netdisk_build_index_share(array $share, array $cfg, string $root, bool $allowOcr, int $jobId = 0, bool $forceOcr = false): array {
+    // 独立连接：避免与 db() 静态 PDO / web 端并发语句冲突（SQLite 同连接仅允许一个活动语句）
+    $pdo = new PDO('sqlite:' . $GLOBALS['config']['db_path']);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $pdo->exec('PRAGMA journal_mode = WAL;');
+    $pdo->exec('PRAGMA busy_timeout = 30000;');
+    $shareId = (int)$share['id'];
+    $files = 0;
+    $folders = 0;
+    $texts = 0;
+    $errors = 0;
+    $skipped = 0;       // 未变化、未重复下载的文件数
+    $skippedByExt = 0;  // 黑名单扩展名跳过的文件数
+    $notes = [];
+    $visited = 0;
+    $currentLevel = [$root];
+    $seenDirs = [$root => true];
+    $contCfg = $cfg['cfg'];
+    $configId = (int)($cfg['config_id'] ?? 0); // 连接级索引/OCR 配置归属
+    // 0024: 本轮内容寻址参数指纹（单一来源函数 netdisk_ocr_params_key）；results 表查询/写入均用此 key
+    $caParamsKey = netdisk_ocr_params_key($configId);
+    $ocrReuseHit = 0;     // 0024: 内容寻址命中复用（未重新 OCR）的文件数
+    $lastHb = 0; // 心跳节流：距上次上报至少 1s
+
+    // 预扫描总量（目录缓存 300s，正式遍历直接命中，不增加 API 请求）
+    $scan = netdisk_scan_share_tree($cfg, $root);
+    if ($jobId > 0) {
+        netdisk_index_job_update($jobId, [
+            'status' => 'running', 'started_at' => time(), 'heartbeat_at' => time(),
+            'total_dirs' => $scan['dirs'], 'total_files' => $scan['files'],
+            'processed_dirs' => 0, 'current_dir' => (string)$root, 'error' => '',
+            'current_detail' => '预扫描目录',
+        ], $pdo);
+    }
+    // 0030: job 开跑即把 OCR 文件级进度归零（不论本轮是否做 OCR）——旧任务残留的
+    // ocr_files_total（真机 219）会让「OCR 文件 2/219」跨轮显示，用户以为 OCR 没关掉；
+    // 本轮真做 OCR 时下面池前会重新写入 count($ocrTasks)。
+    if ($jobId > 0) {
+        netdisk_index_job_update($jobId, ['ocr_files_total' => 0, 'ocr_files_done' => 0], $pdo);
+    }
+    // 0018: 不再整表清空低优先级 OCR 队列——改在遍历结束后仅清理 uri 已消失的行，
+    // 保留 pending/failed 任务可续跑，避免"改并发→重建→队列重排"导致已完成/排队任务重复下载。
+    $ocrMaxBytes = $allowOcr ? (netdisk_index_ocr_max_mb($configId) * 1048576) : 0;
+    $ocrLowBytes = $allowOcr ? (netdisk_index_ocr_low_max_mb($configId) * 1048576) : 0;
+    $ocrTasks = [];       // 高优先级（≤max_mb）：重建时入池
+    $ocrQueued = 0;       // 低优先级（>max_mb ≤low_max_mb）：入队空闲 OCR
+    $ocrOversize = 0;     // >low_max_mb：跳过 OCR
+    $ocrZeroSkipped = 0;  // 0028: 跳过阈值MB=0 模式下被跳过的 OCR 候选数（本轮只建索引，不做 OCR）
+    $ocrDone = 0;         // 高优先级池实际 OCR 完成的文件数
+    $ocrSkipInc = 0;      // 0018: 状态表达标、增量跳过的 OCR 文件数
+    $ocrGaveUp = 0;       // 0018: failed/invalid 且 attempts>=3、放弃重试的 OCR 文件数
+    $ocrBackfilled = 0;   // 0018: 旧索引 text 已达标、回填状态行的文件数
+    $ocrFailedNow = 0;    // 0018: 本轮 OCR 失败（结果为空）的文件数
+    $ocrStarvedMark = 0;  // 0018: 本轮新入低优队列、状态标记 starved 的文件数
+    $ocrSkipQueued = 0;   // 0018 必改: 已在低优队列（pending/running）且 updated_at 未变、按增量跳过的文件数（不再重复下载）
+    $ocrQueueDup = 0;     // 0018 必改: 队列已有 pending/running 行时抑制的重复入队次数
+    $insQueue = $pdo->prepare('INSERT INTO netdisk_ocr_queue (share_id, config_id, uri, name, ext, size, status, created_at)
+        VALUES (:s, :c, :u, :n, :e, :z, "pending", :t)');
+
+    // 载入现有索引（增量依据：uri => [updated_at, text, is_folder]）
+    $existing = [];
+    $sel = $pdo->prepare('SELECT uri, updated_at, text, is_folder, content_hash FROM netdisk_index WHERE share_id = :s');
+    $sel->execute([':s' => $shareId]);
+    foreach ($sel->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $existing[(string)$row['uri']] = [
+            'updated_at' => (string)$row['updated_at'],
+            'text' => (string)$row['text'],
+            'is_folder' => (int)$row['is_folder'],
+            // 0024: fast-path 复用轮不重算哈希，写回时保留既有 content_hash（不被空串覆盖）
+            'content_hash' => (string)($row['content_hash'] ?? ''),
+        ];
+    }
+    $seenUris = [];
+
+    // 0018: 载入 OCR 文件级状态（uri => 行），增量判定与 attempts 计数依据
+    $ocrState = [];
+    $selOcr = $pdo->prepare('SELECT uri, updated_at, status, quality, chars, attempts, first_at, elapsed_ms, pages_per_min FROM netdisk_ocr_files WHERE share_id = :s');
+    $selOcr->execute([':s' => $shareId]);
+    foreach ($selOcr->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $ocrState[(string)$row['uri']] = $row;
+    }
+    $selOcr->closeCursor();
+    // 0018 必改: 载入「已排队」集合——队列中 pending/running 行的 uri；
+    // updated_at 未变时按增量跳过（$isUnchanged=true、复用旧正文、不下载），
+    // 避免大文件每轮重建都完整重新下载再排队。
+    $ocrQueueMap = [];
+    try {
+        $selQm = $pdo->prepare('SELECT uri FROM netdisk_ocr_queue WHERE share_id = :s AND status IN ("pending","running")');
+        $selQm->execute([':s' => $shareId]);
+        foreach ($selQm->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $ocrQueueMap[(string)$row['uri']] = true;
+        }
+        $selQm->closeCursor();
+    } catch (Throwable $ign) {
+        // 队列映射读取失败不影响本轮索引（退化为原下载路径）
+    }
+    // 状态行 upsert：冲突时保留 first_at，其余字段覆盖为本轮结果
+    $upOcrFile = $pdo->prepare('INSERT INTO netdisk_ocr_files (share_id, uri, updated_at, size, status, quality, chars, attempts, last_error, dpi, pages_total, pages_done, engine, elapsed_ms, pages_per_min, first_at, finished_at)
+        VALUES (:sid, :uri, :u, :z, :st, :q, :c, :a, :e, :dpi, :pt, :pd, :eng, :ems, :ppm, :first, :t)
+        ON CONFLICT(share_id, uri) DO UPDATE SET updated_at=excluded.updated_at, size=excluded.size, status=excluded.status,
+            quality=excluded.quality, chars=excluded.chars, attempts=excluded.attempts, last_error=excluded.last_error,
+            dpi=excluded.dpi, pages_total=excluded.pages_total, pages_done=excluded.pages_done, engine=excluded.engine,
+            elapsed_ms=excluded.elapsed_ms, pages_per_min=excluded.pages_per_min, finished_at=excluded.finished_at');
+    // 0020: starved 标记专用 upsert——与 worker 让位处同口径 CASE 保护：
+    // done/failed/invalid 行不被降级为 starved（0018 的两处裸 upsert 会把 done-不达标/failed-未熔断
+    // 的行覆盖成 starved），仅刷新 updated_at/size；attempts 对受保护行原样保留。
+    $upOcrFileStarved = $pdo->prepare('INSERT INTO netdisk_ocr_files (share_id, uri, updated_at, size, status, quality, chars, attempts, last_error, dpi, pages_total, pages_done, engine, elapsed_ms, pages_per_min, first_at, finished_at)
+        VALUES (:sid, :uri, :u, :z, "starved", 0, 0, :a, "starved", 0, 0, 0, "", 0, 0, :first, :t)
+        ON CONFLICT(share_id, uri) DO UPDATE SET updated_at=excluded.updated_at, size=excluded.size,
+            status=CASE WHEN netdisk_ocr_files.status IN ("done", "failed", "invalid") THEN netdisk_ocr_files.status ELSE "starved" END,
+            last_error=CASE WHEN netdisk_ocr_files.status IN ("done", "failed", "invalid") THEN netdisk_ocr_files.last_error ELSE "starved" END,
+            attempts=CASE WHEN netdisk_ocr_files.status IN ("done", "failed", "invalid") THEN netdisk_ocr_files.attempts ELSE excluded.attempts END');
+
+    $ins = $pdo->prepare('INSERT INTO netdisk_index (share_id, uri, name, is_folder, ext, size, parent_path, text, indexed_at, updated_at, content_hash)
+        VALUES (:sid, :uri, :name, :isf, :ext, :size, :parent, :text, :t, :u, :ch)
+        ON CONFLICT(share_id, uri) DO UPDATE SET name=:name2, is_folder=:isf2, ext=:ext2, size=:size2, parent_path=:parent2, text=:text2, indexed_at=:t2, updated_at=:u2, content_hash=:ch2');
+    $updText = $pdo->prepare('UPDATE netdisk_index SET text=:text WHERE share_id=:sid AND uri=:uri');
+    for ($depth = 0; $depth <= 5; $depth++) {
+        if (empty($currentLevel) || $visited >= 300) {
+            break;
+        }
+        $batch = [];
+        foreach ($currentLevel as $dirUri) {
+            if ($visited >= 300) {
+                break;
+            }
+            $visited++;
+            $batch[] = $dirUri;
+        }
+        $batchData = cloudreve_list_folder_multi($cfg, $batch, 300);
+        $nextLevel = [];
+        foreach ($batch as $dirUri) {
+            $data = $batchData[$dirUri] ?? null;
+            if (!is_array($data)) {
+                $errors++;
+                continue;
+            }
+            netdisk_register_redirect_aliases($contCfg, $root, $data);
+            $parent = $dirUri;
+            foreach (($data['files'] ?? []) as $f) {
+                $isFolder = (int)($f['type'] ?? 0) === 1;
+                $name = (string)($f['name'] ?? '');
+                $redirect = (string)($f['metadata']['sys:shared_redirect'] ?? '');
+                $navigateUri = $redirect !== '' ? $redirect : (string)($f['path'] ?? '');
+                if ($navigateUri === '') {
+                    continue;
+                }
+                $ext = $isFolder ? '' : netdisk_file_ext($name);
+                $size = (int)($f['size'] ?? 0);
+                $cloudUpdatedAt = (string)($f['updated_at'] ?? '');
+                $seenUris[$navigateUri] = true;
+                // 0024: 内容寻址哈希惰性求值——快速路径（判定顺序①）命中时保持 ''，哈希函数零调用；
+                // 未命中才在 F 分支（metadata 探测）或下载分支（字节顺带算）里赋值。
+                $caHash = '';
+
+$text = '';
+                $skipExts = netdisk_index_skip_exts($configId);
+                $isSkipExt = !$isFolder && isset($skipExts[$ext]);
+
+                // 增量判定：已索引且 uri/更新标记一致 → 复用旧正文，不下载。
+                // 但正文为空（上次 OCR 未完成/失败）的文件不跳过，本次重试。
+                $prev = $existing[$navigateUri] ?? null;
+                // 0018: OCR 候选不再"始终重扫"，改按 netdisk_ocr_files 状态表增量判定：
+                //  - status=done 且 quality>=0.6、chars>=20、updated_at 与云端一致 → 跳过（计入增量）；
+                //  - status IN (failed,invalid) 且 attempts>=3 → 跳过（不再无限重试坏文件）；
+                //  - 无状态行但旧 netdisk_index.text 已达标且 updated_at 一致 → 回填 done 行，不送 OCR（老索引平滑升级）；
+                //  - 已在低优队列（pending/running）且 updated_at 未变（无状态行或状态为 starved）→ 按增量跳过，不再重复下载；
+                //  - 其余（无记录 / updated_at 变化 / 质量不达标且未达重试上限）→ 照旧下载、入池。
+                // force_ocr=1（强制重跑）忽略上述全部跳过判定。netdisk_ocr_index_quality_ok() 仍作达标门槛。
+                $isOcrCandFile = !$isFolder && !$isSkipExt && netdisk_is_ocr_candidate($ext);
+                $ocrSkipDone = false;
+                $ocrSkipGaveUp = false;
+                $ocrBackfillRow = false;
+                $ocrSkipQueuedRow = false;
+                if ($isOcrCandFile && !$forceOcr) {
+                    $st = $ocrState[$navigateUri] ?? null;
+                    if ($st !== null) {
+                        $stUpdatedOk = ((string)$st['updated_at'] === $cloudUpdatedAt)
+                            || ((string)$st['updated_at'] === '' && $prev !== null && (string)$prev['updated_at'] === $cloudUpdatedAt);
+                        if ((string)$st['status'] === 'done' && (float)$st['quality'] >= 0.6 && (int)$st['chars'] >= 20 && $stUpdatedOk) {
+                            $ocrSkipDone = true;
+                        } elseif (in_array((string)$st['status'], ['failed', 'invalid'], true) && (int)$st['attempts'] >= 3) {
+                            $ocrSkipGaveUp = true;
+                        }
+                    } elseif ($prev !== null && (string)$prev['updated_at'] !== '' && (string)$prev['updated_at'] === $cloudUpdatedAt
+                        && netdisk_ocr_index_quality_ok((string)($prev['text'] ?? ''))) {
+                        $ocrBackfillRow = true;
+                    }
+                    // 0018 必改: 已排队（pending/running）且 updated_at 未变 → 按增量跳过，不再重复下载。
+                    // 仅在无状态行或状态为 starved 时生效：done-不达标 / failed-未熔断的文件仍需重扫，
+                    // 不能被遗留队列行掩盖（否则质量不达标的文件永远等不到重扫）。
+                    if (!$ocrSkipDone && !$ocrSkipGaveUp && !$ocrBackfillRow
+                        && isset($ocrQueueMap[$navigateUri])
+                        && ($st === null || (string)$st['status'] === 'starved')
+                        && $prev !== null && (string)$prev['updated_at'] !== '' && (string)$prev['updated_at'] === $cloudUpdatedAt) {
+                        $ocrSkipQueuedRow = true;
+                    }
+                }
+                $ocrSkipAny = $ocrSkipDone || $ocrSkipGaveUp || $ocrBackfillRow || $ocrSkipQueuedRow;
+                // OCR 候选：有状态行时完全以状态表为准（done+达标才跳，quality 不达标即使 text 看似达标也重扫）；
+                // 无状态行时才用 netdisk_ocr_index_quality_ok 判定旧 text 是否可回填。
+                $isUnchanged = !$isFolder && $prev !== null
+                    && $prev['updated_at'] !== '' && $prev['updated_at'] === $cloudUpdatedAt
+                    && (int)$prev['is_folder'] === 0
+                    && (netdisk_is_ocr_candidate($ext)
+                        ? (!$forceOcr && $ocrSkipAny)
+                        : $prev['text'] !== '');
+
+                if ($isFolder) {
+                    $text = '';
+                } elseif ($isUnchanged) {
+                    $text = $prev['text'];
+                    $skipped++;
+                    if ($isOcrCandFile) {
+                        // 0018: OCR 候选被增量跳过 → 分类计数；回填场景补写状态行（下次直接命中）
+                        if ($ocrSkipGaveUp) {
+                            $ocrGaveUp++;
+                        } elseif ($ocrSkipQueuedRow) {
+                            $ocrSkipQueued++;
+                        } else {
+                            $ocrSkipInc++;
+                        }
+                        if ($ocrBackfillRow) {
+                            $bfQ = netdisk_ocr_quality((string)$prev['text']);
+                            $bfChars = string_len((string)$prev['text']);
+                            $bfNow = time();
+                            netdisk_exec_retry(fn() => $upOcrFile->execute([
+                                ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
+                                ':st' => 'done', ':q' => $bfQ, ':c' => $bfChars, ':a' => 0, ':e' => '',
+                                ':dpi' => 0, ':pt' => 0, ':pd' => 0, ':eng' => '', ':ems' => 0, ':ppm' => 0.0, ':first' => $bfNow, ':t' => $bfNow,
+                            ]));
+                            $ocrState[$navigateUri] = ['uri' => $navigateUri, 'updated_at' => $cloudUpdatedAt, 'status' => 'done',
+                                'quality' => $bfQ, 'chars' => $bfChars, 'attempts' => 0, 'first_at' => $bfNow];
+                            $ocrBackfilled++;
+                        }
+                    }
+                } elseif ($isSkipExt) {
+                    // 黑名单扩展名：跳过下载正文/OCR，仅索引文件名
+                    $skippedByExt++;
+                } elseif ($isOcrCandFile && !$forceOcr
+                    && ($caHash = netdisk_ocr_file_hash_meta($f, $navigateUri)) !== ''
+                    && ($caRow = netdisk_ocr_result_lookup($caHash, $caParamsKey, $pdo)) !== null) {
+                    // 0024 判定顺序②：metadata 已带 sha256 且结果表命中达标 → 直接复用正文，不下载、不进 OCR 队列。
+                    // 改名/移动/重命名父目录后内容不变即走此路（uri 变、updated_at 可能变，但哈希不变）。
+                    $text = (string)$caRow['text'];
+                    $skipped++;
+                    $ocrReuseHit++;
+                    $rhNow = time();
+                    $rhQ = netdisk_ocr_quality($text);
+                    $rhChars = string_len($text);
+                    netdisk_exec_retry(fn() => $upOcrFile->execute([
+                        ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
+                        ':st' => 'done', ':q' => $rhQ, ':c' => $rhChars, ':a' => 0, ':e' => '',
+                        ':dpi' => 0, ':pt' => (int)$caRow['pages'], ':pd' => (int)$caRow['pages'], ':eng' => 'reuse-' . (string)$caRow['source'],
+                        ':ems' => 0, ':ppm' => 0.0, ':first' => $rhNow, ':t' => $rhNow,
+                    ]));
+                    netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_files SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                        ->execute([':h' => $caHash, ':s' => $shareId, ':u' => $navigateUri]));
+                    netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_results SET last_hit_at=:t WHERE content_hash=:h AND params_key=:k')
+                        ->execute([':t' => $rhNow, ':h' => $caHash, ':k' => $caParamsKey]));
+                    if ($text !== '') {
+                        $texts++;
+                    }
+                } elseif (!$isFolder && $size > 0 && $size <= 5242880) {
+                    // ≤5MB：下载取正文（文本/Office/PDF 文本层/OCR 高优）
+                    $isOcr = $allowOcr && netdisk_is_ocr_candidate($ext);
+                    $raw = netdisk_fetch_raw_bytes($contCfg, $navigateUri);
+                    if ($raw === null) {
+                        $errors++;
+                    } else {
+                        // 0024: 已下载字节顺带算哈希（OCR 候选才算；不为算哈希单独多下一次文件）
+                        if ($caHash === '' && $isOcr) {
+                            $caHash = netdisk_ocr_file_hash_bytes($raw, $navigateUri);
+                        }
+                        $text = netdisk_extract_text_from_bytes($ext, $raw, false);
+                        // 0024 判定顺序②：文本层为空需 OCR 时，先查内容寻址结果表；命中达标即复用，不进池/队
+                        $caHitG = ($isOcr && $text === '' && $caHash !== '' && !$forceOcr)
+                            ? netdisk_ocr_result_lookup($caHash, $caParamsKey, $pdo) : null;
+                        if ($caHitG !== null) {
+                            $text = (string)$caHitG['text'];
+                            $skipped++;
+                            $ocrReuseHit++;
+                            $rhNow = time();
+                            $rhQ = netdisk_ocr_quality($text);
+                            $rhChars = string_len($text);
+                            netdisk_exec_retry(fn() => $upOcrFile->execute([
+                                ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
+                                ':st' => 'done', ':q' => $rhQ, ':c' => $rhChars, ':a' => 0, ':e' => '',
+                                ':dpi' => 0, ':pt' => (int)$caHitG['pages'], ':pd' => (int)$caHitG['pages'], ':eng' => 'reuse-' . (string)$caHitG['source'],
+                                ':ems' => 0, ':ppm' => 0.0, ':first' => $rhNow, ':t' => $rhNow,
+                            ]));
+                            netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_files SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                                ->execute([':h' => $caHash, ':s' => $shareId, ':u' => $navigateUri]));
+                            netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_results SET last_hit_at=:t WHERE content_hash=:h AND params_key=:k')
+                                ->execute([':t' => $rhNow, ':h' => $caHash, ':k' => $caParamsKey]));
+                        } elseif ($isOcr && $text === '' && $ocrLowBytes === 0) {
+                            // 0028: 跳过阈值MB=0——下载/哈希/文件名索引照旧，但不进 OCR 池、不进队列
+                            $ocrZeroSkipped++;
+                        } elseif ($isOcr && $text === '' && $size <= $ocrLowBytes) {
+                            if ($size <= $ocrMaxBytes) {
+                                $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
+                                if ($tmp !== false) {
+                                    @file_put_contents($tmp, $raw);
+                                    $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId, 'updated_at' => $cloudUpdatedAt, 'size' => $size, 'content_hash' => $caHash];
+                                } else {
+                                    $errors++;
+                                }
+                            } else {
+                                // 0018 必改: 已有 pending/running 队列行则不重复入队（多轮重建不再堆积重复行、同一文件不被 OCR 多遍）
+                                $qDup = false;
+                                try {
+                                    $qDupSt = $pdo->prepare('SELECT COUNT(*) FROM netdisk_ocr_queue WHERE share_id=:s AND uri=:u AND status IN ("pending","running")');
+                                    $qDupSt->execute([':s' => $shareId, ':u' => $navigateUri]);
+                                    $qDup = (int)$qDupSt->fetchColumn() > 0;
+                                    $qDupSt->closeCursor();
+                                } catch (Throwable $ign) {}
+                                if (!$qDup) {
+                                    netdisk_exec_retry(fn() => $insQueue->execute([':s' => $shareId, ':c' => $configId, ':u' => $navigateUri, ':n' => $name, ':e' => $ext, ':z' => $size, ':t' => time()]));
+                                    $ocrQueued++;
+                                } else {
+                                    $ocrQueueDup++;
+                                }
+                                // 0018: 低优队列文件标记 starved（排队待空闲处理；让位/排队不计失败、不计入 attempts>=3 永久跳过）
+                                // 0020: 改用 CASE 保护 upsert——done/failed/invalid 行不被降级，仅刷新 updated_at/size
+                                $qNow = time();
+                                $qPrev = $ocrState[$navigateUri] ?? null;
+                                $qPrevSt = (string)($qPrev['status'] ?? '');
+                                netdisk_exec_retry(fn() => $upOcrFileStarved->execute([
+                                    ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
+                                    ':a' => (int)($qPrev['attempts'] ?? 0), ':first' => $qNow, ':t' => $qNow,
+                                ]));
+                                if (in_array($qPrevSt, ['done', 'failed', 'invalid'], true)) {
+                                    // 受保护行：DB 保持原 status/last_error/attempts，内存态同步只刷新 updated_at/size
+                                    if (is_array($qPrev)) {
+                                        $ocrState[$navigateUri]['updated_at'] = $cloudUpdatedAt;
+                                        $ocrState[$navigateUri]['size'] = $size;
+                                    }
+                                } else {
+                                    $ocrState[$navigateUri] = ['uri' => $navigateUri, 'updated_at' => $cloudUpdatedAt, 'status' => 'starved',
+                                        'quality' => 0, 'chars' => 0, 'attempts' => (int)($qPrev['attempts'] ?? 0), 'first_at' => $qNow];
+                                    $ocrStarvedMark++;
+                                }
+                            }
+                        }
+                        if ($text !== '') {
+                            $texts++;
+                        }
+                    }
+                } elseif (!$isFolder && $size > 5242880 && $size > 0) {
+                    // 5MB~上限 的 OCR 候选：≤max_mb 取字节入池，否则入低优队列/跳过
+                    $isOcr = $allowOcr && netdisk_is_ocr_candidate($ext);
+                    if ($isOcr && $ocrLowBytes === 0) {
+                        // 0028: 跳过阈值MB=0 时不再报「超大文件（>0MB）」，一律计为「只建索引」跳过
+                        $ocrZeroSkipped++;
+                    } elseif ($isOcr && $size > $ocrLowBytes) {
+                        $ocrOversize++;
+                    } elseif ($isOcr && $size <= $ocrMaxBytes) {
+                        $raw = netdisk_fetch_raw_bytes($contCfg, $navigateUri);
+                        if ($raw === null) {
+                            $errors++;
+                        } else {
+                            // 0024: 已下载字节顺带算哈希
+                            if ($caHash === '') {
+                                $caHash = netdisk_ocr_file_hash_bytes($raw, $navigateUri);
+                            }
+                            $caHitH = (!$forceOcr) ? netdisk_ocr_result_lookup($caHash, $caParamsKey, $pdo) : null;
+                            if ($caHitH !== null) {
+                                // 0024 判定顺序②：内容寻址命中达标 → 复用正文，不进高优池
+                                $text = (string)$caHitH['text'];
+                                $skipped++;
+                                $ocrReuseHit++;
+                                $rhNow = time();
+                                $rhQ = netdisk_ocr_quality($text);
+                                $rhChars = string_len($text);
+                                netdisk_exec_retry(fn() => $upOcrFile->execute([
+                                    ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
+                                    ':st' => 'done', ':q' => $rhQ, ':c' => $rhChars, ':a' => 0, ':e' => '',
+                                    ':dpi' => 0, ':pt' => (int)$caHitH['pages'], ':pd' => (int)$caHitH['pages'], ':eng' => 'reuse-' . (string)$caHitH['source'],
+                                    ':ems' => 0, ':ppm' => 0.0, ':first' => $rhNow, ':t' => $rhNow,
+                                ]));
+                                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_files SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                                    ->execute([':h' => $caHash, ':s' => $shareId, ':u' => $navigateUri]));
+                                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_results SET last_hit_at=:t WHERE content_hash=:h AND params_key=:k')
+                                    ->execute([':t' => $rhNow, ':h' => $caHash, ':k' => $caParamsKey]));
+                                if ($text !== '') {
+                                    $texts++;
+                                }
+                            } else {
+                                $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
+                                if ($tmp !== false) {
+                                    @file_put_contents($tmp, $raw);
+                                    $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId, 'updated_at' => $cloudUpdatedAt, 'size' => $size, 'content_hash' => $caHash];
+                                } else {
+                                    $errors++;
+                                }
+                            }
+                        }
+                    } elseif ($isOcr) {
+                        // 0018 必改: 已有 pending/running 队列行则不重复入队（多轮重建不再堆积重复行、同一文件不被 OCR 多遍）
+                        $qDup = false;
+                        try {
+                            $qDupSt = $pdo->prepare('SELECT COUNT(*) FROM netdisk_ocr_queue WHERE share_id=:s AND uri=:u AND status IN ("pending","running")');
+                            $qDupSt->execute([':s' => $shareId, ':u' => $navigateUri]);
+                            $qDup = (int)$qDupSt->fetchColumn() > 0;
+                            $qDupSt->closeCursor();
+                        } catch (Throwable $ign) {}
+                        if (!$qDup) {
+                            netdisk_exec_retry(fn() => $insQueue->execute([':s' => $shareId, ':c' => $configId, ':u' => $navigateUri, ':n' => $name, ':e' => $ext, ':z' => $size, ':t' => time()]));
+                            $ocrQueued++;
+                        } else {
+                            $ocrQueueDup++;
+                        }
+                        // 0018: 低优队列文件标记 starved（排队待空闲处理；让位/排队不计失败、不计入 attempts>=3 永久跳过）
+                        // 0020: 改用 CASE 保护 upsert——done/failed/invalid 行不被降级，仅刷新 updated_at/size
+                        $qNow = time();
+                        $qPrev = $ocrState[$navigateUri] ?? null;
+                        $qPrevSt = (string)($qPrev['status'] ?? '');
+                        netdisk_exec_retry(fn() => $upOcrFileStarved->execute([
+                            ':sid' => $shareId, ':uri' => $navigateUri, ':u' => $cloudUpdatedAt, ':z' => $size,
+                            ':a' => (int)($qPrev['attempts'] ?? 0), ':first' => $qNow, ':t' => $qNow,
+                        ]));
+                        if (in_array($qPrevSt, ['done', 'failed', 'invalid'], true)) {
+                            // 受保护行：DB 保持原 status/last_error/attempts，内存态同步只刷新 updated_at/size
+                            if (is_array($qPrev)) {
+                                $ocrState[$navigateUri]['updated_at'] = $cloudUpdatedAt;
+                                $ocrState[$navigateUri]['size'] = $size;
+                            }
+                        } else {
+                            $ocrState[$navigateUri] = ['uri' => $navigateUri, 'updated_at' => $cloudUpdatedAt, 'status' => 'starved',
+                                'quality' => 0, 'chars' => 0, 'attempts' => (int)($qPrev['attempts'] ?? 0), 'first_at' => $qNow];
+                            $ocrStarvedMark++;
+                        }
+                    }
+                }
+                $now = time();
+                // 0024: content_hash 写回——本轮算出/命中即用新值；快速路径等未算哈希的轮次保留既有值（不被空串覆盖）
+                $caHashW = $caHash !== '' ? $caHash : (string)($prev['content_hash'] ?? '');
+                netdisk_exec_retry(fn() => $ins->execute([
+                    ':sid' => $shareId, ':uri' => $navigateUri, ':name' => $name, ':isf' => $isFolder ? 1 : 0,
+                    ':ext' => $ext, ':size' => $size, ':parent' => $parent, ':text' => $text, ':t' => $now, ':u' => $cloudUpdatedAt, ':ch' => $caHashW,
+                    ':name2' => $name, ':isf2' => $isFolder ? 1 : 0, ':ext2' => $ext, ':size2' => $size,
+                    ':parent2' => $parent, ':text2' => $text, ':t2' => $now, ':u2' => $cloudUpdatedAt, ':ch2' => $caHashW,
+                ]));
+                // 细粒度进度：按文件上报当前处理对象 + 心跳（节流 ≥1s）
+                if ($jobId > 0 && ($now - $lastHb) >= 1) {
+                    $lastHb = $now;
+                    netdisk_index_job_update($jobId, [
+                        'files' => $files + 1,
+                        'processed_dirs' => $visited,
+                        'current_uri' => $navigateUri,
+                        'current_name' => $name,
+                        'current_detail' => $isFolder ? '遍历目录' : '解析内容',
+                        'queue_remaining' => max(0, $scan['files'] - $files - 1),
+                        'heartbeat_at' => $now,
+                    ], $pdo);
+                }
+                if ($isFolder) {
+                    $folders++;
+                } else {
+                    $files++;
+                }
+                if ($isFolder) {
+                    $childUri = $redirect !== '' ? $redirect : $navigateUri;
+                    if ($childUri !== '' && netdisk_uri_within_root($root, $childUri, $contCfg) && !isset($seenDirs[$childUri])) {
+                        $seenDirs[$childUri] = true;
+                        $nextLevel[] = $childUri;
+                    }
+                }
+            }
+            if ($jobId > 0) {
+                netdisk_index_job_update($jobId, [
+                    'processed_dirs' => $visited,
+                    'files' => $files,
+                    'folders' => $folders,
+                    'texts' => $texts,
+                    'errors' => $errors,
+                    'ocr_queued' => $ocrQueued,
+                ], $pdo);
+            }
+            // 终止响应：用户请求取消 → 中断遍历（跳过 OCR 池）
+            if ($jobId > 0 && netdisk_index_job_cancelled($jobId, $pdo)) {
+                // 清理已入队的低优任务与临时文件由外层统一处理；此处直接跳出遍历
+                unset($currentLevel);
+                break 2;
+            }
+        }
+        $currentLevel = $nextLevel;
+    }
+    // 0030: $allowOcr 是开跑时的快照（worker 一轮只读一次），用户中途关掉 OCR 后旧实现会一路跑到底。
+    // 这里穿透进程内配置缓存重读一次；已关则本轮剩余候选整批不收（删临时文件、不写状态行、不计数）。
+    $ocrOffMid = false;
+    if ($allowOcr && !netdisk_index_ocr_enabled($configId, true)) {
+        $ocrOffMid = true;
+        $ocrAbortAtEntry = count($ocrTasks);
+        foreach ($ocrTasks as $task) {
+            if (isset($task['tmp']) && is_file($task['tmp'])) {
+                @unlink($task['tmp']);
+            }
+        }
+        $ocrTasks = [];
+        if ($ocrAbortAtEntry > 0) {
+            $notes[] = 'OCR 已在运行中被关闭：剩余 ' . $ocrAbortAtEntry . ' 个候选未识别（本轮只建索引）';
+        }
+        if ($jobId > 0) {
+            netdisk_index_job_update($jobId, ['ocr_files_total' => 0, 'ocr_files_done' => 0], $pdo);
+        }
+    }
+    // 高优先级 OCR 并发池：遍历结束后统一执行（同时 ≤concurrency 个 tesseract）
+    if (!empty($ocrTasks) && $allowOcr) {
+        // 记录本次高优 OCR 文件总数（供前端 OCR 文件级进度条）
+        if ($jobId > 0) {
+            netdisk_index_job_update($jobId, ['ocr_files_total' => count($ocrTasks), 'ocr_files_done' => 0], $pdo);
+        }
+        $poolRes = netdisk_ocr_run_pool($ocrTasks, netdisk_index_ocr_concurrency($configId), $jobId, $pdo);
+        // 0030: 池内逐文件重读开关后可能中途停手——剩余候选不 finalize、不写状态行
+        $ocrOffMid = $ocrOffMid || !empty($poolRes['ocr_off']);
+        if ($ocrOffMid && $jobId > 0) {
+            netdisk_index_job_update($jobId, ['ocr_files_total' => 0, 'ocr_files_done' => 0], $pdo);
+        }
+        $stEngine = (netdisk_ocr_sidecar_enabled() && netdisk_ocr_sidecar_available()) ? 'paddleocr-sidecar'
+            : (trim((string)shell_exec('command -v tesseract 2>/dev/null')) !== '' ? 'tesseract' : '');
+        // 0018: 池起点计时——elapsed_ms/pages_per_min 供 0021 自动定档做历史样本
+        $poolT0 = microtime(true);
+        // 0019: 逐文件 finalize（旧实现对全部任务一次性 netdisk_ocr_finalize_results，
+        // 整本重扫+逐级升 DPI 期间零心跳（前端 300s 判死），一次 Fatal 全部结果尽丢）。
+        // 现在每文件独立 finalize：完成即写正文+状态行+心跳；中途崩溃时已完成文件全部保留，
+        // 配合 0018 增量判定，重启后天然按文件粒度续跑。
+        $finTotal = count($ocrTasks);
+        $finIdx = 0;
+        $ocrAbortedOff = 0; // 0030: 因运行中关闭 OCR 而未识别的候选数
+        foreach ($ocrTasks as $task) {
+            $uri = $task['uri'];
+            $finIdx++;
+            // 0030: 运行中关闭 OCR → 池里已出结果的照常 finalize，其余整批丢弃（删 tmp、不写状态行）
+            if ($ocrOffMid && !isset($poolRes['results'][$uri])) {
+                if (isset($task['tmp']) && is_file($task['tmp'])) {
+                    @unlink($task['tmp']);
+                }
+                $ocrAbortedOff++;
+                continue;
+            }
+            // 0018: finalize 会删除 tmp，先抓该文件 PDF 总页数供状态表落库（尽力而为，取不到记 0）
+            $stPages = 0;
+            if (strtolower(ltrim((string)($task['ext'] ?? ''), '.')) === 'pdf' && isset($task['tmp']) && is_file($task['tmp'])) {
+                $pi = @shell_exec('pdfinfo ' . escapeshellarg($task['tmp']) . ' 2>/dev/null');
+                if (is_string($pi) && preg_match('/Pages:\s+(\d+)/', $pi, $pm)) {
+                    $stPages = (int)$pm[1];
+                }
+            }
+            // 该文件的池内原始结果单独交给 finalize（签名不变，单元素数组即逐文件模式）
+            $oneRaw = isset($poolRes['results'][$uri]) ? [$uri => $poolRes['results'][$uri]] : [];
+            $oneFinal = netdisk_ocr_finalize_results([$task], $oneRaw);
+            // 0019: 每文件 finalize 完成即写心跳——长 PDF 后处理期间前端不再误判 worker 已死
+            if ($jobId > 0) {
+                netdisk_index_job_update($jobId, [
+                    'heartbeat_at' => time(),
+                    'current_detail' => 'OCR 后处理 ' . $finIdx . '/' . $finTotal . '：' . (string)($task['name'] ?? ''),
+                ], $pdo);
+            }
+            $txt = trim((string)($oneFinal[$uri] ?? ''));
+            if ($txt !== '') {
+                netdisk_exec_retry(fn() => $updText->execute([':text' => $txt, ':sid' => $shareId, ':uri' => $uri]));
+                $texts++;
+                $ocrDone++;
+                // 0024 判定顺序③：OCR 成功后额外写一份进内容寻址结果表（source='nas'），供改名/移动/多分享复用
+                $caTaskHash = (string)($task['content_hash'] ?? '');
+                if ($caTaskHash !== '') {
+                    netdisk_ocr_result_save($caTaskHash, $caParamsKey, (int)($task['size'] ?? 0), $stPages, $txt, $stEngine, 'nas', $pdo);
+                    netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_index SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                        ->execute([':h' => $caTaskHash, ':s' => $shareId, ':u' => $uri]));
+                }
+            } else {
+                $prevText = $existing[$uri]['text'] ?? '';
+                if ($prevText !== '') {
+                    netdisk_exec_retry(fn() => $updText->execute([':text' => $prevText, ':sid' => $shareId, ':uri' => $uri]));
+                }
+            }
+            // 0018: 无论成败都落状态行——下轮重建的增量判定据此进行；
+            // 失败仅 attempts++ 并计入 notes，不中断整轮（连续 3 次失败后不再重试）。
+            $stQ = $txt !== '' ? netdisk_ocr_quality($txt) : 0.0;
+            $stChars = $txt !== '' ? string_len($txt) : 0;
+            $prevSt = $ocrState[$uri] ?? null;
+            // 0018 必改: attempts = 连续失败计数——成功归零；失败 +1；force_ocr 轮失败从 1 重计（不被 3 次上限挡住）。
+            // 否则成功多轮的文件累计 attempts>=3 后，一次偶发失败即被永久放弃。
+            $stAtt = ($txt !== '') ? 0 : ($forceOcr ? 1 : ((int)($prevSt['attempts'] ?? 0) + 1));
+            $stFirst = (int)($prevSt['first_at'] ?? 0) > 0 ? (int)$prevSt['first_at'] : time();
+            // 0019: 失败归因——预算守卫标记过的文件（巨图/超大文件）落 invalid + 具体原因，
+            // 不再笼统记 failed；invalid 同样计入 attempts>=3 熔断（巨图重试三次也不会变小）。
+            $invReason = isset($task['tmp']) ? netdisk_ocr_invalid_reason((string)$task['tmp']) : '';
+            // 0020: sidecar 服务端失败（5xx/超时/解析失败）→ 状态行仍 failed（文件本身不坏，
+            // 交连续失败计数管），last_error 记具体原因替代笼统文案
+            $failReason = isset($task['tmp']) ? netdisk_ocr_fail_reason((string)$task['tmp']) : '';
+            $stStatus = $txt !== '' ? 'done' : ($invReason !== '' ? 'invalid' : 'failed');
+            $stErr = $txt !== '' ? '' : ($invReason !== '' ? $invReason : ($failReason !== '' ? $failReason : 'OCR 返回空文本（图片损坏/格式不支持/OCR 服务异常）'));
+            // 0019: 页级进度——成功记总页数；失败记已成功识别页数（GLOBALS 由 recognize_pdf 维护）
+            $stPagesDone = $txt !== '' ? $stPages : (int)($GLOBALS['ND_OCR_PAGES_DONE'][(string)($task['tmp'] ?? '')] ?? 0);
+            // 0018: 耗时指标——优先 finalize 逐文件真实耗时；桩/异常缺失时退回池累计。
+            // pages_per_min 仅 PDF（页数>0）有意义，图片记 0。
+            $stElapsed = (int)($GLOBALS['ND_OCR_FINALIZE_TIMINGS'][$uri] ?? 0);
+            if ($stElapsed <= 0) {
+                $stElapsed = (int)round((microtime(true) - $poolT0) * 1000);
+            }
+            $stPpm = ($stPages > 0 && $stElapsed > 0) ? round($stPages / ($stElapsed / 60000.0), 2) : 0.0;
+            netdisk_exec_retry(fn() => $upOcrFile->execute([
+                ':sid' => $shareId, ':uri' => $uri, ':u' => (string)($task['updated_at'] ?? ''), ':z' => (int)($task['size'] ?? 0),
+                ':st' => $stStatus, ':q' => $stQ, ':c' => $stChars, ':a' => $stAtt, ':e' => $stErr,
+                ':dpi' => $txt !== '' ? netdisk_index_ocr_dpi_start($configId) : 0,
+                ':pt' => $stPages, ':pd' => $stPagesDone,
+                ':eng' => $stEngine, ':ems' => $stElapsed, ':ppm' => $stPpm, ':first' => $stFirst, ':t' => time(),
+            ]));
+            $ocrState[$uri] = ['uri' => $uri, 'updated_at' => (string)($task['updated_at'] ?? ''), 'status' => $stStatus,
+                'quality' => $stQ, 'chars' => $stChars, 'attempts' => $stAtt, 'first_at' => $stFirst];
+            // 0024: content_hash 回填必须在状态行 upsert 之后——upsert 语句不含该列，
+            // 若在 upsert 前 UPDATE 会命中 0 行，状态行 content_hash 永远为空（快速路径①因此永不命中）。
+            if ($txt !== '' && (string)($task['content_hash'] ?? '') !== '') {
+                $caRtHash = (string)$task['content_hash'];
+                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_files SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                    ->execute([':h' => $caRtHash, ':s' => $shareId, ':u' => $uri]));
+            }
+            if ($txt === '') {
+                $ocrFailedNow++;
+            }
+            // 每个文件完成（含页级 + 自适应 DPI 重试）后递增文件级 OCR 进度
+            if ($jobId > 0) {
+                netdisk_index_job_update($jobId, [
+                    'ocr_files_done' => $ocrDone,
+                    'heartbeat_at' => time(),
+                    'current_detail' => 'OCR 完成 ' . $ocrDone . '/' . count($ocrTasks) . ' 个文件',
+                ], $pdo);
+            }
+        }
+    } elseif (!empty($ocrTasks)) {
+        // OCR 未启用：清理临时文件，不处理
+        foreach ($ocrTasks as $task) {
+            @unlink($task['tmp']);
+        }
+    }
+    // 清理索引中已不存在的条目（删除的文件）
+    // 0024: 此处只删路径行（netdisk_index 与 netdisk_ocr_files）；netdisk_ocr_results 结果行一行都不跟着删——
+    // 路径行删除后对应结果行变孤儿，交收尾 GC 按 last_hit_at + TTL/容量淘汰
+    // （PC 先扫后传的结果在 NAS 遍历到该文件之前就是孤儿，绝不能被当垃圾清掉）。
+    $allUris = netdisk_exec_retry(fn() => $pdo->query("SELECT uri FROM netdisk_index WHERE share_id=$shareId")->fetchAll(PDO::FETCH_COLUMN)) ?: [];
+    $toDelete = array_values(array_diff($allUris, array_keys($seenUris)));
+    if (!empty($toDelete)) {
+        $del = $pdo->prepare('DELETE FROM netdisk_index WHERE share_id=:s AND uri=:u');
+        $delOcrF = $pdo->prepare('DELETE FROM netdisk_ocr_files WHERE share_id=:s AND uri=:u');
+        foreach ($toDelete as $uri) {
+            netdisk_exec_retry(fn() => $del->execute([':s' => $shareId, ':u' => $uri]));
+            netdisk_exec_retry(fn() => $delOcrF->execute([':s' => $shareId, ':u' => $uri]));
+        }
+    }
+    // 0018: 替代原"重建开头整表清空"——仅删除本轮遍历中已消失（云端删除/移出 root）的队列行，
+    // pending/failed 任务保留续跑；与 netdisk_index 的清理同处执行。
+    try {
+        $qSel = $pdo->prepare('SELECT id, uri FROM netdisk_ocr_queue WHERE share_id = :s');
+        $qSel->execute([':s' => $shareId]);
+        $qRows = $qSel->fetchAll(PDO::FETCH_ASSOC);
+        $qSel->closeCursor();
+        $delQ = $pdo->prepare('DELETE FROM netdisk_ocr_queue WHERE id = :id');
+        foreach ($qRows as $qr) {
+            if (!isset($seenUris[(string)$qr['uri']])) {
+                netdisk_exec_retry(fn() => $delQ->execute([':id' => (int)$qr['id']]));
+            }
+        }
+    } catch (Throwable $ign) {
+        // 队列清理失败不影响本轮索引结果
+    }
+    // 0024: 重建收尾跑一次结果表 GC（孤儿按 last_hit_at + TTL/容量淘汰；被引用行永不删）
+    netdisk_ocr_results_gc($pdo);
+    if ($visited >= 300) {
+        $notes[] = '达到目录上限(300)，大目录可能未完整索引';
+    }
+    if ($skipped > 0) {
+        $notes[] = $skipped . ' 个文件未变化已跳过（增量）';
+    }
+    if ($skippedByExt > 0) {
+        $notes[] = $skippedByExt . ' 个黑名单扩展名文件跳过正文（仅文件名索引）';
+    }
+    if ($ocrDone > 0) {
+        $notes[] = 'OCR 完成 ' . $ocrDone . ' 个文件（并发 ' . netdisk_index_ocr_concurrency() . '）';
+    }
+    if ($ocrQueued > 0) {
+        // 0028: 正常上限MB=0 时「>0MB」是鬼话，改为说清语义；同时备注按本连接的配置取阈值（旧实现取全局默认值）
+        if (netdisk_index_ocr_max_mb($configId) === 0) {
+            $notes[] = '正常上限MB=0：本轮不进高优 OCR 池，' . $ocrQueued . ' 个 OCR 候选全部加入低优先级队列，将后台空闲时处理';
+        } else {
+            $notes[] = $ocrQueued . ' 个较大文件（>' . netdisk_index_ocr_max_mb($configId) . 'MB）已加入低优先级 OCR 队列，将后台空闲时处理';
+        }
+    }
+    if ($ocrStarvedMark > 0) {
+        $notes[] = $ocrStarvedMark . ' 个低优队列文件标记为待处理（starved）——排队/让位不计入失败次数，不会触发≥3 次永久跳过';
+    }
+    if (!empty($ocrAbortedOff)) {
+        // 0030: 运行中关闭 OCR 的收尾提示（与「跳过阈值MB=0」是两种不同情形，各自一条）
+        $notes[] = 'OCR 已在运行中被关闭：' . $ocrAbortedOff . ' 个候选未识别，临时文件已清理';
+    }
+    if ($allowOcr && $ocrLowBytes === 0) {
+        // 0028: 跳过阈值MB=0 → 本轮完全不做 OCR；旧实现会输出「n 个超大文件（>0MB）跳过 OCR」这种误导文案
+        $notes[] = '跳过阈值MB=0：本轮只建索引、不做 OCR' . ($ocrZeroSkipped > 0 ? '，' . $ocrZeroSkipped . ' 个 OCR 候选已跳过' : '');
+    } elseif ($ocrOversize > 0) {
+        $notes[] = $ocrOversize . ' 个超大文件（>' . netdisk_index_ocr_low_max_mb($configId) . 'MB）跳过 OCR，仍按文件名索引';
+    }
+    if ($ocrReuseHit > 0) {
+        $notes[] = $ocrReuseHit . ' 个 OCR 文件按内容哈希命中复用（改名/移动/多分享共享，未重新识别）';
+    }
+    if ($ocrSkipInc > 0) {
+        $notes[] = $ocrSkipInc . ' 个 OCR 文件已跳过（增量：结果达标未重扫' . ($ocrBackfilled > 0 ? '，含 ' . $ocrBackfilled . ' 个旧索引回填' : '') . '）';
+    }
+    if ($ocrSkipQueued > 0) {
+        $notes[] = $ocrSkipQueued . ' 个 OCR 文件已跳过（已在低优先级队列排队，未重复下载）';
+    }
+    if ($ocrQueueDup > 0) {
+        $notes[] = $ocrQueueDup . ' 个文件已在低优先级队列中，本轮抑制重复入队';
+    }
+    if ($ocrGaveUp > 0) {
+        $notes[] = $ocrGaveUp . ' 个文件 OCR 失败≥3 次不再重试（可在重建时勾选「强制重跑 OCR」重试）';
+    }
+    if ($ocrFailedNow > 0) {
+        $notes[] = $ocrFailedNow . ' 个文件 OCR 失败已跳过（状态已记录，下轮重建自动重试）';
+    }
+    if ($jobId > 0) {
+        $cancelled = netdisk_index_job_cancelled($jobId, $pdo);
+        netdisk_index_job_update($jobId, [
+            'status' => $cancelled ? 'cancelled' : 'done',
+            'finished_at' => time(),
+            'files' => $files,
+            'folders' => $folders,
+            'texts' => $texts,
+            'errors' => $errors,
+            'ocr_done' => $ocrDone,
+            'ocr_queued' => $ocrQueued,
+            'processed_dirs' => $visited,
+            'cancel_requested' => 0,
+            'notes' => implode('；', $notes),
+        ], $pdo);
+    }
+    return ['files' => $files, 'folders' => $folders, 'texts' => $texts, 'errors' => $errors, 'skipped' => $skipped,
+        'notes' => implode('；', $notes), 'ocr_done' => $ocrDone, 'ocr_queued' => $ocrQueued, 'ocr_oversize' => $ocrOversize,
+        'cancelled' => isset($cancelled) ? (bool)$cancelled : false];
+}
+
+// 低优先级 OCR 队列：worker 空闲时处理一批（时间盒 maxSeconds，最长一次跑完），
+// 返回本批处理完成的项数。处理结果回填 netdisk_index.text。遇到新的 pending 重建 job 时提前让位。
+// 注意：不在此处用全局 OCR 开关拦截——队列项按各自 config_id 的连接级 OCR 配置处理。
+function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
+    // 独立连接：避免与 db() 静态 PDO 上其它活动语句冲突（SQLite 同连接仅允许一个活动语句）
+    $pdo = new PDO('sqlite:' . $GLOBALS['config']['db_path']);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $pdo->exec('PRAGMA journal_mode = WAL;');
+    $pdo->exec('PRAGMA busy_timeout = 30000;');
+    $concurrency = netdisk_index_ocr_concurrency(0);
+    $start = time();
+    $totalDone = 0;
+    $markRunning = $pdo->prepare('UPDATE netdisk_ocr_queue SET status="running", started_at=:t, error="" WHERE id=:id');
+    $markFailed = $pdo->prepare('UPDATE netdisk_ocr_queue SET status="failed", error=:e, finished_at=:t WHERE id=:id');
+    $markDone = $pdo->prepare('UPDATE netdisk_ocr_queue SET status="done", finished_at=:t, error="" WHERE id=:id');
+    $updIndex = $pdo->prepare('UPDATE netdisk_index SET text=:t WHERE share_id=:s AND uri=:u');
+    // 0018: 队列批处理的结果同样落 netdisk_ocr_files 状态表（否则队列完成的重建仍会重扫）
+    $upOcrFileQ = $pdo->prepare('INSERT INTO netdisk_ocr_files (share_id, uri, updated_at, size, status, quality, chars, attempts, last_error, dpi, pages_total, pages_done, engine, elapsed_ms, pages_per_min, first_at, finished_at)
+        VALUES (:sid, :uri, :u, :z, :st, :q, :c, :a, :e, :dpi, :pt, :pd, :eng, :ems, :ppm, :first, :t)
+        ON CONFLICT(share_id, uri) DO UPDATE SET updated_at=excluded.updated_at, size=excluded.size, status=excluded.status,
+            quality=excluded.quality, chars=excluded.chars, attempts=excluded.attempts, last_error=excluded.last_error,
+            dpi=excluded.dpi, pages_total=excluded.pages_total, pages_done=excluded.pages_done, engine=excluded.engine,
+            elapsed_ms=excluded.elapsed_ms, pages_per_min=excluded.pages_per_min, finished_at=excluded.finished_at');
+    $shareStmt = $pdo->prepare('SELECT * FROM shares WHERE id=:id AND deleted_at IS NULL');
+    // 自愈：回收 running 超时（>10 分钟）的队列项——worker 崩溃/卡死后遗留，避免永久卡住
+    $pdo->prepare('UPDATE netdisk_ocr_queue SET status="failed", error="处理超时已重置", finished_at=:now
+        WHERE status="running" AND started_at>0 AND started_at<:cut')
+        ->execute([':now' => time(), ':cut' => time() - 600]);
+
+    $qYielded = false; // 0018: 是否因 pending 重建 job 让位（让位时把仍 pending 的队列项标记 starved）
+    while (time() - $start < $maxSeconds) {
+        $rows = netdisk_exec_retry(function () use ($pdo): array {
+            $stmt = $pdo->query('SELECT id, share_id, config_id, uri, ext, size FROM netdisk_ocr_queue WHERE status="pending" ORDER BY id ASC LIMIT 1');
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $stmt->closeCursor();
+            return $rows;
+        }) ?: [];
+        if (empty($rows)) {
+            break;
+        }
+        $jobs = [];
+        $meta = [];
+        foreach ($rows as $row) {
+            $qid = (int)$row['id'];
+            $shareId = (int)$row['share_id'];
+            $uri = (string)$row['uri'];
+            netdisk_exec_retry(fn() => $markRunning->execute([':t' => time(), ':id' => $qid]));
+            $shareStmt->execute([':id' => $shareId]);
+            $shareRow = $shareStmt->fetch(PDO::FETCH_ASSOC);
+            $shareStmt->closeCursor();
+            if (!$shareRow) {
+                netdisk_exec_retry(fn() => $markFailed->execute([':e' => '分享不存在', ':t' => time(), ':id' => $qid]));
+                continue;
+            }
+            $base = netdisk_share_config($shareRow, $pdo);
+            if (!$base['enabled'] || !$base['cfg']) {
+                netdisk_exec_retry(fn() => $markFailed->execute([':e' => '分享未启用网盘', ':t' => time(), ':id' => $qid]));
+                continue;
+            }
+            $rowCfgId = (int)($row['config_id'] ?? $base['config_id'] ?? 0);
+            if (!netdisk_index_ocr_enabled($rowCfgId)) {
+                // 该连接级 OCR 已关闭：此队列项不再处理（标记完成，避免永久堆积）
+                netdisk_exec_retry(fn() => $markDone->execute([':t' => time(), ':id' => $qid]));
+                continue;
+            }
+            $size = (int)($row['size'] ?? 0);
+            $rowLowBytes = netdisk_index_ocr_low_max_mb($rowCfgId) * 1048576;
+            if ($size > $rowLowBytes) {
+                netdisk_exec_retry(fn() => $markFailed->execute([':e' => '超过低优先级上限', ':t' => time(), ':id' => $qid]));
+                continue;
+            }
+            $raw = netdisk_fetch_raw_bytes($base['cfg'], $uri);
+            if ($raw === null) {
+                
+                // 下载失败：attempts<3 自动重试，否则永久失败（不中断索引）
+                $dlAtt = 0;
+                try { $dlAtt = (int)$pdo->query('SELECT attempts FROM netdisk_ocr_queue WHERE id=' . (int)$qid)->fetchColumn(); } catch (Throwable $ign) {}
+                if ($dlAtt < 3) {
+                    $pdo->prepare('UPDATE netdisk_ocr_queue SET status="pending", started_at=0, attempts="' . ($dlAtt + 1) . '", error="下载失败，待重试" WHERE id=:id')->execute([':id' => $qid]);
+                } else {
+                    netdisk_exec_retry(fn() => $markFailed->execute([':e' => '下载失败（已重试3次）', ':t' => time(), ':id' => $qid]));
+                }
+                continue;
+            }
+            // 0024: 已下载字节顺带算哈希；内容寻址命中达标则直接复用正文、标记队列完成，不进 OCR 池
+            $caHashQ = netdisk_ocr_file_hash_bytes($raw, $uri);
+            $caParamsKeyQ = netdisk_ocr_params_key($rowCfgId);
+            $caHitQ = netdisk_ocr_result_lookup($caHashQ, $caParamsKeyQ, $pdo);
+            if ($caHitQ !== null) {
+                $caTxtQ = (string)$caHitQ['text'];
+                netdisk_exec_retry(fn() => $updIndex->execute([':t' => $caTxtQ, ':s' => $shareId, ':u' => $uri]));
+                netdisk_exec_retry(fn() => $markDone->execute([':t' => time(), ':id' => $qid]));
+                $caNowQ = time();
+                $caQQ = netdisk_ocr_quality($caTxtQ);
+                $caCQ = string_len($caTxtQ);
+                netdisk_exec_retry(fn() => $upOcrFileQ->execute([
+                    ':sid' => $shareId, ':uri' => $uri, ':u' => '', ':z' => $size,
+                    ':st' => 'done', ':q' => $caQQ, ':c' => $caCQ, ':a' => 0, ':e' => '',
+                    ':dpi' => 0, ':pt' => (int)$caHitQ['pages'], ':pd' => (int)$caHitQ['pages'], ':eng' => 'reuse-' . (string)$caHitQ['source'],
+                    ':ems' => 0, ':ppm' => 0.0, ':first' => $caNowQ, ':t' => $caNowQ,
+                ]));
+                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_files SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                    ->execute([':h' => $caHashQ, ':s' => $shareId, ':u' => $uri]));
+                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_index SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                    ->execute([':h' => $caHashQ, ':s' => $shareId, ':u' => $uri]));
+                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_results SET last_hit_at=:t WHERE content_hash=:h AND params_key=:k')
+                    ->execute([':t' => $caNowQ, ':h' => $caHashQ, ':k' => $caParamsKeyQ]));
+                $totalDone++;
+                continue;
+            }
+            $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
+            if ($tmp === false) {
+                netdisk_exec_retry(fn() => $markFailed->execute([':e' => '临时文件失败', ':t' => time(), ':id' => $qid]));
+                continue;
+            }
+            @file_put_contents($tmp, $raw);
+            $jobs[] = ['uri' => $uri, 'tmp' => $tmp, 'ext' => (string)($row['ext'] ?? ''), 'name' => (string)($row['name'] ?? ''), 'config_id' => $rowCfgId];
+            $meta[$uri] = ['qid' => $qid, 'share_id' => $shareId, 'tmp' => $tmp, 'content_hash' => $caHashQ, 'params_key' => $caParamsKeyQ, 'size' => $size];
+        }
+        if (empty($jobs)) {
+            break;
+        }
+        // 0018: finalize 会删除 tmp，先抓 PDF 总页数供状态表落库
+        $pdfPagesQ = [];
+        foreach ($jobs as $j) {
+            if (strtolower(ltrim((string)($j['ext'] ?? ''), '.')) === 'pdf' && isset($j['tmp']) && is_file($j['tmp'])) {
+                $pi = @shell_exec('pdfinfo ' . escapeshellarg($j['tmp']) . ' 2>/dev/null');
+                if (is_string($pi) && preg_match('/Pages:\s+(\d+)/', $pi, $pm)) {
+                    $pdfPagesQ[(string)$j['uri']] = (int)$pm[1];
+                }
+            }
+        }
+        $stEngineQ = (netdisk_ocr_sidecar_enabled() && netdisk_ocr_sidecar_available()) ? 'paddleocr-sidecar'
+            : (trim((string)shell_exec('command -v tesseract 2>/dev/null')) !== '' ? 'tesseract' : '');
+        // 0018: 批处理计时起点（elapsed_ms/pages_per_min 供 0021 自动定档）
+        $qT0 = microtime(true);
+        // 0018: 载入既有状态行——attempts 跨轮累计（真实失败 3 次才熔断，starved 轮不计数）
+        $qUris = array_map(fn($j) => (string)$j['uri'], $jobs);
+        $qPrevState = [];
+        if (!empty($qUris)) {
+            $qSelSt = $pdo->prepare('SELECT share_id, uri, attempts, first_at FROM netdisk_ocr_files WHERE (share_id, uri) IN (VALUES ' . implode(',', array_fill(0, count($qUris), '(?,?)')) . ')');
+            $qSelParams = [];
+            foreach ($jobs as $j) {
+                $qSelParams[] = (int)$meta[(string)$j['uri']]['share_id'];
+                $qSelParams[] = (string)$j['uri'];
+            }
+            $qSelSt->execute($qSelParams);
+            foreach ($qSelSt->fetchAll(PDO::FETCH_ASSOC) as $r) {
+                $qPrevState[(int)$r['share_id'] . '|' . (string)$r['uri']] = $r;
+            }
+            $qSelSt->closeCursor();
+        }
+        $res = netdisk_ocr_run_pool($jobs, $concurrency, 0, $pdo);
+        // 统一后处理：规范化 + 自适应 DPI 重试 + 清理 tmp
+        $finalResults = netdisk_ocr_finalize_results($jobs, $res['results']);
+        foreach ($jobs as $j) {
+            $uri = $j['uri'];
+            $m = $meta[$uri];
+            $txt = trim((string)($finalResults[$uri] ?? ''));
+            netdisk_exec_retry(fn() => $updIndex->execute([':t' => $txt, ':s' => $m['share_id'], ':u' => $uri]));
+            netdisk_exec_retry(fn() => $markDone->execute([':t' => time(), ':id' => $m['qid']]));
+            // 0024 判定顺序③：队列 OCR 成功后写内容寻址结果表（source='nas'）+ 两张路径表 content_hash 列
+            if ($txt !== '' && (string)($m['content_hash'] ?? '') !== '') {
+                netdisk_ocr_result_save((string)$m['content_hash'], (string)$m['params_key'], (int)($m['size'] ?? 0), (int)($pdfPagesQ[$uri] ?? 0), $txt, $stEngineQ, 'nas', $pdo);
+                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_index SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                    ->execute([':h' => (string)$m['content_hash'], ':s' => (int)$m['share_id'], ':u' => $uri]));
+            }
+            // 0018: 落状态行（updated_at 队列不存，写空串——重建侧判定允许空串回退比对 netdisk_index.updated_at）
+            $qQ = $txt !== '' ? netdisk_ocr_quality($txt) : 0.0;
+            $qChars = $txt !== '' ? string_len($txt) : 0;
+            $qPages = (int)($pdfPagesQ[$uri] ?? 0);
+            $qNow = time();
+            // 0018 必改: attempts = 连续失败计数——成功归零；失败跨轮累计 +1（此前恒写 1，熔断永远触发不了）；starved 轮不加计数
+            $qPrev = $qPrevState[(int)$m['share_id'] . '|' . $uri] ?? null;
+            $qAtt = $txt !== '' ? 0 : ((int)($qPrev['attempts'] ?? 0) + 1);
+            // 0019: 失败归因（预算守卫标记 → invalid + 原因）与页级进度
+            $qInv = netdisk_ocr_invalid_reason((string)($j['tmp'] ?? ''));
+            // 0020: sidecar 服务端失败归因（同 build 侧口径：failed + 具体原因）
+            $qFail = netdisk_ocr_fail_reason((string)($j['tmp'] ?? ''));
+            $qSt = $txt !== '' ? 'done' : ($qInv !== '' ? 'invalid' : 'failed');
+            $qErr = $txt !== '' ? '' : ($qInv !== '' ? $qInv : ($qFail !== '' ? $qFail : 'OCR 返回空文本（图片损坏/格式不支持/OCR 服务异常）'));
+            $qPagesDone = $txt !== '' ? $qPages : (int)($GLOBALS['ND_OCR_PAGES_DONE'][(string)($j['tmp'] ?? '')] ?? 0);
+            $qFirst = (int)($qPrev['first_at'] ?? 0) > 0 ? (int)$qPrev['first_at'] : $qNow;
+            // 0018: 耗时指标——优先 finalize 逐文件真实耗时，缺失退回批累计（PDF 记 pages_per_min，图片记 0）
+            $qElapsed = (int)($GLOBALS['ND_OCR_FINALIZE_TIMINGS'][$uri] ?? 0);
+            if ($qElapsed <= 0) {
+                $qElapsed = (int)round((microtime(true) - $qT0) * 1000);
+            }
+            $qPpm = ($qPages > 0 && $qElapsed > 0) ? round($qPages / ($qElapsed / 60000.0), 2) : 0.0;
+            netdisk_exec_retry(fn() => $upOcrFileQ->execute([
+                ':sid' => (int)$m['share_id'], ':uri' => $uri, ':u' => '', ':z' => 0,
+                ':st' => $qSt, ':q' => $qQ, ':c' => $qChars, ':a' => $qAtt,
+                ':e' => $qErr,
+                ':dpi' => 0, ':pt' => $qPages, ':pd' => $qPagesDone,
+                ':eng' => $stEngineQ, ':ems' => $qElapsed, ':ppm' => $qPpm, ':first' => $qFirst, ':t' => $qNow,
+            ]));
+            // 0024: content_hash 回填在 upsert 之后（同 build 侧，upsert 不含该列）
+            if ($txt !== '' && (string)($m['content_hash'] ?? '') !== '') {
+                $caRtHashQ = (string)$m['content_hash'];
+                netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_files SET content_hash=:h WHERE share_id=:s AND uri=:u')
+                    ->execute([':h' => $caRtHashQ, ':s' => (int)$m['share_id'], ':u' => $uri]));
+            }
+            $totalDone++;
+        }
+        // 出现新的 pending 重建 job → 让位（重建优先）
+        $pendingJob = (int)$pdo->query('SELECT COUNT(*) FROM netdisk_index_jobs WHERE status="pending"')->fetchColumn();
+        if ($pendingJob > 0) {
+            $qYielded = true;
+            break;
+        }
+    }
+    // 0018: 让位（starved）与失败区分——仍 pending 的队列项在状态表标记 starved（attempts 原样保留、不加计数），
+    // 不计入 attempts>=3 的永久跳过，避免大文件因反复让位被判死。
+    if ($qYielded) {
+        try {
+            $qNowY = time();
+            $starvedSel = $pdo->query('SELECT share_id, uri, size FROM netdisk_ocr_queue WHERE status="pending"');
+            $starvedRows = $starvedSel->fetchAll(PDO::FETCH_ASSOC);
+            $starvedSel->closeCursor();
+            $upStarved = $pdo->prepare('INSERT INTO netdisk_ocr_files (share_id, uri, updated_at, size, status, quality, chars, attempts, last_error, dpi, pages_total, pages_done, engine, elapsed_ms, pages_per_min, first_at, finished_at)
+                VALUES (:sid, :uri, "", :z, "starved", 0, 0, :a, "starved", 0, 0, 0, "", 0, 0, :first, :t)
+                ON CONFLICT(share_id, uri) DO UPDATE SET status=CASE WHEN netdisk_ocr_files.status IN ("done", "failed", "invalid") THEN netdisk_ocr_files.status ELSE "starved" END,
+                    last_error=CASE WHEN netdisk_ocr_files.status IN ("done", "failed", "invalid") THEN netdisk_ocr_files.last_error ELSE "starved" END,
+                    size=excluded.size');
+            foreach ($starvedRows as $sr) {
+                $srSid = (int)$sr['share_id'];
+                $srUri = (string)$sr['uri'];
+                $srAtt = 0;
+                $srFirst = $qNowY;
+                try {
+                    $pv = $pdo->prepare('SELECT attempts, first_at FROM netdisk_ocr_files WHERE share_id=? AND uri=?');
+                    $pv->execute([$srSid, $srUri]);
+                    $pvr = $pv->fetch(PDO::FETCH_ASSOC);
+                    $pv->closeCursor();
+                    if ($pvr !== false) {
+                        $srAtt = (int)$pvr['attempts'];
+                        $srFirst = (int)$pvr['first_at'] > 0 ? (int)$pvr['first_at'] : $qNowY;
+                    }
+                } catch (Throwable $ign) {}
+                netdisk_exec_retry(fn() => $upStarved->execute([
+                    ':sid' => $srSid, ':uri' => $srUri, ':z' => (int)($sr['size'] ?? 0),
+                    ':a' => $srAtt, ':first' => $srFirst, ':t' => $qNowY,
+                ]));
+            }
+        } catch (Throwable $ign) {
+            // starved 标记失败不影响队列处理结果
+        }
+    }
+    return $totalDone;
+}
+
+// 本地索引检索：文件名 / 路径 / 正文 LIKE。返回内容同 handle_netdisk_search 的 nameHits/contentHits
+function netdisk_index_search(array $share, array $cfg, string $root, string $q, string $rootLabel): array {
+
+    $pdo = db();
+    $shareId = (int)$share['id'];
+    $likeVal = '%' . str_replace(['%', '_'], ['\\%', '\\_'], $q) . '%';
+    $stmt = $pdo->prepare('SELECT uri, name, is_folder, ext, size, parent_path, text FROM netdisk_index
+        WHERE share_id = :sid AND (name LIKE :like ESCAPE "\\" OR text LIKE :like2 ESCAPE "\\")
+        ORDER BY is_folder ASC, name ASC LIMIT 80');
+    $stmt->execute([':sid' => $shareId, ':like' => $likeVal, ':like2' => $likeVal]);
+    $nameHits = [];
+    $contentHits = [];
+    $fuzzyDone = []; // uri => true，精确命中过的文件不再重复模糊判定（模糊在补充阶段统一做）
+    $aliasDenied = false; // 索引来自旧的更宽根目录时，@share 结果会被当前白名单拦下
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $uri = (string)$row['uri'];
+        // 索引可能早于分享根目录/连接的调整，返回前必须按当前授权范围复核
+        if (!netdisk_uri_within_root($root, $uri, $cfg['cfg'])) {
+            if (strpos($uri, '@share') !== false) {
+                $aliasDenied = true;
+            }
+            continue;
+        }
+        // 用该文件 uri 解析分享根名（@share → /测试）
+        $shareLabel = netdisk_share_label($cfg['cfg'], $root, $uri);
+        $isFolder = (int)$row['is_folder'] === 1;
+        $name = (string)$row['name'];
+        $ext = (string)$row['ext'];
+        // 展示路径：去掉根前缀；@share 命中去掉 cloudreve://<uid>@share 前缀
+        $rel = netdisk_display_path($root, $uri, $shareLabel);
+        $baseInfo = [
+            'uri' => $uri,
+            'name' => $name,
+            'is_folder' => $isFolder,
+            'path' => $rel,
+            'ext' => $ext,
+            'size' => (int)($row['size'] ?? 0),
+            'can_download' => !$isFolder && netdisk_download_allowed($share, $uri),
+        ];
+        $nameHit = mb_stripos($name, $q) !== false;
+        $text = (string)$row['text'];
+        $textPos = $text !== '' ? mb_stripos($text, $q) : false;
+        if ($nameHit) {
+            $nameHits[] = $baseInfo;
+        }
+        if ($textPos !== false) {
+            // 收集同一文件中的所有匹配位置（最多 8 处），生成多段 snippet 便于展开浏览
+            $snippets = [];
+            $searchFrom = 0;
+            $qLen = mb_strlen($q);
+            $textLen = mb_strlen($text);
+            $snippetCount = 0;
+            $snippetCap = 30;
+            while ($searchFrom < $textLen && $snippetCount < $snippetCap) {
+                $pos = mb_stripos($text, $q, $searchFrom);
+                if ($pos === false) {
+                    break;
+                }
+                $sStart = max(0, $pos - 30);
+                $sLen = min(120, $textLen - $sStart);
+                $snippets[] = [
+                    'offset' => $pos,
+                    'text' => '…' . mb_substr($text, $sStart, $sLen) . '…',
+                ];
+                $searchFrom = $pos + $qLen;
+                $snippetCount++;
+            }
+            // OCR 形近错字容错补充：同一文件还有"退刀槽"的形近误识别（如"退刀模/退刀枝"）
+            // 时，把模糊命中也合入 snippets，让扫描件中的变体也能被浏览到（仍封顶 8 处）。
+            if (netdisk_is_ocr_candidate($ext) && $snippetCount < $snippetCap) {
+                $fuzzySnips = netdisk_ocr_fuzzy_snippets($text, $q, $snippetCap);
+                foreach ($fuzzySnips as $fs) {
+                    $dup = false;
+                    foreach ($snippets as $ex) {
+                        if (abs((int)$ex['offset'] - (int)$fs['offset']) < mb_strlen($q)) {
+                            $dup = true;
+                            break;
+                        }
+                    }
+                    if (!$dup) {
+                        $snippets[] = $fs;
+                        if (count($snippets) >= $snippetCap) {
+                            break;
+                        }
+                    }
+                }
+                usort($snippets, function ($a, $b) {
+                    return (int)$a['offset'] <=> (int)$b['offset'];
+                });
+            }
+            $contentHits[] = [
+                'uri' => $uri,
+                'name' => $name,
+                'snippet' => $snippets[0]['text'], // 兼容字段：第一处
+                'snippets' => $snippets,
+                'source' => 'index',
+                'path' => $rel,
+                'ext' => $ext,
+                'size' => (int)($row['size'] ?? 0),
+                'can_download' => $baseInfo['can_download'],
+                'is_folder' => $isFolder,
+            ];
+            $fuzzyDone[$uri] = true;
+        }
+    }
+    // OCR 形近错字容错补充：精确 LIKE 命中不足时，扫描该分享下所有 OCR 候选文件正文，
+    // 对"整词逐字符差异 ≤每3字1错"相近的词做模糊召回（针对 tesseract 将"退刀槽"识别成
+    // "退刀模/退刀枝/退刀槐"等形近错字的场景）。'fuzzy'=>true 供前端区分展示来源。
+    if (count($contentHits) < 20) {
+        $fuzzyStmt = $pdo->prepare('SELECT uri, name, is_folder, ext, size, parent_path, text FROM netdisk_index
+            WHERE share_id = :sid AND is_folder=0 AND text <> "" AND ext IN ("pdf","png","jpg","jpeg","webp","bmp")');
+        $fuzzyStmt->execute([':sid' => $shareId]);
+        foreach ($fuzzyStmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $uri = (string)$row['uri'];
+            if (isset($fuzzyDone[$uri])) {
+                continue;
+            }
+            if (!netdisk_uri_within_root($root, $uri, $cfg['cfg'])) {
+                if (strpos($uri, '@share') !== false) {
+                    $aliasDenied = true;
+                }
+                continue;
+            }
+            $name = (string)$row['name'];
+            $text = (string)$row['text'];
+            $fuzzySnips = netdisk_ocr_fuzzy_snippets($text, $q, 30);
+            if (!empty($fuzzySnips)) {
+                $ext = (string)$row['ext'];
+                $rel = netdisk_display_path($root, $uri, netdisk_share_label($cfg['cfg'], $root, $uri));
+                $contentHits[] = [
+                    'uri' => $uri,
+                    'name' => $name,
+                    'snippet' => $fuzzySnips[0]['text'],
+                    'snippets' => $fuzzySnips,
+                    'source' => 'index',
+                    'fuzzy' => true,
+                    'path' => $rel,
+                    'ext' => $ext,
+                    'size' => (int)($row['size'] ?? 0),
+                    'can_download' => netdisk_download_allowed($share, $uri),
+                    'is_folder' => 0,
+                ];
+                $fuzzyDone[$uri] = true;
+                if (count($contentHits) >= 40) {
+                    break;
+                }
+            }
+        }
+    }
+    $contentHits = array_slice($contentHits, 0, 40);
+    // 仅返回精确 + OCR 容错结果
+    return [
+        'nameHits' => array_slice($nameHits, 0, 40),
+        'contentHits' => $contentHits,
+        'aliasDenied' => $aliasDenied,
+    ];
+}
+
+function cloudreve_get_thumb_url(array $cfg, string $uri): ?string {
+    $resp = cloudreve_api($cfg, 'GET', '/file/thumb?uri=' . rawurlencode($uri));
+    if (!$resp || (int)($resp['code'] ?? 1) !== 0) {
+        return null;
+    }
+    return (string)($resp['data']['url'] ?? '');
+}
+
+function cloudreve_get_file_urls(array $cfg, array $uris): ?array {
+    $resp = cloudreve_api($cfg, 'POST', '/file/url', ['uris' => array_values($uris), 'download' => false]);
+    if (!$resp || (int)($resp['code'] ?? 1) !== 0) {
+        return null;
+    }
+    return $resp['data']['urls'] ?? null;
+}
+
+function cloudreve_discover_wopi_viewer(array $cfg, string $ext): ?string {
+    $c = cloudreve_conn($cfg);
+    if ($c['viewer_id'] !== '') {
+        return $c['viewer_id'];
+    }
+    $ext = strtolower(ltrim($ext, '.'));
+    $resp = cloudreve_api($cfg, 'GET', '/site/config/explorer');
+    if (!$resp || (int)($resp['code'] ?? 1) !== 0) {
+        return null;
+    }
+    $groups = $resp['data']['file_viewers'] ?? [];
+    if (!is_array($groups)) {
+        return null;
+    }
+    foreach ($groups as $group) {
+        foreach (($group['viewers'] ?? []) as $viewer) {
+            if (($viewer['type'] ?? '') !== 'wopi' || !empty($viewer['disabled'])) {
+                continue;
+            }
+            $viewerExts = $viewer['exts'] ?? [];
+            if (is_array($viewerExts) && in_array($ext, array_map('strtolower', $viewerExts), true)) {
+                return (string)($viewer['id'] ?? '');
+            }
+        }
+    }
+    return null;
+}
+
+function cloudreve_create_viewer_session(array $cfg, string $uri, string $viewerId, string $action): ?array {
+    $c = cloudreve_conn($cfg);
+    $token = cloudreve_access_token($cfg);
+    if ($token === '' || $c['base_url'] === '') {
+        return null;
+    }
+    $url = $c['base_url'] . '/api/v4/file/viewerSession';
+    $payload = json_encode([
+        'uri' => $uri,
+        'viewer_id' => $viewerId,
+        'preferred_action' => $action,
+    ], JSON_UNESCAPED_UNICODE);
+    $headers = [
+        'User-Agent: SiyuanShareNetdisk',
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $token,
+    ];
+    $ctx = stream_context_create([
+        'http' => [
+            'method' => 'PUT',
+            'timeout' => 20,
+            'ignore_errors' => true,
+            'header' => implode("\r\n", $headers) . "\r\n",
+            'content' => $payload,
+        ],
+    ]);
+    $raw = @file_get_contents($url, false, $ctx);
+    if ($raw === false || $raw === '') {
+        return [
+            'error' => 'HTTP ' . (string)($http_response_header[0] ?? 'error') . ' from Cloudreve (WOPI 后端未就绪或服务端错误)',
+        ];
+    }
+    $resp = json_decode($raw, true);
+    if (!is_array($resp) || (int)($resp['code'] ?? 1) !== 0) {
+        return [
+            'error' => is_array($resp) ? (string)($resp['msg'] ?? '') : (string)$raw,
+        ];
+    }
+    return $resp['data'] ?? null;
+}
+
+function netdisk_file_ext(string $name): string {
+    $ext = strtolower((string)pathinfo($name, PATHINFO_EXTENSION));
+    return $ext !== '' ? $ext : '';
+}
+
+function netdisk_is_office(string $name): bool {
+    return in_array(netdisk_file_ext($name), [
+        'doc', 'docx', 'ppt', 'pptx', 'odt', 'odp', 'rtf',
+    ], true);
+}
+
+// PDF / Excel / 纯文本 走”内容代理“在浏览器本地预览，不依赖 Cloudreve WOPI
+function netdisk_is_pdf(string $name): bool {
+    return in_array(netdisk_file_ext($name), ['pdf'], true);
+}
+
+function netdisk_is_excel(string $name): bool {
+    return in_array(netdisk_file_ext($name), ['xls', 'xlsx', 'ods', 'csv', 'tsv'], true);
+}
+
+function netdisk_is_text(string $name): bool {
+    return in_array(netdisk_file_ext($name), ['txt', 'md', 'log', 'ini', 'conf', 'srt', 'json', 'xml', 'yaml', 'yml'], true);
+}
+
+function netdisk_is_image(string $name): bool {
+    return in_array(netdisk_file_ext($name), [
+        'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'avif',
+    ], true);
+}
+
+function netdisk_is_media(string $name): bool {
+    return in_array(netdisk_file_ext($name), [
+        'mp4', 'webm', 'ogg', 'ogv', 'mov', 'mkv', 'avi', 'mp3', 'wav', 'flac', 'm4a', 'aac', 'opus',
+    ], true);
+}
+
+// 共享重定向（@share）白名单：只有从已授权目录列表中实际发现的链接才可访问。
+// 记录值：d=目录链接（允许其子路径），f=文件链接（仅精确匹配）。
+function netdisk_redirect_alias_key(int $connId, string $root, string $uri): string {
+    return 'nd_alias_' . $connId . '_' . md5($root) . '_' . md5($uri);
+}
+
+function netdisk_register_redirect_alias(array $conn, string $root, string $uri, bool $isFolder, int $ttl = 604800): void {
+    if ($uri === '') {
+        return;
+    }
+    netdisk_cache_set(
+        netdisk_redirect_alias_key((int)($conn['id'] ?? 0), netdisk_normalize_root($root), $uri),
+        $isFolder ? 'd' : 'f',
+        $ttl
+    );
+}
+
+function netdisk_register_redirect_aliases(array $conn, string $root, ?array $data, int $ttl = 604800): void {
+    if (!is_array($data)) {
+        return;
+    }
+    foreach (($data['files'] ?? []) as $f) {
+        $redirect = (string)($f['metadata']['sys:shared_redirect'] ?? '');
+        if ($redirect !== '') {
+            netdisk_register_redirect_alias($conn, $root, $redirect, (int)($f['type'] ?? 0) === 1, $ttl);
+        }
+    }
+}
+
+function netdisk_redirect_alias_kind(int $connId, string $root, string $uri): string {
+    $kind = netdisk_cache_get(netdisk_redirect_alias_key($connId, $root, $uri));
+    return is_string($kind) ? $kind : '';
+}
+
+// 判断文件 URI 是否允许访问：
+//  1. 在授权根目录内（含根目录自身）
+//  2. 或命中从授权目录中发现的 @share 共享链接（含目录链接的子路径）
+function netdisk_uri_within_root(string $root, string $uri, ?array $conn = null): bool {
+    $root = netdisk_normalize_root($root);
+    if ($root === '' || $uri === '') {
+        return false;
+    }
+    if (preg_match('#(?:^|/)\.\.(?:/|$)#', $uri) === 1 || str_contains($uri, '\\')) {
+        return false;
+    }
+    if ($uri === $root || str_starts_with($uri, rtrim($root, '/') . '/')) {
+        return true;
+    }
+    if ($conn === null) {
+        return false;
+    }
+    $connId = (int)($conn['id'] ?? 0);
+    if (netdisk_redirect_alias_kind($connId, $root, $uri) !== '') {
+        return true;
+    }
+    $pos = strpos($uri, '@share');
+    if ($pos === false) {
+        return false;
+    }
+    $prefix = substr($uri, 0, $pos + strlen('@share'));
+    $tail = substr($uri, $pos + strlen('@share'));
+    if ($tail === '' || $tail[0] !== '/') {
+        return false;
+    }
+    $acc = $prefix;
+    foreach (array_filter(explode('/', $tail), 'strlen') as $seg) {
+        $acc .= '/' . $seg;
+        if (netdisk_redirect_alias_kind($connId, $root, $acc) === 'd') {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 生成用于前端展示的相对路径：
+//  - 根内 URI：去掉 $root 前缀
+//  - @share 命中：去掉 cloudreve://<uid>@share 前缀，仅保留共享目录内部的相对路径
+//  - 返回空字符串表示就是根自身（前端据此不显示路径行）
+function netdisk_display_path(string $root, string $uri, string $shareLabel = ''): string {
+
+    $rel = '';
+
+    // 优先按 @share 前缀解析：返回 @share 之后的完整路径（含 root 目录名，如 /测试/文件.pdf）。
+    if (preg_match('#^cloudreve://[^/@]+@share(?:/|$)#i', $uri, $m)) {
+
+        $pos = strpos($uri, '@share');
+
+        if ($pos !== false) {
+
+            $rel = '/' . ($shareLabel !== '' ? $shareLabel . '/' : '') . ltrim(substr($uri, $pos + strlen('@share')), '/');
+
+        }
+
+    } else {
+
+        $rootN = rtrim(netdisk_normalize_root($root), '/');
+
+        if ($rootN !== '' && str_starts_with($uri, $rootN . '/')) {
+
+            $rel = '/' . substr($uri, strlen($rootN) + 1);
+
+        } elseif ($uri !== $rootN) {
+
+            $rel = $uri;
+
+        }
+
+    }
+
+    if ($rel === '') {
+
+        return '';
+
+    }
+
+    // Cloudreve 返回的 path 是 URL 编码态，解码为可读路径（如 2-采购&外协&试验/…）
+
+    $decoded = rawurldecode($rel);
+
+    return $decoded !== '' ? $decoded : $rel;
+
+}
+
+function netdisk_gate_share(string $slug): ?array {
+    $share = find_share_by_slug($slug);
+    if (!$share) {
+        return null;
+    }
+    if (share_is_expired($share)) {
+        return null;
+    }
+    if (share_visitor_limit_reached($share)) {
+        return null;
+    }
+    $cfg = netdisk_share_config($share);
+    if (!$cfg['enabled']) {
+        return null;
+    }
+    if (!$cfg['cfg']) {
+        return null;
+    }
+    if ((int)($cfg['cfg']['enabled'] ?? 0) !== 1) {
+        return null;
+    }
+    if (share_requires_password($share) && !share_access_granted((int)$share['id'])) {
+        return null;
+    }
+    return [$share, $cfg];
+}
+
+function netdisk_download_rules(int $shareId): array {
+    $stmt = db()->prepare('SELECT id, uri, is_folder FROM share_download_rules WHERE share_id = :sid ORDER BY id ASC');
+    $stmt->execute([':sid' => $shareId]);
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+// 判断某文件 URI 是否命中该分享的下载规则（文件精确匹配 / 文件夹前缀匹配，含其下所有文件）
+function netdisk_download_allowed(array $share, string $uri): bool {
+    $uri = (string)$uri;
+    $rules = netdisk_download_rules((int)$share['id']);
+    foreach ($rules as $rule) {
+        $ruleUri = (string)($rule['uri'] ?? '');
+        if ($ruleUri === '') {
+            continue;
+        }
+        if ((int)($rule['is_folder'] ?? 0) === 1) {
+            if ($uri === $ruleUri || strpos($uri, rtrim($ruleUri, '/') . '/') === 0) {
+                return true;
+            }
+        } elseif ($uri === $ruleUri) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function handle_netdisk_list(string $slug): void {
+    $gated = netdisk_gate_share($slug);
+    if (!$gated) {
+        api_response(403, null, '无权访问网盘');
+    }
+    [$share, $cfg] = $gated;
+    $root = netdisk_normalize_root($cfg['root']);
+    $uri = trim((string)($_GET['uri'] ?? ''));
+    if ($uri === '') {
+        $uri = $root;
+    }
+    if (!netdisk_uri_within_root($root, $uri, $cfg['cfg'])) {
+        api_response(400, null, '目录不在授权范围内');
+    }
+    $data = cloudreve_list_folder($cfg['cfg'], $uri);
+    if ($data === null) {
+        api_response(502, null, 'Cloudreve 连接失败');
+    }
+    netdisk_register_redirect_aliases($cfg['cfg'], $root, $data);
+    $files = [];
+    foreach (($data['files'] ?? []) as $f) {
+        $isFolder = (int)($f['type'] ?? 0) === 1;
+        $name = (string)($f['name'] ?? '');
+        // 跟随符号链接（Cloudreve 共享目录/文件）：若列表项带 sys:shared_redirect，
+        // 则导航/打开目标应指向该重定向 URI。
+        $redirect = (string)($f['metadata']['sys:shared_redirect'] ?? '');
+        $navigateUri = $redirect !== '' ? $redirect : (string)($f['path'] ?? '');
+        $files[] = [
+            'name' => $name,
+            'is_folder' => $isFolder,
+            'size' => (int)($f['size'] ?? 0),
+            'uri' => $navigateUri,
+            'ext' => $isFolder ? '' : netdisk_file_ext($name),
+            'can_download' => !$isFolder && netdisk_download_allowed($share, $navigateUri),
+        ];
+    }
+    api_response(200, [
+        'root' => $root,
+        'parent' => (string)($data['parent']['path'] ?? ''),
+        'files' => $files,
+        'permission' => $cfg['permission'],
+    ]);
+}
+
+// 网盘文件搜索：文件名递归匹配 + 可选 Cloudreve 全文检索(FTS)内容命中
+// 返回 ['nameHits'=>[['uri','name','is_folder','path','ext','size','can_download']],
+//        'contentHits'=>[['uri','name','snippet']], 'diag'=>(string|null)]
+function handle_netdisk_search(string $slug): void {
+    $gated = netdisk_gate_share($slug);
+    if (!$gated) {
+        api_response(403, null, '无权访问网盘');
+    }
+    [$share, $cfg] = $gated;
+    $root = netdisk_normalize_root($cfg['root']);
+    $q = trim((string)($_GET['q'] ?? ''));
+    if (mb_strlen($q) < 1) {
+        api_response(200, ['nameHits' => [], 'contentHits' => [], 'diag' => null]);
+    }
+    $nameHits = [];
+    $contentHits = [];
+    $diag = null;
+
+    // 0) 结果缓存：同一分享 + 关键词 60s 内直接返回，超快二次检索
+    $shareId = (int)$share['id'];
+    $cacheKey = 'nd_search_' . $shareId . '_' . md5($q . '|' . $root);
+    $cached = netdisk_cache_get($cacheKey);
+    if ($cached !== null && is_array(json_decode($cached, true))) {
+        $hit = json_decode($cached, true);
+        api_response(200, ['nameHits' => $hit['nameHits'] ?? [], 'contentHits' => $hit['contentHits'] ?? [], 'diag' => ($hit['diag'] ?? null)]);
+    }
+
+    // 1) 本地全文索引优先（毫秒级 SQL）——若存在且“不太旧”直接检索
+    $pdo = db();
+    $idxRow = $pdo->prepare('SELECT COUNT(*) AS c, COALESCE(MAX(indexed_at),0) AS latest FROM netdisk_index WHERE share_id=:sid');
+    $idxRow->execute([':sid' => $shareId]);
+    $idxStat = $idxRow->fetch(PDO::FETCH_ASSOC);
+    $idxCount = (int)($idxStat['c'] ?? 0);
+    $idxLatest = (int)($idxStat['latest'] ?? 0);
+    $idxRefresh = $idxLatest > 0 && $idxLatest < time() - netdisk_index_refresh_ttl((int)($cfg['config_id'] ?? 0)); // 超过 TTL 视为待刷新
+    $allowOcr = netdisk_index_ocr_enabled((int)($cfg['config_id'] ?? 0));
+    $jobId = 0;
+
+    // 1) 本地索引长期有效：只要存在就优先直接检索（毫秒级），不因“过期”而走慢速在线兜底。
+    if ($idxCount > 0) {
+        $idxRes = netdisk_index_search($share, $cfg, $root, $q, netdisk_share_label($cfg['cfg'], $root, $root));
+        $nameHits = $idxRes['nameHits'];
+        $contentHits = $idxRes['contentHits'];
+        // 索引偏旧（超 TTL）：本次仍返回索引结果，后台排队一次增量刷新（非阻塞）。
+        if ($idxRefresh) {
+            $jobId = netdisk_index_job_create($shareId);
+            $diag = '本地索引命中（' . $idxCount . ' 个文件/目录）；索引已超刷新周期，后台正在增量刷新。';
+        } else {
+            $diag = '本地索引命中（' . $idxCount . ' 个文件/目录）';
+        }
+        if (!empty($idxRes['aliasDenied'])) {
+            $diag .= '；部分共享目录结果因当前分享根目录授权范围已变化而隐藏，索引刷新后恢复';
+        }
+        error_log('[netdisk_search] q=' . $q . ' (index) nameHits=' . count($nameHits) . ' contentHits=' . count($contentHits) . ' diag=' . $diag);
+        netdisk_cache_set($cacheKey, json_encode(['nameHits' => $nameHits, 'contentHits' => $contentHits, 'diag' => $diag], JSON_UNESCAPED_UNICODE), 60);
+        api_response(200, ['nameHits' => $nameHits, 'contentHits' => $contentHits, 'diag' => $diag]);
+    }
+
+    // 2) 索引缺失（从未建立）→ 异步排队重建，当前请求退化为在线遍历兜底。
+    if ($idxCount === 0) {
+        $jobId = netdisk_index_job_create($shareId);
+        if ($jobId > 0) {
+            $diag = '本地索引正在后台初次建立，当前结果来自在线检索，稍后重试将命中本地索引。';
+        }
+    }
+
+    // 3) 在线遍历兜底（仅无索引时走到这里）
+    $visited = 0;
+    $sawShared = false;
+    $textBudget = 20;
+    $textCandidates = [];
+    $contCfg = $cfg['cfg'];
+
+    // …沿用在线遍历（文件名 + @share + 文本兜底）作为兜底，逻辑不变…
+    $collectNameHits = function (array $data) use (&$nameHits, &$textCandidates, $q, $share, $textBudget, $root) {
+        foreach (($data['files'] ?? []) as $f) {
+            if (count($nameHits) >= 40) {
+                break;
+            }
+            $isFolder = (int)($f['type'] ?? 0) === 1;
+            $name = (string)($f['name'] ?? '');
+            $redirect = (string)($f['metadata']['sys:shared_redirect'] ?? '');
+            $navigateUri = $redirect !== '' ? $redirect : (string)($f['path'] ?? '');
+            if (mb_stripos($name, $q) !== false) {
+                $nameHits[] = [
+                    'uri' => $navigateUri,
+                    'name' => $name,
+                    'is_folder' => $isFolder,
+                    'path' => netdisk_display_path($root, $navigateUri),
+                    'ext' => $isFolder ? '' : netdisk_file_ext($name),
+                    'size' => (int)($f['size'] ?? 0),
+                    'can_download' => !$isFolder && netdisk_download_allowed($share, $navigateUri),
+                ];
+            }
+            if (
+                !$isFolder
+                && count($textCandidates) < $textBudget
+                && !isset($textCandidates[$navigateUri])
+                && netdisk_is_local_text_ext($name)
+                && (int)($f['size'] ?? 0) <= 1048576
+            ) {
+                $textCandidates[$navigateUri] = $name;
+            }
+        }
+    };
+
+    $currentLevel = [$root];
+    $seenDirs = [$root => true];
+    for ($depth = 0; $depth <= 5; $depth++) {
+        if (empty($currentLevel) || $visited >= 120 || count($nameHits) >= 40) {
+            break;
+        }
+        $batch = [];
+        foreach ($currentLevel as $dirUri) {
+            if ($visited >= 120) {
+                break;
+            }
+            $visited++;
+            $batch[] = $dirUri;
+        }
+        $batchData = cloudreve_list_folder_multi($cfg, $batch, 60);
+        $nextLevel = [];
+        foreach ($batch as $dirUri) {
+            $data = $batchData[$dirUri] ?? null;
+            if (!is_array($data)) {
+                continue;
+            }
+            netdisk_register_redirect_aliases($contCfg, $root, $data);
+            $collectNameHits($data);
+            foreach (($data['files'] ?? []) as $f) {
+                if ((int)($f['type'] ?? 0) === 1) {
+                    $redirect = (string)($f['metadata']['sys:shared_redirect'] ?? '');
+                    if ($redirect !== '') {
+                        $sawShared = true;
+                    }
+                    $childUri = $redirect !== '' ? $redirect : (string)($f['path'] ?? '');
+                    if ($childUri !== '' && netdisk_uri_within_root($root, $childUri, $contCfg) && !isset($seenDirs[$childUri])) {
+                        $seenDirs[$childUri] = true;
+                        $nextLevel[] = $childUri;
+                    }
+                }
+            }
+        }
+        $currentLevel = $nextLevel;
+    }
+    $fts = cloudreve_api($cfg['cfg'], 'GET', '/file/search?query=' . rawurlencode($q));
+    if (is_array($fts) && (int)($fts['code'] ?? 1) === 0 && is_array($fts['data']['hits'] ?? null)) {
+        $hits = $fts['data']['hits'];
+        $diag = 'FTS OK，命中 ' . count($hits) . ' 条';
+        $dropped = 0;
+        foreach ($hits as $hit) {
+            if (count($contentHits) >= 40) {
+                break;
+            }
+            $file = $hit['file'] ?? null;
+            if (!is_array($file)) {
+                continue;
+            }
+            $uri = (string)($file['path'] ?? '');
+            if ($uri === '') {
+                continue;
+            }
+            if (!netdisk_uri_within_root($root, $uri, $contCfg)) {
+                $dropped++;
+                continue;
+            }
+            $contentHits[] = [
+                'uri' => $uri,
+                'name' => (string)($file['name'] ?? ''),
+                'snippet' => (string)($hit['content'] ?? ''),
+                'source' => 'fts',
+                'path' => netdisk_display_path($root, $uri, netdisk_share_label($contCfg, $root, $uri)),
+                'ext' => netdisk_file_ext((string)($file['name'] ?? '')),
+                'size' => (int)($file['size'] ?? 0),
+                'can_download' => netdisk_download_allowed($share, $uri),
+                'is_folder' => false,
+            ];
+        }
+        if ($dropped > 0) {
+            $diag .= '，' . $dropped . ' 条因不在分享根目录内被过滤';
+        }
+        if (empty($contentHits)) {
+            $diag .= '；Cloudreve 全文检索返回 0 条（索引可能为空/未配置 Tika 文本抽取/文件归属非服务账号）';
+            if ($sawShared) {
+                $diag .= '；遍历发现共享目录（@share），其中的文件属于其他账号，Cloudreve 全文索引按账号隔离无法覆盖';
+            }
+            $diag .= '。已尝试本地文本匹配。';
+        }
+    } elseif (is_array($fts)) {
+        $diag = 'FTS 返回 code=' . (int)($fts['code'] ?? -1) . ' msg=' . (string)($fts['msg'] ?? '') . '。已尝试本地文本匹配。';
+    }
+
+    if (!empty($textCandidates) && count($contentHits) < 40) {
+        $toFetch = [];
+        if (empty($contentHits)) {
+            $toFetch = array_keys($textCandidates);
+        } else {
+            foreach ($textCandidates as $uri => $nm) {
+                foreach ($nameHits as $nh) {
+                    if (isset($nh['uri']) && $nh['uri'] === $uri) {
+                        $toFetch[] = $uri;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!empty($toFetch)) {
+            $bodies = netdisk_fetch_text_content_multi($contCfg, $toFetch);
+            foreach ($toFetch as $candUri) {
+                if (count($contentHits) >= 40) {
+                    break;
+                }
+                $body = $bodies[$candUri] ?? null;
+                if ($body === null || mb_stripos($body, $q) === false) {
+                    continue;
+                }
+                $pos = mb_stripos($body, $q);
+                $start = max(0, $pos - 30);
+                $len = min(120, mb_strlen($body) - $start);
+                $contentHits[] = [
+                    'uri' => $candUri,
+                    'name' => $textCandidates[$candUri],
+                    'snippet' => '…' . mb_substr($body, $start, $len) . '…',
+                    'source' => 'text',
+                    'path' => netdisk_display_path($root, $candUri),
+                    'ext' => netdisk_file_ext($textCandidates[$candUri]),
+                    'size' => 0,
+                    'can_download' => netdisk_download_allowed($share, $candUri),
+                    'is_folder' => false,
+                ];
+            }
+        }
+    }
+
+    // 去重 contentHits
+    $seenUris = [];
+    $dedupContent = [];
+    foreach (array_reverse($contentHits) as $ch) {
+        if (!isset($seenUris[$ch['uri']])) {
+            $seenUris[$ch['uri']] = true;
+            $dedupContent[] = $ch;
+        }
+    }
+    $contentHits = array_reverse($dedupContent);
+
+    error_log('[netdisk_search] q=' . $q . ' (fallback) nameHits=' . count($nameHits) . ' contentHits=' . count($contentHits) . ' diag=' . $diag);
+    netdisk_cache_set($cacheKey, json_encode(['nameHits' => $nameHits, 'contentHits' => $contentHits, 'diag' => $diag], JSON_UNESCAPED_UNICODE), 60);
+    api_response(200, ['nameHits' => $nameHits, 'contentHits' => $contentHits, 'diag' => $diag]);
+}
+
+// WOPI 回调基础地址：office 服务器会回调该地址拉取文件，必须能被 office 服务器公网访问。
+// 优先使用站点设置的「网站地址」（site_base_url），否则回退到请求主机。
+function netdisk_wopi_base_url(): string {
+    $custom = trim((string)get_setting('site_base_url', ''));
+    if ($custom !== '') {
+        return rtrim($custom, '/');
+    }
+    return rtrim(base_url(), '/');
+}
+
+// 判断地址主机是否为仅本机/内网可见（office 服务器无法回调）
+function netdisk_wopi_host_reachable_by_office(string $url): bool {
+    $host = strtolower((string)parse_url($url, PHP_URL_HOST));
+    if ($host === '' || $host === 'localhost' || $host === '127.0.0.1' || $host === '::1') {
+        return false;
+    }
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        return (bool)filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+    }
+    return true;
+}
+
+// 尝试通过本地 WOPI 宿主打开 office 文档（只读预览）；
+// 返回 null 表示未配置 office 引擎；返回 ['type'=>'unsupported','message'=>...] 表示配置/可达性诊断错误。
+function netdisk_try_open_office(array $share, array $cfg, string $slug, string $uri, string $name): ?array {
+    $conn = $cfg['cfg'] ?? null;
+    if (!$conn || !netdisk_office_configured()) {
+        return null;
+    }
+    $ext = netdisk_file_ext($name);
+    $engine = netdisk_office_engine($ext);
+    if ($engine === null) {
+        return null;
+    }
+    // 引擎回退：所选引擎无可用应用（被停用/未配置）时，尝试另一引擎
+    if (netdisk_office_base_url($engine) === '') {
+        $alt = $engine === 'collabora' ? 'onlyoffice' : 'collabora';
+        if (netdisk_office_has_view($alt, $ext)) {
+            $engine = $alt;
+        } else {
+            return [
+                'type' => 'unsupported',
+                'message' => '预览失败：所选预览引擎（' . ($engine === 'collabora' ? 'Collabora' : 'OnlyOffice') . '）未配置可用服务，且另一引擎不支持该文件类型',
+            ];
+        }
+    }
+    $wopiBase = netdisk_wopi_base_url();
+    if (!netdisk_wopi_host_reachable_by_office($wopiBase)) {
+        return [
+            'type' => 'unsupported',
+            'message' => '预览失败：本站网站地址（' . $wopiBase . '）为本地/内网地址，office 服务器无法回调拉取文件。请在「站点设置 → 网站地址」配置公网可访问的域名（如 https://siyuan-share-test.projuser.xyz）。',
+        ];
+    }
+    $fileId = substr(md5($slug . ':' . $uri), 0, 20);
+    $token = netdisk_wopi_sign_token((int)$share['id'], $uri, (int)$conn['id'], 7200);
+    // WOPISrc 必须是 office 服务器可回调的绝对 URL
+    $wopiUrl = $wopiBase . '/s/' . rawurlencode($slug) . '/netdisk/wopi/' . $fileId;
+    $viewerUrl = netdisk_office_viewer_url($engine, $ext, $wopiUrl, $token);
+    if ($viewerUrl === '') {
+        return ['type' => 'unsupported', 'message' => '预览失败：无法为该引擎构建预览地址'];
+    }
+    return ['type' => 'office', 'url' => $viewerUrl, 'engine' => $engine];
+}
+function handle_netdisk_open(string $slug): void {
+    $gated = netdisk_gate_share($slug);
+    if (!$gated) {
+        api_response(403, null, '无权访问网盘');
+    }
+    [$share, $cfg] = $gated;
+    $root = netdisk_normalize_root($cfg['root']);
+    $uri = (string)($_GET['uri'] ?? '');
+    if ($uri === '' || !netdisk_uri_within_root($root, $uri, $cfg['cfg'])) {
+        api_response(400, null, '文件不在授权范围内');
+    }
+    $name = rawurldecode((string)($_GET['name'] ?? ''));
+    $base = base_path();
+    $contentUrl = $base . '/s/' . rawurlencode($slug) . '/netdisk/content?uri=' . rawurlencode($uri) . '&name=' . rawurlencode($name);
+    $thumbUrl = $base . '/s/' . rawurlencode($slug) . '/netdisk/thumb?uri=' . rawurlencode($uri) . '&name=' . rawurlencode($name);
+
+    if (netdisk_is_image($name)) {
+        api_response(200, ['type' => 'image', 'src' => $contentUrl, 'thumb' => $thumbUrl]);
+    }
+    if (netdisk_is_media($name)) {
+        api_response(200, ['type' => 'media', 'src' => $contentUrl]);
+    }
+// PDF：优先 office 引擎（本地 WOPI 宿主只读预览）；未配置 office 时退回浏览器原生 iframe
+    if (netdisk_is_pdf($name)) {
+        $office = netdisk_try_open_office($share, $cfg, $slug, $uri, $name);
+        if ($office) {
+            api_response(200, $office);
+        }
+        api_response(200, ['type' => 'pdf', 'src' => $contentUrl]);
+    }
+    // Excel / CSV：优先 office 引擎；否则前端 SheetJS 只读表格
+    if (netdisk_is_excel($name)) {
+        $office = netdisk_try_open_office($share, $cfg, $slug, $uri, $name);
+        if ($office) {
+            api_response(200, $office);
+        }
+        api_response(200, ['type' => 'excel', 'src' => $contentUrl, 'ext' => netdisk_file_ext($name)]);
+    }
+    // 纯文本：直接内联展示
+    if (netdisk_is_text($name)) {
+        api_response(200, ['type' => 'text', 'src' => $contentUrl]);
+    }
+    // 其它 office 文档：通过本地 WOPI 宿主（Collabora / OnlyOffice）只读预览
+    if (netdisk_is_office($name)) {
+        $office = netdisk_try_open_office($share, $cfg, $slug, $uri, $name);
+        if ($office) {
+            api_response(200, $office);
+        }
+        api_response(200, ['type' => 'unsupported', 'message' => '未配置 office 预览引擎（请在“网盘配置 → 文件预览”里添加 OnlyOffice / Collabora 应用）']);
+    }
+    api_response(200, ['type' => 'unsupported', 'message' => '该文件类型不支持在线预览']);
+}
+
+// 网盘文件全屏预览页（新标签页打开）：复用 /netdisk/open 返回结果，整页渲染
+function handle_netdisk_preview_page(string $slug): void {
+    $gated = netdisk_gate_share($slug);
+    if (!$gated) {
+        http_response_code(403);
+        echo 'Forbidden';
+        exit;
+    }
+    [$share, $cfg] = $gated;
+    $root = netdisk_normalize_root($cfg['root']);
+    $uri = (string)($_GET['uri'] ?? '');
+    if ($uri === '' || !netdisk_uri_within_root($root, $uri, $cfg['cfg'])) {
+        http_response_code(400);
+        echo 'Bad Request';
+        exit;
+    }
+    $name = rawurldecode((string)($_GET['name'] ?? basename($uri)));
+    $base = base_path();
+    $openUrl = $base . '/s/' . rawurlencode($slug) . '/netdisk/open?uri=' . rawurlencode($uri) . '&name=' . rawurlencode($name);
+    header('Content-Type: text/html; charset=UTF-8');
+    echo '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">';
+    echo '<meta name="viewport" content="width=device-width, initial-scale=1">';
+    echo '<title>' . htmlspecialchars($name) . ' - 预览</title>';
+    echo '<style>html,body{margin:0;padding:0;height:100%;background:#fff}';
+    echo '.pv-body{position:fixed;inset:0}.pv-err{display:flex;align-items:center;justify-content:center;height:100%;color:#c00;font-size:14px;padding:24px;text-align:center}';
+    echo 'iframe.pv-frame{width:100%;height:100%;border:none;display:block}';
+    echo '.pv-media{width:100%;height:100%;object-fit:contain;display:block}';
+    echo 'video.pv-media{background:#000}textarea.pv-text{width:100%;height:100%;border:none;padding:16px;box-sizing:border-box;font-size:13px;resize:none}';
+    echo '</style></head><body>';
+    echo '<script src="' . htmlspecialchars($base . '/assets/vendor/xlsx.full.min.js') . '"></script>';
+    echo '<div class="pv-body" data-pv-body><div class="pv-err">加载中…</div></div>';
+    echo '<script>fetch(' . json_encode($openUrl, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . ',{credentials:"same-origin"})';
+    echo '.then(function(r){return r.json()}).then(function(p){';
+    echo 'var body=document.querySelector("[data-pv-body]");';
+    echo 'if(!p||p.code!==0||!p.data){body.innerHTML=\'<div class="pv-err">无法打开文件</div>\';return;}';
+    echo 'var d=p.data;';
+    echo 'if(d.type==="office"){body.innerHTML=\'<iframe class="pv-frame" src="\'+encodeURI(d.url)+\'" allowfullscreen></iframe>\';}';
+    echo 'else if(d.type==="image"){body.innerHTML=\'<img class="pv-media" src="\'+d.src+\'">\';}';
+    echo 'else if(d.type==="media"){body.innerHTML=\'<video class="pv-media" controls autoplay src="\'+d.src+\'"></video>\';}';
+    echo 'else if(d.type==="pdf"){body.innerHTML=\'<iframe class="pv-frame" src="\'+d.src+\'"></iframe>\';}';
+    echo 'else if(d.type==="text"){fetch(d.src).then(function(r){return r.text()}).then(function(t){body.innerHTML=\'<textarea class="pv-text" readonly>\'+t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")+\'</textarea>\';});}';
+    echo 'else if(d.type==="excel"){body.innerHTML=\'<div class="pv-sheet" style="overflow:auto;height:100%"></div>\';fetch(d.src).then(function(r){return r.arrayBuffer()}).then(function(b){';
+    echo 'var wb=XLSX.read(b,{type:"array"});var ws=wb.Sheets[wb.SheetNames[0]];';
+    echo 'var html=XLSX.utils.sheet_to_html(ws,{id:"pv-sheet-tbl",editable:false});';
+    echo 'body.querySelector(".pv-sheet").innerHTML=html;}).catch(function(){body.innerHTML=\'<div class="pv-err">表格解析失败</div>\';});}';
+    echo 'else{body.innerHTML=\'<div class="pv-err">\'+(d.message||"该文件类型不支持在线预览")+\'</div>\';}';
+    echo '}).catch(function(){document.querySelector("[data-pv-body]").innerHTML=\'<div class="pv-err">加载出错</div>\';});';
+    echo '</script></body></html>';
+    exit;
+}
+
+// 从 URL 剥掉 query/fragment，只保留 scheme://host:port/path —— 报错透传时防止泄露签名 token
+function netdisk_url_sanitized(string $url): string {
+    $parts = parse_url($url);
+    if (!is_array($parts) || empty($parts['host'])) { return $url; }
+    $u = strtolower((string)($parts['scheme'] ?? 'http')) . '://'
+       . (string)$parts['host']
+       . (isset($parts['port']) ? ':' . $parts['port'] : '')
+       . (string)($parts['path'] ?? '');
+    return $u;
+}
+
+// 服务端代理拉取网盘内容（文件字节/缩略图）统一收口（curl 实现）：
+// - 显式跟随重定向（≤5 次），协议白名单仅 http/https（CURLOPT_PROTOCOLS/REDIR_PROTOCOLS），防重定向落点穿越 file:// 等；
+// - 用 header 回调收集重定向链，失败时每一跳都过 netdisk_url_sanitized()（剥 query，防签名 token 泄露）拼进错误 msg；
+// - 失败跳主机 ≠ 入参主机时，追加「请检查 Cloudreve 站点 URL / 存储节点直链配置」提示；
+// - 复用 netdisk_office_http_classify 五分类归一化；https 失败按第 5 提交同口径仅关证书校验降级重试一次（不改协议）；
+// - 「自签证书降级重试仍失败」后缀仅在最终失败确属 TLS 类时拼接（修掉此前无条件拼接的误导）。
+// 注意：CURLOPT_TIMEOUT 为整次请求（含全部重定向跳）的总时长上限，与旧 PHP 流实现的逐跳 timeout 语义不同。
+function netdisk_proxy_fetch_curl_once(string $url, int $timeout, bool $insecure): array {
+    $locations = [];
+    $statusLine = '';
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 5,
+        CURLOPT_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        CURLOPT_CONNECTTIMEOUT => min(15, $timeout),
+        CURLOPT_TIMEOUT => $timeout,
+        CURLOPT_SSL_VERIFYPEER => !$insecure,
+        CURLOPT_SSL_VERIFYHOST => $insecure ? 0 : 2,
+        CURLOPT_HEADERFUNCTION => function ($ch, $header) use (&$locations, &$statusLine) {
+            if (stripos($header, 'location:') === 0) {
+                $loc = trim(substr($header, 9));
+                if ($loc !== '') { $locations[] = $loc; }
+            } elseif (preg_match('#^HTTP/\S+\s+[1-5]\d\d#', $header)) {
+                $statusLine = trim($header); // 多跳时保留最后一个状态行
+            }
+            return strlen($header);
+        },
+    ]);
+    $raw = curl_exec($ch);
+    $errno = curl_errno($ch);
+    $errmsg = curl_error($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    // 证书类失败（可通过关校验绕过）与「端口不是 HTTPS」类握手失败（关校验也绕不过）分开：
+    // 前者才配「自签证书降级重试仍失败」后缀，后者应把真实原因（协议不匹配）报出去。
+    $certFail = (in_array($errno, [51, 58, 59, 60, 77], true)
+        || stripos($errmsg, 'certificate') !== false || stripos($errmsg, 'self-signed') !== false);
+    if ($raw === false || $errno !== 0) {
+        // 失败跳：最后一个重定向落点；没有发生重定向时即入参 URL 本身
+        $failTarget = $locations !== [] ? end($locations) : $url;
+        $chain = implode(' → ', array_map('netdisk_url_sanitized', array_merge([$url], $locations)));
+        // curl 错误文案归一化成 netdisk_office_http_classify 认识的关键词（与 cloudreve_http_request 同口径）
+        $norm = '';
+        if ($errno === 6) { $norm = 'Could not resolve host: ' . $errmsg; }
+        elseif ($errno === 7) { $norm = 'Connection refused: ' . $errmsg; }
+        elseif ($errno === 28) { $norm = 'Connection timed out: ' . $errmsg; }
+        elseif ($errno === 60 || $errno === 51 || $errno === 58 || $errno === 59 || $errno === 53 || $errno === 77) { $norm = 'SSL certificate problem: ' . $errmsg; }
+        elseif ($errno === 35) { $norm = 'SSL connect error: ' . $errmsg; }
+        else { $norm = $errmsg !== '' ? $errmsg : ('curl 错误号 ' . $errno); }
+        $error = netdisk_office_http_classify($norm) . '（目标：' . $chain . '）';
+        $failHost = strtolower((string)(parse_url($failTarget, PHP_URL_HOST) ?: ''));
+        $baseHost = strtolower((string)(parse_url($url, PHP_URL_HOST) ?: ''));
+        if ($failHost !== '' && $baseHost !== '' && $failHost !== $baseHost) {
+            $error .= '；失败跳主机与配置地址不一致，请检查 Cloudreve 站点 URL / 存储节点直链配置';
+        }
+        return ['ok' => false, 'raw' => '', 'error' => $error, 'ssl_fail' => $certFail];
+    }
+    if ($status >= 400) {
+        $statusText = $statusLine !== '' ? $statusLine : ('HTTP ' . $status);
+        $chain = implode(' → ', array_map('netdisk_url_sanitized', array_merge([$url], $locations)));
+        return ['ok' => false, 'raw' => (string)$raw,
+                'error' => 'HTTP 状态码异常：' . $statusText . '（目标：' . $chain . '）', 'ssl_fail' => false];
+    }
+    return ['ok' => true, 'raw' => (string)$raw, 'error' => '', 'ssl_fail' => false];
+}
+
+function netdisk_proxy_fetch(string $url, int $timeout): array {
+    $first = netdisk_proxy_fetch_curl_once($url, $timeout, false);
+    if ($first['ok']) { return $first; }
+    if (strpos($url, 'https://') !== 0) {
+        return ['ok' => false, 'raw' => $first['raw'], 'error' => $first['error'], 'ssl_fail' => false];
+    }
+    // https 失败：绕过证书校验降级重试一次（局域网自签证书常见场景，只关校验不改协议）
+    $retry = netdisk_proxy_fetch_curl_once($url, $timeout, true);
+    if ($retry['ok']) { return $retry; }
+    // 两次都失败：绕过证书后仍失败且原因不是证书 => 真实原因是 DNS/拒连/超时/状态码；否则回退首次的证书错误
+    $final = (!$retry['ssl_fail'] && $retry['error'] !== '') ? $retry : $first;
+    $suffix = $final['ssl_fail'] ? '；自签证书降级重试仍失败' : '';
+    return ['ok' => false, 'raw' => $final['raw'], 'error' => $final['error'] . $suffix, 'ssl_fail' => false];
+}
+
+function handle_netdisk_thumb(string $slug): void {
+    $gated = netdisk_gate_share($slug);
+    if (!$gated) {
+        api_response(403, null, '无权访问网盘');
+    }
+    [$share, $cfg] = $gated;
+    $root = netdisk_normalize_root($cfg['root']);
+    $uri = (string)($_GET['uri'] ?? '');
+    if ($uri === '' || !netdisk_uri_within_root($root, $uri, $cfg['cfg'])) {
+        api_response(400, null, '文件不在授权范围内');
+    }
+    $thumb = cloudreve_get_thumb_url($cfg['cfg'], $uri);
+    if ($thumb === null || $thumb === '') {
+        api_response(404, null, '缩略图不存在');
+    }
+    // Cloudreve Pro 可能返回混淆/相对路径的反盗链 URL（obfuscated: true），
+    // 无法在服务端直接代理，此时优雅降级为 404（前端会回退到内容代理预览）。
+    if (!preg_match('#^https?://#i', $thumb)) {
+        api_response(404, null, '缩略图不可直接代理');
+    }
+    $resp = netdisk_proxy_fetch($thumb, 20);
+    if (!$resp['ok']) {
+        api_response(502, null, '获取缩略图失败：' . $resp['error']);
+    }
+    $raw = $resp['raw'];
+    $imgInfo = @getimagesizefromstring($raw);
+    $imgMime = is_array($imgInfo) ? (string)($imgInfo['mime'] ?? '') : '';
+    if (!preg_match('#^image/(png|jpeg|gif|webp|bmp|avif)$#', $imgMime)) {
+        $imgMime = 'image/jpeg';
+    }
+    header('Content-Type: ' . $imgMime);
+    header('Content-Disposition: inline');
+    header('X-Content-Type-Options: nosniff');
+    header("Content-Security-Policy: default-src 'none'; sandbox");
+    header('Cache-Control: private, max-age=300');
+    echo $raw;
+    exit;
+}
+
+function handle_netdisk_content(string $slug): void {
+    $gated = netdisk_gate_share($slug);
+    if (!$gated) {
+        api_response(403, null, '无权访问网盘');
+    }
+    [$share, $cfg] = $gated;
+    $root = netdisk_normalize_root($cfg['root']);
+    $uri = (string)($_GET['uri'] ?? '');
+    if ($uri === '' || !netdisk_uri_within_root($root, $uri, $cfg['cfg'])) {
+        api_response(400, null, '文件不在授权范围内');
+    }
+    $info = cloudreve_file_info($cfg['cfg'], $uri);
+    $name = is_array($info) ? (string)($info['name'] ?? '') : '';
+    if ($name === '') {
+        $name = rawurldecode((string)($_GET['name'] ?? ''));
+    }
+    $urls = cloudreve_get_file_urls($cfg['cfg'], [$uri]);
+    if (empty($urls) || empty($urls[0]['url'])) {
+        api_response(502, null, '获取文件地址失败');
+    }
+    $fileUrl = (string)$urls[0]['url'];
+    $resp = netdisk_proxy_fetch($fileUrl, 30);
+    if (!$resp['ok']) {
+        api_response(502, null, '获取文件内容失败：' . $resp['error']);
+    }
+    $raw = $resp['raw'];
+    $ext = netdisk_file_ext($name);
+    $mime = detect_share_asset_mime_by_ext($ext);
+    header('Content-Type: ' . $mime);
+    header('Content-Disposition: inline; filename="' . rawurlencode($name) . '"');
+    header('Content-Length: ' . strlen($raw));
+    header('X-Content-Type-Options: nosniff');
+    // SVG 是主动内容：直接导航时用 CSP sandbox 禁止脚本执行
+    if ($mime === 'image/svg+xml') {
+        header("Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox");
+    }
+    echo $raw;
+    exit;
+}
+
+// 网盘下载：必须命中该分享的下载规则，否则 403
+function handle_netdisk_download(string $slug): void {
+    $gated = netdisk_gate_share($slug);
+    if (!$gated) {
+        http_response_code(403);
+        echo 'Forbidden';
+        exit;
+    }
+    [$share, $cfg] = $gated;
+    $root = netdisk_normalize_root($cfg['root']);
+    $uri = (string)($_GET['uri'] ?? '');
+    if ($uri === '' || !netdisk_uri_within_root($root, $uri, $cfg['cfg'])) {
+        http_response_code(400);
+        echo 'Bad Request';
+        exit;
+    }
+    if (!netdisk_download_allowed($share, $uri)) {
+        http_response_code(403);
+        echo 'Forbidden';
+        exit;
+    }
+    $info = cloudreve_file_info($cfg['cfg'], $uri);
+    $name = is_array($info) ? (string)($info['name'] ?? '') : '';
+    if ($name === '') {
+        $name = rawurldecode((string)($_GET['name'] ?? basename($uri)));
+    }
+    $urls = cloudreve_get_file_urls($cfg['cfg'], [$uri]);
+    if (empty($urls) || empty($urls[0]['url'])) {
+        http_response_code(502);
+        echo '获取文件地址失败';
+        exit;
+    }
+    $fileUrl = (string)$urls[0]['url'];
+    $ctx = stream_context_create([
+        'http' => ['timeout' => 30, 'ignore_errors' => true, 'follow_location' => 1],
+    ]);
+    $raw = @file_get_contents($fileUrl, false, $ctx);
+    if ($raw === false) {
+        http_response_code(502);
+        echo '下载文件失败';
+        exit;
+    }
+    $ext = netdisk_file_ext($name);
+    $mime = detect_share_asset_mime_by_ext($ext);
+    header('Content-Type: ' . $mime);
+    header('Content-Disposition: attachment; filename="' . rawurlencode($name) . '"');
+    header('Content-Length: ' . strlen($raw));
+    echo $raw;
+    exit;
+}
+
+function detect_share_asset_mime_by_ext(string $ext): string {
+    $map = [
+        'png' => 'image/png', 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg',
+        'gif' => 'image/gif', 'webp' => 'image/webp', 'bmp' => 'image/bmp',
+        'svg' => 'image/svg+xml', 'avif' => 'image/avif',
+        'mp4' => 'video/mp4', 'webm' => 'video/webm', 'ogg' => 'audio/ogg',
+        'ogv' => 'video/ogg', 'mov' => 'video/quicktime', 'mkv' => 'video/x-matroska',
+        'avi' => 'video/x-msvideo', 'mp3' => 'audio/mpeg', 'wav' => 'audio/wav',
+        'flac' => 'audio/flac', 'm4a' => 'audio/mp4', 'aac' => 'audio/aac',
+        'opus' => 'audio/ogg', 'pdf' => 'application/pdf',
+        'txt' => 'text/plain; charset=UTF-8', 'md' => 'text/markdown; charset=UTF-8',
+        'csv' => 'text/csv; charset=UTF-8', 'json' => 'application/json; charset=UTF-8',
+        'xml' => 'application/xml; charset=UTF-8',
+        'doc' => 'application/msword', 'docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'xls' => 'application/vnd.ms-excel', 'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'ppt' => 'application/vnd.ms-powerpoint', 'pptx' => 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'odt' => 'application/vnd.oasis.opendocument.text', 'ods' => 'application/vnd.oasis.opendocument.spreadsheet',
+        'odp' => 'application/vnd.oasis.opendocument.presentation', 'rtf' => 'application/rtf',
+    ];
+    return $map[$ext] ?? 'application/octet-stream';
+}
+
+function netdisk_test_connection(array $cfg): array {
+    $c = cloudreve_conn($cfg);
+    if ($c['base_url'] === '' || $c['email'] === '' || $c['password'] === '') {
+        return ['ok' => false, 'message' => '地址/账号/密码不能为空'];
+    }
+    $login = cloudreve_login_detailed($cfg);
+    if (!$login['ok']) {
+        return ['ok' => false, 'message' => '登录失败：' . $login['reason']];
+    }
+    $token = cloudreve_access_token($cfg);
+    if ($token === '') {
+        return ['ok' => false, 'message' => '未能获取访问令牌'];
+    }
+    $root = netdisk_normalize_root((string)($cfg['default_root'] ?? ''));
+    $data = cloudreve_list_folder($cfg, $root);
+    if ($data === null) {
+        return ['ok' => false, 'message' => '连接成功，但无法访问根目录「' . $root . '」'];
+    }
+    $count = count($data['files'] ?? []);
+    return ['ok' => true, 'message' => '连接成功，根目录「' . $root . '」可访问，共 ' . $count . ' 项'];
+}
+
+// ============================================================
+// WOPI 只读宿主：把 php-site 变成 WOPI Host，
+// 让 Collabora / OnlyOffice 服务器直接从我们这里拉取文件字节，
+// 实现文档只读预览（放弃在线编辑）。
+// ============================================================
+
+function netdisk_base64url_encode(string $data): string {
+    return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+}
+
+function netdisk_base64url_decode(string $data): string {
+    return base64_decode(strtr($data, '-_', '+/'));
+}
+
+function netdisk_wopi_secret(): string {
+    $sec = (string)get_setting('netdisk_wopi_secret', '');
+    if ($sec === '') {
+        $sec = bin2hex(random_bytes(32));
+        set_setting('netdisk_wopi_secret', $sec);
+    }
+    return $sec;
+}
+
+function netdisk_wopi_sign_token(int $shareId, string $uri, int $cfgId, int $ttl = 3600): string {
+    $secret = netdisk_wopi_secret();
+    $exp = time() + $ttl;
+    $payload = netdisk_base64url_encode(json_encode([
+        'sid' => $shareId,
+        'uri' => $uri,
+        'cid' => $cfgId,
+        'exp' => $exp,
+    ]));
+    return $payload . '.' . hash_hmac('sha256', $payload, $secret);
+}
+
+function netdisk_wopi_verify_token(string $token): ?array {
+    $secret = netdisk_wopi_secret();
+    $pos = strrpos($token, '.');
+    if ($pos === false) {
+        return null;
+    }
+    $payload = substr($token, 0, $pos);
+    $sig = substr($token, $pos + 1);
+    if (!hash_equals(hash_hmac('sha256', $payload, $secret), $sig)) {
+        return null;
+    }
+    $data = json_decode(netdisk_base64url_decode($payload), true);
+    if (!is_array($data)) {
+        return null;
+    }
+    if ((int)($data['exp'] ?? 0) < time()) {
+        return null;
+    }
+    return $data;
+}
+
+// WOPI 共享访问守门：token 自身已授权，不再校验分享密码 cookie
+function netdisk_wopi_gate(array $share, array $data, int $cfgId): ?array {
+    if (share_is_expired($share)) {
+        return null;
+    }
+    if (share_visitor_limit_reached($share)) {
+        return null;
+    }
+    $cfg = netdisk_share_config($share);
+    if (!$cfg['enabled']) {
+        return null;
+    }
+    if ((int)$share['id'] !== (int)($data['sid'] ?? 0)) {
+        return null;
+    }
+    if ($cfgId !== (int)($data['cid'] ?? 0)) {
+        return null;
+    }
+    $conn = cloudreve_config_get($cfgId);
+    if (!$conn || (int)($conn['enabled'] ?? 0) !== 1) {
+        return null;
+    }
+    $myshareCfg = netdisk_share_config($share);
+    $root = netdisk_normalize_root($myshareCfg['root']);
+    if (!netdisk_uri_within_root($root, (string)($data['uri'] ?? ''), $conn)) {
+        return null;
+    }
+    return $conn;
+}
+
+function cloudreve_file_info(array $cfg, string $uri): ?array {
+    $resp = cloudreve_api($cfg, 'GET', '/file/info?uri=' . rawurlencode($uri));
+    if (!$resp || (int)($resp['code'] ?? 1) !== 0) {
+        return null;
+    }
+    return $resp['data'] ?? null;
+}
+
+function netdisk_share_label(array $cfg, string $root, string $uri): string {
+    // 从 @share URI 提取分享根 URI（cloudreve://<uid>@share）
+    $pos = strpos($uri, '@share');
+    if ($pos === false) { return ''; }
+    $shareRoot = substr($uri, 0, $pos + strlen('@share'));
+    static $cache = [];
+    $k = md5($root . '|' . $shareRoot);
+    if (array_key_exists($k, $cache)) { return $cache[$k]; }
+    $name = '';
+    // 列出分享根目录，找 redirect == shareRoot 的文件夹，取其 name（如 测试）
+    $rootN = rtrim(netdisk_normalize_root($root), '/');
+    if ($rootN !== '') {
+        $data = cloudreve_list_folder($cfg, $rootN);
+        foreach (($data['files'] ?? []) as $f) {
+            $r = (string)($f['metadata']['sys:shared_redirect'] ?? '');
+            if ($r !== '' && str_starts_with($shareRoot, $r)) {
+                $name = (string)($f['name'] ?? '');
+                break;
+            }
+        }
+    }
+    $cache[$k] = $name;
+    return $name;
+}
+
+
+
+
+function handle_netdisk_wopi(string $slug, string $fileId): void {
+    $token = (string)($_GET['access_token'] ?? '');
+    $data = netdisk_wopi_verify_token($token);
+    if (!$data) {
+        http_response_code(401);
+        echo 'Unauthorized';
+        exit;
+    }
+    $share = find_share_by_slug($slug);
+    if (!$share) {
+        http_response_code(404);
+        echo 'Not Found';
+        exit;
+    }
+    $conn = netdisk_wopi_gate($share, $data, (int)($data['cid'] ?? 0));
+    if (!$conn) {
+        http_response_code(403);
+        echo 'Forbidden';
+        exit;
+    }
+    $uri = (string)$data['uri'];
+    if (substr(md5($slug . ':' . $uri), 0, 20) !== $fileId) {
+        http_response_code(404);
+        echo 'Not Found';
+        exit;
+    }
+    $info = cloudreve_file_info($conn, $uri);
+    if (!$info) {
+        http_response_code(404);
+        echo 'Not Found';
+        exit;
+    }
+    $cfg = netdisk_share_config($share);
+    $name = (string)($info['name'] ?? basename($uri));
+    header('Content-Type: application/json');
+    echo json_encode([
+        'BaseFileName' => $name,
+        'OwnerId' => (string)($share['user_id'] ?? ''),
+        'Size' => (int)($info['size'] ?? 0),
+        'UserId' => 'visitor',
+        'Version' => '1.0',
+        'ReadOnly' => true,
+        'UserCanWrite' => false,
+        'UserCanNotWriteRelative' => true,
+        'UserCanRename' => false,
+        'UserCanShare' => false,
+        'SupportsLocks' => false,
+        'SupportsUpdate' => false,
+        'SupportsRename' => false,
+        'SupportsDeleteFile' => false,
+        'CloseButton' => true,
+        'Permission' => 'read',
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+function handle_netdisk_wopi_getfile(string $slug, string $fileId): void {
+    $token = (string)($_GET['access_token'] ?? '');
+    $data = netdisk_wopi_verify_token($token);
+    if (!$data) {
+        http_response_code(401);
+        echo 'Unauthorized';
+        exit;
+    }
+    $share = find_share_by_slug($slug);
+    if (!$share) {
+        http_response_code(404);
+        echo 'Not Found';
+        exit;
+    }
+    $conn = netdisk_wopi_gate($share, $data, (int)($data['cid'] ?? 0));
+    if (!$conn) {
+        http_response_code(403);
+        echo 'Forbidden';
+        exit;
+    }
+    $uri = (string)$data['uri'];
+    if (substr(md5($slug . ':' . $uri), 0, 20) !== $fileId) {
+        http_response_code(404);
+        echo 'Not Found';
+        exit;
+    }
+    $urls = cloudreve_get_file_urls($conn, [$uri]);
+    if (empty($urls) || empty($urls[0]['url'])) {
+        http_response_code(502);
+        echo 'Failed to fetch file';
+        exit;
+    }
+    $fileUrl = (string)$urls[0]['url'];
+    $range = (string)($_SERVER['HTTP_RANGE'] ?? '');
+    $headers = "User-Agent: SiyuanShareNetdisk\r\n";
+    if ($range !== '') {
+        $headers .= 'Range: ' . $range . "\r\n";
+    }
+    $ctx = stream_context_create([
+        'http' => [
+            'timeout' => 120,
+            'ignore_errors' => true,
+            'follow_location' => 1,
+            'header' => $headers,
+        ],
+    ]);
+    $raw = @file_get_contents($fileUrl, false, $ctx);
+
+    if ($raw === false) {
+        http_response_code(502);
+        echo 'Failed to fetch file content';
+        exit;
+    }
+    $statusCode = 200;
+    $contentRange = '';
+    if (is_array($http_response_header)) {
+        foreach ($http_response_header as $h) {
+            if (preg_match('#^HTTP/\S+\s+(\d+)#', $h, $mm)) {
+                $statusCode = (int)$mm[1];
+            } elseif (stripos($h, 'Content-Range:') === 0) {
+                $contentRange = trim(substr($h, 14));
+            }
+        }
+    }
+    if ($statusCode === 206 && $contentRange !== '') {
+        header('Content-Range: ' . $contentRange);
+    }
+    http_response_code($statusCode === 206 ? 206 : 200);
+    header('Content-Type: application/octet-stream');
+    header('Content-Length: ' . strlen($raw));
+    header('Cache-Control: no-store');
+    header('X-Content-Type-Options: nosniff');
+    echo $raw;
+    exit;
+}
+
+// ---- Office 引擎（Collabora / OnlyOffice）全局配置（office_apps 表）与 URL 构建 ----
+
+// 读取全部 office 应用
+function netdisk_office_apps(bool $enabledOnly = false): array {
+    $pdo = db();
+    $sql = 'SELECT id, name, engine, base_url, enabled, created_at, updated_at FROM office_apps';
+    if ($enabledOnly) {
+        $sql .= ' WHERE enabled=1';
+    }
+    $sql .= ' ORDER BY id ASC';
+    return $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
+}
+
+// 取某引擎应用的 base_url（仅已启用）
+function netdisk_office_base_url(string $engine): string {
+    foreach (netdisk_office_apps(true) as $app) {
+        if (strtolower((string)$app['engine']) === $engine) {
+            return rtrim((string)$app['base_url'], '/');
+        }
+    }
+    return '';
+}
+
+// 统一抓取 WOPI 引擎地址：先带证书校验抓取；https 失败时自动绕过证书校验降级重试一次。
+// 返回 ['ok'=>bool, 'raw'=>string, 'error'=>string, 'note'=>string]；error 区分 DNS / 拒连 / 超时 / 证书 / HTTP 状态码。
+function netdisk_office_http_classify(string $msg): string {
+    $m = strtolower($msg);
+    if (strpos($m, 'getaddrinfo') !== false || strpos($m, 'could not resolve') !== false || strpos($m, 'name or service not known') !== false || strpos($m, 'nodename nor servname') !== false) {
+        return 'DNS 解析失败（主机名不存在或容器内 DNS 不可用）';
+    }
+    if (strpos($m, 'connection refused') !== false) {
+        return '连接被拒绝（端口未监听或被防火墙拦截）';
+    }
+    if (strpos($m, 'timed out') !== false || strpos($m, 'timeout') !== false) {
+        return '连接超时（网络不通或服务未在该端口监听）';
+    }
+    if (strpos($m, 'wrong version number') !== false || strpos($m, 'packet length too long') !== false || strpos($m, 'unsupported protocol') !== false || strpos($m, 'ssl connect error') !== false) {
+        return 'TLS 握手失败：目标端口可能并不是 HTTPS 服务（wrong version number / packet length too long），若该服务为明文端口请改用 http:// 地址';
+    }
+    if (strpos($m, 'ssl') !== false || strpos($m, 'certificate') !== false) {
+        return 'TLS 证书校验失败（自签名/过期/主机名不匹配）';
+    }
+    if (strpos($m, 'could not find') !== false || strpos($m, 'unable to') !== false) {
+        return '网络不可达：' . $msg;
+    }
+    return $msg !== '' ? $msg : '未知错误';
+}
+
+function netdisk_office_http_get_once(string $url, bool $insecure): array {
+    $options = ['http' => ['timeout' => 15, 'follow_location' => 1, 'ignore_errors' => true, 'max_redirects' => 5]];
+    if ($insecure) {
+        $options['ssl'] = ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true];
+    }
+    $lastError = '';
+    set_error_handler(function ($no, $msg) use (&$lastError) { $lastError = $msg; return true; });
+    $raw = @file_get_contents($url, false, stream_context_create($options));
+    restore_error_handler();
+    $status = '';
+    if (isset($http_response_header[0]) && is_string($http_response_header[0])) {
+        $status = $http_response_header[0];
+    }
+    if ($raw === false) {
+        return ['ok' => false, 'raw' => '', 'status' => '',
+                'error' => netdisk_office_http_classify($lastError),
+                'ssl_fail' => (stripos($lastError, 'ssl') !== false || stripos($lastError, 'certificate') !== false)];
+    }
+    if ($status !== '' && preg_match('#HTTP/\S+\s+([1-5]\d\d)#', $status, $sm) && (int)$sm[1] >= 400) {
+        return ['ok' => false, 'raw' => $raw, 'status' => $status,
+                'error' => 'HTTP 状态码异常：' . $status, 'ssl_fail' => false];
+    }
+    return ['ok' => true, 'raw' => $raw, 'status' => $status, 'error' => '', 'ssl_fail' => false];
+}
+
+function netdisk_office_fetch(string $url): array {
+    $first = netdisk_office_http_get_once($url, false);
+    if ($first['ok']) {
+        return ['ok' => true, 'raw' => $first['raw'], 'error' => '', 'note' => ''];
+    }
+    if (strpos($url, 'https://') !== 0) {
+        return ['ok' => false, 'raw' => $first['raw'], 'error' => $first['error'], 'note' => ''];
+    }
+    // https 失败：绕过证书校验降级重试一次（局域网自签证书常见场景）
+    $retry = netdisk_office_http_get_once($url, true);
+    if ($retry['ok']) {
+        return ['ok' => true, 'raw' => $retry['raw'], 'error' => '',
+                'note' => '（证书校验未通过，已自动绕过证书校验重试成功；建议为服务配置受信证书或局域网内改走 http）'];
+    }
+    // 两次都失败：绕过证书后仍失败且原因不是证书 => 真实原因是 DNS/拒连/超时/状态码；否则回退首次的证书错误
+    $final = (!$retry['ssl_fail'] && $retry['error'] !== '') ? $retry : $first;
+    return ['ok' => false, 'raw' => $final['raw'], 'error' => $final['error'], 'note' => ''];
+}
+
+// 从引擎的 /hosting/discovery 解析 ext -> view 的 action urlsrc（缓存 1 小时）
+// 若该引擎当前没有已启用的应用，直接返回空（避免误用旧缓存/已删除应用的地址）
+function netdisk_office_discovery(string $engine): array {
+    $base = netdisk_office_base_url($engine);
+    if ($base === '') {
+        return [];
+    }
+    $cacheKey = 'netdisk_office_disc_' . $engine . '_' . md5($base);
+    $cached = (string)get_setting($cacheKey, '');
+    if ($cached !== '') {
+        $arr = json_decode($cached, true);
+        if (is_array($arr) && (int)($arr['ts'] ?? 0) > time() - 3600) {
+            return is_array($arr['map'] ?? null) ? $arr['map'] : [];
+        }
+    }
+    $url = $base . '/hosting/discovery';
+    $resp = netdisk_office_fetch($url);
+    $raw = $resp['ok'] ? $resp['raw'] : '';
+    $map = [];
+    if ($raw !== false && strpos($raw, '<') === 0) {
+        preg_match_all('#<action[^>]*name="([^"]+)"[^>]*ext="([^"]+)"[^>]*urlsrc="([^"]+)"#i', $raw, $m, PREG_SET_ORDER);
+        foreach ($m as $row) {
+            if (strtolower($row[1]) === 'view') {
+                $map[strtolower($row[2])] = html_entity_decode($row[3], ENT_QUOTES | ENT_HTML5);
+            }
+        }
+        preg_match_all('#<action[^>]*ext="([^"]+)"[^>]*name="([^"]+)"[^>]*urlsrc="([^"]+)"#i', $raw, $m2, PREG_SET_ORDER);
+        foreach ($m2 as $row) {
+            if (strtolower($row[2]) === 'view') {
+                $map[strtolower($row[1])] = html_entity_decode($row[3], ENT_QUOTES | ENT_HTML5);
+            }
+        }
+    }
+    set_setting($cacheKey, json_encode(['ts' => time(), 'map' => $map]));
+    return $map;
+}
+
+// 校验 office 服务器地址：抓取 /hosting/discovery 并解析应用名与可预览扩展名
+// 返回 ['ok'=>bool, 'app'=>(string)服务器应用名, 'exts'=>array(可view扩展名的去重列表), 'error'=>(string)]
+function netdisk_office_validate_base(string $base): array {
+    $base = rtrim(trim($base), '/');
+    if ($base === '') {
+        return ['ok' => false, 'app' => '', 'exts' => [], 'error' => '地址不能为空'];
+    }
+    if (strpos($base, 'http://') !== 0 && strpos($base, 'https://') !== 0) {
+        return ['ok' => false, 'app' => '', 'exts' => [], 'error' => '地址需以 http(s):// 开头'];
+    }
+    $url = $base . '/hosting/discovery';
+    $resp = netdisk_office_fetch($url);
+    $raw = $resp['ok'] ? $resp['raw'] : '';
+    if (!$resp['ok'] || $raw === '') {
+        $reason = $resp['ok'] ? '返回内容为空' : $resp['error'];
+        return ['ok' => false, 'app' => '', 'exts' => [], 'error' => '无法访问 ' . $url . '（' . $reason . '）' . $resp['note']];
+    }
+    if (strpos($raw, '<') !== 0) {
+        $snip = mb_substr(trim(strip_tags((string)$raw)), 0, 80);
+        return ['ok' => false, 'app' => '', 'exts' => [], 'error' => '返回内容不是企业文档服务（WOPI discovery）' . ($snip !== '' ? '；实际返回：' . $snip : '') . $resp['note']];
+    }
+    preg_match('#<app[^>]*name="([^"]+)"#i', $raw, $am);
+    $appName = isset($am[1]) ? html_entity_decode($am[1], ENT_QUOTES | ENT_HTML5) : '(未知)';
+    $exts = [];
+    preg_match_all('#<action[^>]*name="([^"]+)"[^>]*ext="([^"]+)"#i', $raw, $m, PREG_SET_ORDER);
+    foreach ($m as $row) {
+        if (strtolower($row[1]) === 'view') {
+            $exts[strtolower($row[2])] = true;
+        }
+    }
+    preg_match_all('#<action[^>]*ext="([^"]+)"[^>]*name="([^"]+)"#i', $raw, $m2, PREG_SET_ORDER);
+    foreach ($m2 as $row) {
+        if (strtolower($row[2]) === 'view') {
+            $exts[strtolower($row[1])] = true;
+        }
+    }
+    $extList = array_map('strval', array_keys($exts));
+    sort($extList, SORT_STRING);
+    return [
+        'ok' => count($extList) > 0,
+        'app' => $appName,
+        'exts' => $extList,
+        'error' => count($extList) > 0 ? '' : '未在 discovery 中发现可预览的扩展名',
+    ];
+}
+
+function netdisk_office_has_view(string $engine, string $ext): bool {
+    $map = netdisk_office_discovery($engine);
+    return isset($map[strtolower(ltrim($ext, '.'))]);
+}
+
+// OnlyOffice 应用映射（与 discovery 中 /hosting/wopi/{app}/view 对应）
+function netdisk_onlyoffice_app(string $ext): string {
+    $ext = strtolower(ltrim($ext, '.'));
+    if (in_array($ext, ['doc', 'docx', 'odt', 'rtf', 'dot', 'dotx', 'wps'], true)) {
+        return 'word';
+    }
+    if (in_array($ext, ['xls', 'xlsx', 'ods', 'csv', 'tsv'], true)) {
+        return 'cell';
+    }
+    if (in_array($ext, ['ppt', 'pptx', 'odp', 'pps', 'ppsx'], true)) {
+        return 'slide';
+    }
+    if ($ext === 'pdf') {
+        return 'pdf';
+    }
+    return 'word';
+}
+
+// 引擎显示名
+function netdisk_office_engine_label(string $engine): string {
+    $e = strtolower(trim($engine));
+    if ($e === 'collabora') {
+        return 'Collabora';
+    }
+    if ($e === 'onlyoffice') {
+        return 'OnlyOffice';
+    }
+    return $e !== '' ? $engine : '未知';
+}
+
+// 取某引擎启用应用的 url_template（泛化引擎用；返回 '' 表示无模板）
+function netdisk_office_app_url_template(string $engine): string {
+    $stmt = db()->prepare('SELECT url_template FROM office_apps WHERE engine = :e AND enabled = 1 AND url_template != "" ORDER BY id ASC LIMIT 1');
+    $stmt->execute([':e' => $engine]);
+    $v = $stmt->fetchColumn();
+    return $v === false ? '' : (string)$v;
+}
+
+// 解析当前应使用哪个引擎预览某扩展名（全局：netdisk_office_ext_map + netdisk_office_engine，auto 优先 Collabora）
+function netdisk_office_engine(string $ext): ?string {
+    $ext = strtolower(ltrim($ext, '.'));
+    $map = json_decode((string)get_setting('netdisk_office_ext_map', '{}'), true);
+    if (is_array($map) && !empty($map[$ext])) {
+        $m = strtolower((string)$map[$ext]);
+        if (netdisk_office_base_url($m) !== '') {
+            return $m;
+        }
+    }
+    $def = strtolower((string)get_setting('netdisk_office_engine', 'auto'));
+    if ($def !== 'auto' && netdisk_office_base_url($def) !== '') {
+        return $def;
+    }
+    if (netdisk_office_has_view('collabora', $ext)) {
+        return 'collabora';
+    }
+    if (netdisk_office_has_view('onlyoffice', $ext)) {
+        return 'onlyoffice';
+    }
+    // 其它自定义引擎：若存在支持该扩展的模板也返回之
+    foreach (netdisk_office_apps(true) as $app) {
+        $eng = strtolower((string)$app['engine']);
+        if (in_array($eng, ['collabora', 'onlyoffice'], true)) {
+            continue;
+        }
+        if ((string)($app['url_template'] ?? '') !== '' && netdisk_office_has_view($eng, $ext)) {
+            return $eng;
+        }
+    }
+    return null;
+}
+
+// 构建 office viewer 的 iframe URL
+function netdisk_office_viewer_url(string $engine, string $ext, string $wopiBaseUrl, string $token): string {
+    $base = netdisk_office_base_url($engine);
+    if ($base === '') {
+        return '';
+    }
+    if ($engine === 'collabora') {
+        $map = netdisk_office_discovery($engine);
+        $src = $map[strtolower(ltrim($ext, '.'))] ?? '';
+        // Collabora: 所有扩展共用同一 cool.html 路径（含版本 hash）；取一个 view urlsrc 的“? 之前”部分
+        if ($src === '') {
+            $src = count($map) > 0 ? (string)reset($map) : '';
+        }
+        if ($src === '') {
+            $src = $base . '/browser/1ec9f2b9e7/cool.html?';
+        }
+        $path = strtok($src, '?');
+        if ($path === false || $path === '') {
+            $path = $src;
+        }
+        return rtrim($path, '/') . '?WOPISrc=' . rawurlencode($wopiBaseUrl) . '&access_token=' . rawurlencode($token) . '&lang=zh-CN&closebutton=1';
+    }
+    if ($engine === 'onlyoffice') {
+        // OnlyOffice：直接构建 /hosting/wopi/{app}/view
+        $app = netdisk_onlyoffice_app($ext);
+        return $base . '/hosting/wopi/' . $app . '/view?WOPISrc=' . rawurlencode($wopiBaseUrl) . '&access_token=' . rawurlencode($token) . '&lang=zh-CN';
+    }
+    // 其它自定义引擎：用保存的 url_template 替换占位符
+    $template = netdisk_office_app_url_template($engine);
+    if ($template !== '') {
+        $replaced = str_replace(
+            ['{WOPISrc}', '{access_token}', '{lang}'],
+            [rawurlencode($wopiBaseUrl), rawurlencode($token), 'zh-CN'],
+            $template
+        );
+        // 兼容部分服务器使用 <WOPISrc> 这类占位
+        $replaced = str_replace(['<WOPISrc>', '<wopisrc=WOPI_SOURCE&>', 'WOPI_SOURCE'], [rawurlencode($wopiBaseUrl), 'WOPISrc=' . rawurlencode($wopiBaseUrl) . '&', rawurlencode($wopiBaseUrl)], $replaced);
+        if ($replaced !== '' && strpos($replaced, 'WOPISrc=') === false) {
+            $replaced .= (strpos($replaced, '?') === false ? '?' : '&') . 'WOPISrc=' . rawurlencode($wopiBaseUrl) . '&access_token=' . rawurlencode($token);
+        }
+        return $replaced;
+    }
+    return '';
+}
+
+// 判断是否已配置 office 引擎（存在任一启用应用）
+function netdisk_office_configured(): bool {
+    return count(netdisk_office_apps(true)) > 0;
+}
+
+function render_netdisk_tab_button(): string {
+    return '<button class="kb-side-tab" type="button" data-share-tab="netdisk">网盘</button>';
+}
+
+function render_netdisk_panel(string $slug): string {
+    $base = base_path();
+    $html = '<div class="kb-side-panel" data-share-panel="netdisk" data-netdisk-slug="' . htmlspecialchars($slug) . '" hidden>';
+    $html .= '<div class="kb-side-body netdisk-body">';
+    $html .= '<div class="netdisk-toolbar">';
+    $html .= '<button class="button ghost" type="button" data-netdisk-up title="刷新"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 4v6h6M20 20v-6h-6"/><path fill="none" stroke="currentColor" stroke-width="2" d="M20 10a8 8 0 0 0-14.4-3M4 14a8 8 0 0 0 14.4 3"/></svg></button>';
+    $html .= '<div class="netdisk-crumbs" data-netdisk-crumbs></div>';
+    $html .= '</div>';
+    $html .= '<div class="netdisk-list" data-netdisk-list><div class="netdisk-empty">加载中…</div></div>';
+    $html .= '</div>';
+    $html .= '</div>';
+    return $html;
+}
 function min_chunk_size_bytes(): int {
     global $config;
     $kb = (int)($config['min_chunk_size_kb'] ?? 256);
@@ -2619,6 +8613,7 @@ function lookup_ip_location(string $ip): array {
     $stmt = $pdo->prepare('SELECT * FROM share_access_geo_cache WHERE ip = :ip LIMIT 1');
     $stmt->execute([':ip' => $ip]);
     $cached = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if ($cached) {
         $updatedAt = strtotime((string)($cached['updated_at'] ?? ''));
         if ($updatedAt && (time() - $updatedAt) < 86400 * 30) {
@@ -2688,6 +8683,7 @@ function purge_share_access_logs(int $shareId): ?int {
     $stmt = $pdo->prepare('SELECT user_id, COALESCE(SUM(size_bytes), 0) AS total FROM share_access_logs WHERE share_id = :sid');
     $stmt->execute([':sid' => $shareId]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     $userId = $row ? (int)$row['user_id'] : null;
     $total = $row ? (int)$row['total'] : 0;
     $pdo->prepare('DELETE FROM share_access_logs WHERE share_id = :sid')->execute([':sid' => $shareId]);
@@ -2702,6 +8698,7 @@ function purge_user_access_logs(int $userId): int {
     $stmt = $pdo->prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM share_access_logs WHERE user_id = :uid');
     $stmt->execute([':uid' => $userId]);
     $total = (int)($stmt->fetch(PDO::FETCH_ASSOC)['total'] ?? 0);
+    $stmt->closeCursor();
     $pdo->prepare('DELETE FROM share_access_logs WHERE user_id = :uid')->execute([':uid' => $userId]);
     adjust_user_storage($userId, -$total);
     return $total;
@@ -2717,6 +8714,7 @@ function cleanup_user_access_logs(int $userId, int $days): void {
         ':cutoff' => $cutoff,
     ]);
     $total = (int)($stmt->fetch(PDO::FETCH_ASSOC)['total'] ?? 0);
+    $stmt->closeCursor();
     if ($total <= 0) {
         return;
     }
@@ -3322,25 +9320,15 @@ function handle_share_comment_upload(string $slug): void {
 
 function handle_share_search(string $slug): void {
     $share = find_share_by_slug($slug);
-    if (!$share) {
-        api_response(404, null, '分享不存在');
-    }
-    if (share_is_expired($share) || share_visitor_limit_reached($share)) {
-        api_response(403, null, '分享已关闭');
-    }
-    if (share_requires_password($share) && !share_access_granted((int)$share['id'])) {
-        api_response(403, null, '请先输入访问密码');
-    }
+    if (!$share) { api_response(404, null, '分享不存在'); }
+    if (share_is_expired($share) || share_visitor_limit_reached($share)) { api_response(403, null, '分享已关闭'); }
+    if (share_requires_password($share) && !share_access_granted((int)$share['id'])) { api_response(403, null, '请先输入访问密码'); }
     $q = trim((string)($_GET['q'] ?? ''));
-    if (mb_strlen($q) < 1) {
-        api_response(200, ['results' => []]);
-    }
+    if (mb_strlen($q) < 1) { api_response(200, ['docResults' => []]); }
     $pdo = db();
     $shareId = (int)$share['id'];
     $words = preg_split('/\s+/u', $q, -1, PREG_SPLIT_NO_EMPTY);
-    if (empty($words)) {
-        api_response(200, ['results' => []]);
-    }
+    if (empty($words)) { api_response(200, ['docResults' => []]); }
     $wordConditions = [];
     $params = [':sid' => $shareId];
     foreach ($words as $i => $word) {
@@ -3349,50 +9337,45 @@ function handle_share_search(string $slug): void {
         $wordConditions[] = "(title LIKE {$pk} ESCAPE \"\\\" OR markdown LIKE {$pk} ESCAPE \"\\\")";
         $params[$pk] = $likeVal;
     }
-    $firstWord = $words[0];
-    $params[':q_raw'] = $firstWord;
-    $params[':q_raw2'] = $firstWord;
     $whereWords = implode(' AND ', $wordConditions);
-    $stmt = $pdo->prepare("
-        SELECT doc_id, title, hpath,
-            CASE
-                WHEN INSTR(markdown, :q_raw) > 50 THEN
-                    SUBSTR(markdown, INSTR(markdown, :q_raw) - 40, 200)
-                WHEN INSTR(markdown, :q_raw) > 0 THEN
-                    SUBSTR(markdown, 1, 200)
-                ELSE
-                    SUBSTR(markdown, 1, 200)
-            END AS snippet_raw,
-            INSTR(markdown, :q_raw2) AS match_pos
-        FROM share_docs
-        WHERE share_id = :sid
-          AND {$whereWords}
-        ORDER BY sort_order ASC, id ASC
-        LIMIT 30
-    ");
-    $stmt->execute($params);
-    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $stmt = $pdo->prepare('SELECT doc_id, title, markdown, hpath FROM share_docs WHERE share_id = :sid AND (' . $whereWords . ') ORDER BY updated_at DESC LIMIT 30');
+    $rows = $stmt->execute($params) ? $stmt->fetchAll(PDO::FETCH_ASSOC) : [];
     $results = [];
-    foreach ($rows as $row) {
-        $raw = $row['snippet_raw'] ?? '';
-        $raw = preg_replace('/^---\s*\n.*?\n---\s*\n/s', '', $raw);
-        $snippet = preg_replace('/[#*`~>\[\]!]+/', '', $raw);
-        $snippet = trim(preg_replace('/\s+/', ' ', $snippet));
-        $matchPos = (int)($row['match_pos'] ?? 0);
-        if ($matchPos > 50) {
-            $snippet = '...' . $snippet;
+    foreach ($rows as $d) {
+        $title = (string)($d['title'] ?? '');
+        $markdown = (string)($d['markdown'] ?? '');
+        $snippets = [];
+        foreach ($words as $wq) {
+            foreach (extract_snippets_multi($markdown, $wq, 30) as $sn) {
+                $snippets[] = $sn;
+            }
         }
-        if (mb_strlen($snippet) > 120) {
-            $snippet = mb_substr($snippet, 0, 120) . '...';
+        usort($snippets, function ($a, $b) { return (int)$a['offset'] <=> (int)$b['offset']; });
+        $merged = [];
+        foreach ($snippets as $sn) {
+            $dup = false;
+            if (!empty($merged)) {
+                $lastOff = $merged[count($merged) - 1]['offset'];
+                if ($sn['offset'] - $lastOff < 3) { $dup = true; }
+            }
+            if (!$dup) { $merged[] = $sn; }
+            if (count($merged) >= 30) break;
         }
+        $titleSnippet = '';
+        foreach ($words as $wq) {
+            $tp = mb_stripos($title, $wq);
+            if ($tp !== false) { $titleSnippet = extract_snippet_at($title, $tp); break; }
+        }
+        $single = !empty($merged) ? $merged[0]['text'] : $titleSnippet;
         $results[] = [
-            'docId'   => $row['doc_id'],
-            'title'   => $row['title'],
-            'hpath'   => $row['hpath'] ?? '',
-            'snippet' => $snippet,
+            'docId' => (string)$d['doc_id'],
+            'title' => $title,
+            'snippet' => $single,
+            'snippets' => $merged,
+            'hpath' => (string)($d['hpath'] ?? ''),
         ];
     }
-    api_response(200, ['results' => $results]);
+    api_response(200, ['docResults' => $results, 'results' => $results]);
 }
 
 function handle_share_comment_submit(string $slug): void {
@@ -3423,6 +9406,7 @@ function handle_share_comment_submit(string $slug): void {
         $check = $pdo->prepare('SELECT email FROM share_comments WHERE id = :id AND share_id = :share_id');
         $check->execute([':id' => $parentId, ':share_id' => $shareId]);
         $row = $check->fetch(PDO::FETCH_ASSOC);
+        $check->closeCursor();
         if (!$row) {
             flash('comment_error', '回复目标不存在');
             redirect($redirectPath);
@@ -3557,6 +9541,7 @@ function handle_share_comment_delete(string $slug): void {
     $stmt = $pdo->prepare('SELECT * FROM share_comments WHERE id = :id AND share_id = :share_id');
     $stmt->execute([':id' => $commentId, ':share_id' => (int)$share['id']]);
     $comment = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$comment) {
         flash('comment_error', '评论不存在');
         redirect($redirectPath);
@@ -3674,6 +9659,7 @@ function handle_share_comment_edit(string $slug): void {
     $stmt = $pdo->prepare('SELECT * FROM share_comments WHERE id = :id AND share_id = :share_id');
     $stmt->execute([':id' => $commentId, ':share_id' => (int)$share['id']]);
     $comment = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$comment) {
         flash('comment_error', '评论不存在');
         redirect($redirectPath);
@@ -3939,6 +9925,7 @@ function verify_email_code(string $email, string $code): bool {
         ':now' => now(),
     ]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$row) {
         return false;
     }
@@ -3977,6 +9964,7 @@ function verify_reset_code(int $userId, string $email, string $code): bool {
         ':now' => now(),
     ]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$row) {
         return false;
     }
@@ -4720,6 +10708,9 @@ function collect_asset_entries(array $files, array $paths, array $docIds): array
 function allocate_share_id(PDO $pdo): int {
     $stmt = $pdo->query('SELECT share_id FROM recycled_share_ids ORDER BY share_id ASC LIMIT 1');
     $shareId = (int)($stmt ? $stmt->fetchColumn() : 0);
+    if ($stmt) {
+        $stmt->closeCursor();
+    }
     if ($shareId > 0) {
         $del = $pdo->prepare('DELETE FROM recycled_share_ids WHERE share_id = :share_id');
         $del->execute([':share_id' => $shareId]);
@@ -4764,6 +10755,7 @@ function hard_delete_share(int $shareId): ?int {
     $stmt = $pdo->prepare('SELECT user_id FROM shares WHERE id = :id');
     $stmt->execute([':id' => $shareId]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$row) {
         return null;
     }
@@ -4795,6 +10787,7 @@ function delete_user_account(int $userId): bool {
     $stmt = $pdo->prepare('SELECT email, role FROM users WHERE id = :id');
     $stmt->execute([':id' => $userId]);
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$user) {
         return false;
     }
@@ -5085,9 +11078,11 @@ function recalculate_share_size(int $shareId): int {
     $stmt = $pdo->prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM share_docs WHERE share_id = :share_id');
     $stmt->execute([':share_id' => $shareId]);
     $docSize = (int)$stmt->fetchColumn();
+    $stmt->closeCursor();
     $stmt = $pdo->prepare('SELECT COALESCE(SUM(size_bytes), 0) AS total FROM share_assets WHERE share_id = :share_id');
     $stmt->execute([':share_id' => $shareId]);
     $assetSize = (int)$stmt->fetchColumn();
+    $stmt->closeCursor();
     $commentSize = share_comment_size($shareId);
     $total = $docSize + $assetSize + $commentSize;
     $stmt = $pdo->prepare('UPDATE shares SET size_bytes = :size_bytes, updated_at = :updated_at WHERE id = :id');
@@ -5221,6 +11216,7 @@ function handle_api(string $path): void {
             ':uid' => $user['id'],
         ]);
         $share = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->closeCursor();
         if (!$share) {
             api_response(404, null, 'Share not found');
         }
@@ -5229,9 +11225,13 @@ function handle_api(string $path): void {
         $docStmt = $pdo->prepare('SELECT id, doc_id, title, icon, hpath, parent_id, sort_index, sort_order, size_bytes, content_hash, meta_hash
             FROM share_docs WHERE share_id = :sid ORDER BY sort_order ASC, id ASC');
         $docStmt->execute([':sid' => $shareId]);
+        // 先取完并关闭 SELECT 游标再写：循环内持有读快照时执行 UPDATE 属"读升级写"，
+        // 撞上其它写者会立即 database is locked（busy_timeout 不生效）。
+        $docRows = $docStmt->fetchAll(PDO::FETCH_ASSOC);
+        $docStmt->closeCursor();
         $docHashUpdate = $pdo->prepare('UPDATE share_docs SET content_hash = :content_hash, meta_hash = :meta_hash WHERE id = :id');
         $docMarkdownStmt = $pdo->prepare('SELECT markdown FROM share_docs WHERE share_id = :sid AND id = :id LIMIT 1');
-        while ($row = $docStmt->fetch(PDO::FETCH_ASSOC)) {
+        foreach ($docRows as $row) {
             $contentHash = normalize_hash_hex($row['content_hash'] ?? '');
             $metaHash = normalize_hash_hex($row['meta_hash'] ?? '');
             if ($contentHash === '') {
@@ -5240,6 +11240,7 @@ function handle_api(string $path): void {
                     ':id' => (int)($row['id'] ?? 0),
                 ]);
                 $docMarkdown = (string)($docMarkdownStmt->fetchColumn() ?: '');
+                $docMarkdownStmt->closeCursor();
                 $contentHash = compute_doc_content_hash($docMarkdown);
                 unset($docMarkdown);
             }
@@ -5274,8 +11275,10 @@ function handle_api(string $path): void {
             ':sid' => $shareId,
             ':prefix' => comment_asset_prefix() . '%',
         ]);
+        $assetRows = $assetStmt->fetchAll(PDO::FETCH_ASSOC);
+        $assetStmt->closeCursor();
         $assetHashUpdate = $pdo->prepare('UPDATE share_assets SET asset_hash = :asset_hash WHERE id = :id');
-        while ($row = $assetStmt->fetch(PDO::FETCH_ASSOC)) {
+        foreach ($assetRows as $row) {
             $assetHash = normalize_hash_hex($row['asset_hash'] ?? '');
             if ($assetHash === '') {
                 $filePath = (string)($row['file_path'] ?? '');
@@ -5325,7 +11328,9 @@ function handle_api(string $path): void {
                 ':id' => $shareId,
                 ':uid' => $user['id'],
             ]);
-            if (!$check->fetchColumn()) {
+            $hardExists = (bool)$check->fetchColumn();
+            $check->closeCursor();
+            if (!$hardExists) {
                 api_response(404, null, '分享不存在');
             }
             hard_delete_share($shareId);
@@ -5354,6 +11359,7 @@ function handle_api(string $path): void {
             ':uid' => $user['id'],
         ]);
         $share = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->closeCursor();
         if (!$share) {
             api_response(404, null, 'Share not found');
         }
@@ -7850,7 +13856,9 @@ function seed_share_visitors_from_logs(int $shareId): void {
     $pdo = db();
     $stmt = $pdo->prepare('SELECT COUNT(*) FROM share_visitors WHERE share_id = :sid');
     $stmt->execute([':sid' => $shareId]);
-    if ((int)$stmt->fetchColumn() > 0) {
+    $visitorCount = (int)$stmt->fetchColumn();
+    $stmt->closeCursor();
+    if ($visitorCount > 0) {
         return;
     }
     $pdo->prepare('INSERT OR IGNORE INTO share_visitors (share_id, visitor_id, created_at)
@@ -8828,6 +14836,7 @@ function route_share(string $slug, ?string $docId = null): void {
             ':id' => $rowId,
         ]);
         $markdown = $docMarkdownStmt->fetchColumn();
+        $docMarkdownStmt->closeCursor();
         return is_string($markdown) ? $markdown : '';
     };
     if (empty($docs)) {
@@ -8891,6 +14900,9 @@ function route_share(string $slug, ?string $docId = null): void {
             $sidebar .= '<button class="kb-side-tab is-active" type="button" data-share-tab="tree">文档树</button>';
             $sidebar .= '<button class="kb-side-tab" type="button" data-share-tab="toc">目录</button>';
             $sidebar .= '<button class="kb-side-tab" type="button" data-share-tab="recent">最近更新</button>';
+            if (netdisk_tab_state($share)['show']) {
+                $sidebar .= render_netdisk_tab_button();
+            }
             $sidebar .= '<div class="kb-side-actions" data-share-tree-actions>';
             $sidebar .= '<button class="kb-side-action" type="button" data-tree-collapse title="折叠所有" aria-label="折叠所有"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#sps-tree-collapse-all"></use></svg></button>';
             $sidebar .= '<button class="kb-side-action" type="button" data-tree-expand title="展开所有" aria-label="展开所有"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#sps-tree-expand-all"></use></svg></button>';
@@ -8905,6 +14917,9 @@ function route_share(string $slug, ?string $docId = null): void {
             $sidebar .= '<div class="kb-side-panel" data-share-panel="recent" hidden>';
             $sidebar .= '<div class="kb-side-body share-recent-body">' . render_share_recent_list($docs, $slug, 5) . '</div>';
             $sidebar .= '</div>';
+            if (netdisk_tab_state($share)['show']) {
+                $sidebar .= render_netdisk_panel($slug);
+            }
             $sidebar .= '</aside>';
             $base = base_path();
             $crumbs = build_breadcrumbs((string)($doc['hpath'] ?? ''));
@@ -9014,12 +15029,15 @@ function route_share(string $slug, ?string $docId = null): void {
         $sidebar .= render_share_sidebar_info(count($docs), (bool)$docId);
         $sidebar .= render_share_search_box($slug);
         $sidebar .= '<div class="kb-side-tabs" data-share-tabs data-share-default="tree">';
-        $sidebar .= '<button class="kb-side-tab is-active" type="button" data-share-tab="tree">文档树</button>';
+            $sidebar .= '<button class="kb-side-tab is-active" type="button" data-share-tab="tree">文档树</button>';
         $sidebar .= '<button class="kb-side-tab" type="button" data-share-tab="toc">目录</button>';
         $sidebar .= '<button class="kb-side-tab" type="button" data-share-tab="recent">最近更新</button>';
+        if (netdisk_tab_state($share)['show']) {
+            $sidebar .= render_netdisk_tab_button();
+        }
         $sidebar .= '<div class="kb-side-actions" data-share-tree-actions>';
-        $sidebar .= '<button class="kb-side-action" type="button" data-tree-collapse title="折叠所有" aria-label="折叠所有"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#sps-tree-collapse-all"></use></svg></button>';
-        $sidebar .= '<button class="kb-side-action" type="button" data-tree-expand title="展开所有" aria-label="展开所有"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#sps-tree-expand-all"></use></svg></button>';
+            $sidebar .= '<button class="kb-side-action" type="button" data-tree-collapse title="折叠所有" aria-label="折叠所有"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#sps-tree-collapse-all"></use></svg></button>';
+            $sidebar .= '<button class="kb-side-action" type="button" data-tree-expand title="展开所有" aria-label="展开所有"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#sps-tree-expand-all"></use></svg></button>';
         $sidebar .= '</div>';
         $sidebar .= '</div>';
         $sidebar .= '<div class="kb-side-panel" data-share-panel="tree">';
@@ -9031,6 +15049,9 @@ function route_share(string $slug, ?string $docId = null): void {
         $sidebar .= '<div class="kb-side-panel" data-share-panel="recent" hidden>';
         $sidebar .= '<div class="kb-side-body share-recent-body">' . render_share_recent_list($docs, $slug, 5) . '</div>';
         $sidebar .= '</div>';
+        if (netdisk_tab_state($share)['show']) {
+            $sidebar .= render_netdisk_panel($slug);
+        }
         $sidebar .= '</aside>';
         $base = base_path();
 
@@ -9189,6 +15210,10 @@ function route_share(string $slug, ?string $docId = null): void {
 
     render_share_not_found_page();
 }
+// CLI 模式：仅暴露函数（供后台 worker require 复用），不执行 web 路由
+if (PHP_SAPI === 'cli') {
+    return;
+}
 $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '/';
 $base = base_path();
 if ($base && strpos($path, $base) === 0) {
@@ -9240,6 +15265,45 @@ if (preg_match('#^/s/([a-zA-Z0-9_-]+)/report$#', $path, $matches) && $_SERVER['R
 
 if (preg_match('#^/s/([a-zA-Z0-9_-]+)/search$#', $path, $matches) && $_SERVER['REQUEST_METHOD'] === 'GET') {
     handle_share_search($matches[1]);
+}
+
+if (preg_match('#^/s/([a-zA-Z0-9_-]+)/netdisk/list$#', $path, $matches) && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    handle_netdisk_list($matches[1]);
+}
+
+if (preg_match('#^/s/([a-zA-Z0-9_-]+)/netdisk/search$#', $path, $matches) && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    handle_netdisk_search($matches[1]);
+}
+
+if (preg_match('#^/s/([a-zA-Z0-9_-]+)/netdisk/open$#', $path, $matches) && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    handle_netdisk_open($matches[1]);
+}
+
+if (preg_match('#^/s/([a-zA-Z0-9_-]+)/netdisk/preview$#', $path, $matches) && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    handle_netdisk_preview_page($matches[1]);
+}
+
+if (preg_match('#^/s/([a-zA-Z0-9_-]+)/netdisk/thumb$#', $path, $matches) && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    handle_netdisk_thumb($matches[1]);
+}
+
+if (preg_match('#^/s/([a-zA-Z0-9_-]+)/netdisk/content$#', $path, $matches) && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    handle_netdisk_content($matches[1]);
+}
+
+// 网盘下载（需命中分享下载规则）
+if (preg_match('#^/s/([a-zA-Z0-9_-]+)/netdisk/download$#', $path, $matches) && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    handle_netdisk_download($matches[1]);
+}
+
+// WOPI 只读宿主：CheckFileInfo
+if (preg_match('#^/s/([a-zA-Z0-9_-]+)/netdisk/wopi/([^/]+)$#', $path, $matches) && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    handle_netdisk_wopi($matches[1], $matches[2]);
+}
+
+// WOPI 只读宿主：GetFile
+if (preg_match('#^/s/([a-zA-Z0-9_-]+)/netdisk/wopi/([^/]+)/contents$#', $path, $matches) && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    handle_netdisk_wopi_getfile($matches[1], $matches[2]);
 }
 
 if (preg_match('#^/s/([a-zA-Z0-9_-]+)(?:/([^/]+))?$#', $path, $matches)) {
@@ -9386,6 +15450,7 @@ if ($path === '/login/email' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $stmt = $pdo->prepare('SELECT * FROM users WHERE email = :email LIMIT 1');
     $stmt->execute([':email' => $email]);
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$user) {
         flash('error', '该邮箱未注册');
         redirect('/login?tab=email&step=verify');
@@ -9585,7 +15650,7 @@ if ($path === '/register') {
             if ($email !== '') {
                 $checkEmail = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
                 $checkEmail->execute([':email' => $email]);
-                if ($checkEmail->fetch()) {
+                if (pdo_fetch_exists($checkEmail)) {
                     flash('error', '该邮箱已注册');
                     redirect('/register');
                 }
@@ -9645,7 +15710,7 @@ if ($path === '/register') {
         $pdo = db();
         $checkEmail = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
         $checkEmail->execute([':email' => $email]);
-        if ($checkEmail->fetch()) {
+        if (pdo_fetch_exists($checkEmail)) {
             flash('error', '该邮箱已注册');
             redirect('/register?step=verify');
         }
@@ -9852,6 +15917,7 @@ if ($path === '/reset') {
         $stmt = $pdo->prepare('SELECT * FROM users WHERE email = :email LIMIT 1');
         $stmt->execute([':email' => $email]);
         $user = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->closeCursor();
         if (!$user) {
             flash('error', '账号不存在');
             redirect('/reset');
@@ -11158,6 +17224,7 @@ if ($path === '/admin') {
     $userCountStmt = $pdo->prepare($userCountSql);
     $userCountStmt->execute($userParams);
     $totalUsers = (int)$userCountStmt->fetchColumn();
+    $userCountStmt->closeCursor();
     [$userPage, $userSize, $userPages, $userOffset] = paginate($totalUsers, $userPage, $userSize);
     $userSql .= ' ORDER BY created_at DESC LIMIT :limit OFFSET :offset';
     $userStmt = $pdo->prepare($userSql);
@@ -11168,8 +17235,13 @@ if ($path === '/admin') {
     $userStmt->bindValue(':offset', $userOffset, PDO::PARAM_INT);
     $userStmt->execute();
     $users = $userStmt->fetchAll(PDO::FETCH_ASSOC);
+    $userStmt->closeCursor();
+    // 批量聚合重算（整页 2 条 SQL），替代逐用户 3 条 SQL 的"读后写"循环，
+    // 避免与 nd-worker 心跳/队列写入撞 SQLite 升级死锁（database is locked）。
+    $storageMap = recalculate_users_storage_batch(array_column($users, 'id'));
     foreach ($users as &$u) {
-        $u['storage_used_bytes'] = recalculate_user_storage((int)$u['id']);
+        $uid = (int)$u['id'];
+        $u['storage_used_bytes'] = $storageMap[$uid] ?? (int)($u['storage_used_bytes'] ?? 0);
     }
     unset($u);
 
@@ -11336,6 +17408,7 @@ if ($path === '/admin') {
     $content .= '<div><label>SMTP 用户名</label><input class="input" name="smtp_user" value="' . htmlspecialchars((string)$smtpUser) . '"></div>';
     $content .= '<div><label>SMTP 密码</label><input class="input" type="password" name="smtp_pass" value="' . htmlspecialchars((string)$smtpPass) . '"></div>';
     $content .= '</div>';
+    $content .= '<div class="muted" style="margin-top:8px">网盘相关设置（Cloudreve 连接、分享绑定、文件预览引擎）请到“分享管理 → 网盘配置”中配置。</div>';
     $content .= '<div style="margin-top:12px"><button class="button primary" type="submit">保存设置</button></div>';
     $content .= '</form></div>';
     $content .= '<div class="modal" id="site-base-url-help" data-report-modal hidden>';
@@ -11805,6 +17878,339 @@ if ($path === '/admin') {
     $content .= '<button class="button" type="submit">跳转</button>';
     $content .= '</form>';
     $content .= '</div>';
+    $content .= '</div>';
+
+    $cloudreveConfigs = cloudreve_configs_all();
+    $content .= '<div class="card" id="netdisk"><h2>网盘配置</h2>';
+
+    // ===================== Cloudreve 连接配置管理 =====================
+    $content .= '<h3 style="margin-top:4px;margin-bottom:8px">Cloudreve 连接配置</h3>';
+    if (empty($cloudreveConfigs)) {
+        $content .= '<div class="notice">尚未添加任何 Cloudreve 连接。请先在下方添加一个连接，再到“分享绑定”里为指定分享开启网盘。</div>';
+    } else {
+        $content .= '<div class="table-scroll table-scroll-has-actions" style="margin-top:12px"><table class="table table-has-actions"><thead><tr><th>名称</th><th>地址</th><th>服务账号</th><th>默认根目录</th><th>状态</th><th class="actions">操作</th></tr></thead><tbody>';
+        foreach ($cloudreveConfigs as $cfg) {
+            $cfgName = htmlspecialchars((string)($cfg['name'] ?? ''));
+            $cfgBase = htmlspecialchars((string)($cfg['base_url'] ?? ''));
+            $cfgEmail = htmlspecialchars((string)($cfg['email'] ?? ''));
+            $cfgRoot = htmlspecialchars((string)($cfg['default_root'] ?? 'cloudreve://my'));
+            $cfgEnabled = (int)($cfg['enabled'] ?? 0) === 1;
+            $cfgState = $cfgEnabled ? '启用' : '停用';
+            $content .= '<tr>';
+            $content .= '<td>' . $cfgName . '</td>';
+            $content .= '<td>' . $cfgBase . '</td>';
+            $content .= '<td>' . $cfgEmail . '</td>';
+            $content .= '<td><code>' . $cfgRoot . '</code></td>';
+            $content .= '<td>' . htmlspecialchars($cfgState) . '</td>';
+            $content .= '<td class="actions">';
+            $content .= '<form method="post" action="' . base_path() . '/admin/netdisk/config/test" class="inline-form">';
+            $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+            $content .= '<input type="hidden" name="config_id" value="' . (int)$cfg['id'] . '">';
+            $content .= '<button class="button" type="submit">测试连接</button>';
+            $content .= '</form>';
+            $content .= '<button class="button" type="button" data-cfg-edit data-cfg-id="' . (int)$cfg['id'] . '" data-cfg-name="' . $cfgName . '" data-cfg-base="' . $cfgBase . '" data-cfg-email="' . $cfgEmail . '" data-cfg-root="' . htmlspecialchars($cfgRoot) . '" data-cfg-enabled="' . ($cfgEnabled ? '1' : '0') . '">编辑</button>';
+            $content .= '<form method="post" action="' . base_path() . '/admin/netdisk/config/delete" class="inline-form" data-confirm-message="确定删除该 Cloudreve 连接配置？其绑定的分享网盘将失效。">';
+            $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+            $content .= '<input type="hidden" name="config_id" value="' . (int)$cfg['id'] . '">';
+            $content .= '<button class="button danger" type="submit">删除</button>';
+            $content .= '</form>';
+            $content .= '</td>';
+            $content .= '</tr>';
+        }
+        $content .= '</tbody></table></div>';
+    }
+
+    // 新增 / 编辑 连接配置表单
+    $editCfg = null;
+    $editCfgId = (int)($_GET['edit_netdisk_cfg'] ?? 0);
+    if ($editCfgId > 0) {
+        $editCfg = cloudreve_config_get($editCfgId);
+    }
+    $cfgFormName = $editCfg ? (string)$editCfg['name'] : '';
+    $cfgFormBase = $editCfg ? (string)$editCfg['base_url'] : '';
+    $cfgFormEmail = $editCfg ? (string)$editCfg['email'] : '';
+    $cfgFormRoot = $editCfg ? (string)$editCfg['default_root'] : 'cloudreve://my';
+    $cfgFormEnabled = !$editCfg || (int)$editCfg['enabled'] === 1;
+    $content .= '<button class="button ghost" type="button" data-netdisk-cfg-toggle style="margin-top:12px">' . ($editCfg ? '正在编辑连接' : '新增连接') . '</button>';
+    $content .= '<div data-netdisk-cfg-form' . ($editCfg ? '' : ' hidden') . '>';
+    $content .= '<form method="post" action="' . base_path() . '/admin/netdisk/config/save" style="margin-top:12px" class="card-sub-form">';
+    $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+    if ($editCfg) {
+        $content .= '<input type="hidden" name="config_id" value="' . (int)$editCfg['id'] . '">';
+        $content .= '<div class="muted" style="margin-bottom:8px">正在编辑配置「' . htmlspecialchars($cfgFormName) . '」（ID ' . (int)$editCfg['id'] . '）</div>';
+    }
+    $content .= '<div class="grid">';
+    $content .= '<div><label>配置名称</label><input class="input" name="name" placeholder="例如：主 Cloudreve" required value="' . htmlspecialchars($cfgFormName) . '"></div>';
+    $content .= '<div><label>Cloudreve 网盘地址</label><input class="input" name="base_url" placeholder="https://cloud.example.com" required value="' . htmlspecialchars($cfgFormBase) . '"></div>';
+    $content .= '<div><label>服务账号邮箱</label><input class="input" name="email" placeholder="用于 API 登录" required value="' . htmlspecialchars($cfgFormEmail) . '"></div>';
+    $content .= '<div><label>服务账号密码</label><input class="input" type="password" name="password" autocomplete="new-password" placeholder="' . ($editCfg ? '留空表示不修改密码' : '') . '"' . ($editCfg ? '' : ' required') . ' value=""></div>';
+    $content .= '<div><label>默认分享根目录 URI</label><div class="netdisk-root-pick"><input class="input" name="default_root" id="netdisk-default-root" placeholder="cloudreve://my 或 cloudreve://my/目录" value="' . htmlspecialchars($cfgFormRoot) . '"><button class="button ghost" type="button" data-netdisk-pick-root>选择目录</button></div></div>';
+    $content .= '</div>';
+    // ===== 连接级全文索引配置（留空 = 使用全局默认） =====
+    $cfgIndexVals = $editCfg ? [
+        'index_ocr_enabled' => (string)($editCfg['index_ocr_enabled'] ?? ''),
+        'index_ocr_concurrency' => (string)($editCfg['index_ocr_concurrency'] ?? ''),
+        'index_ocr_dpi_start' => (string)($editCfg['index_ocr_dpi_start'] ?? ''),
+        'index_ocr_dpi_max' => (string)($editCfg['index_ocr_dpi_max'] ?? ''),
+        'index_ocr_quality_threshold' => (string)($editCfg['index_ocr_quality_threshold'] ?? ''),
+        'index_ocr_max_mb' => (string)($editCfg['index_ocr_max_mb'] ?? ''),
+        'index_ocr_low_max_mb' => (string)($editCfg['index_ocr_low_max_mb'] ?? ''),
+        'index_refresh_ttl' => (string)($editCfg['index_refresh_ttl'] ?? ''),
+        'index_skip_exts' => (string)($editCfg['index_skip_exts'] ?? ''),
+    ] : [];
+    // 连接级 OCR/索引配置已迁移至【全文索引】区的"连接 OCR 配置"独立表单，此处不再展示
+    $content .= '<label style="margin-top:8px;display:inline-block"><input type="checkbox" name="enabled" value="1"' . ($cfgFormEnabled ? ' checked' : '') . '> 启用该连接</label>';
+    $content .= '<div style="margin-top:12px">';
+    $content .= '<button class="button primary" type="submit">' . ($editCfg ? '保存修改' : '新增连接') . '</button>';
+    $content .= ' <button class="button" type="button" data-netdisk-cfg-test>测试连接</button>';
+    if ($editCfg) {
+        $content .= ' <a class="button ghost" href="' . build_admin_query_url('netdisk', ['edit_netdisk_cfg' => null]) . '">取消编辑</a>';
+    }
+    $content .= '</div>';
+    $content .= '</form>';
+    $content .= '</div>';
+
+    // ===================== 分享绑定 =====================
+    $content .= '<h3 style="margin-top:20px;margin-bottom:8px">分享绑定（为已分享的笔记开启网盘）</h3>';
+    $netdiskSharesStmt = $pdo->prepare('SELECT id, type, title, slug, netdisk_enabled, netdisk_root, netdisk_permission, netdisk_config_id FROM shares WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 500');
+    $netdiskSharesStmt->execute();
+    $netdiskShares = $netdiskSharesStmt->fetchAll(PDO::FETCH_ASSOC);
+    // 批量预取每个分享的文档数（fetchAll 自动关游标，避免渲染循环内 SELECT→UPDATE 撞 SQLite 升级锁）
+    $netdiskDocCounts = [];
+    $netdiskDocStmt = $pdo->query('SELECT share_id, COUNT(*) AS cnt FROM share_docs GROUP BY share_id');
+    if ($netdiskDocStmt) {
+        foreach ($netdiskDocStmt->fetchAll(PDO::FETCH_ASSOC) as $docCountRow) {
+            $netdiskDocCounts[(int)$docCountRow['share_id']] = (int)$docCountRow['cnt'];
+        }
+    }
+    if (empty($cloudreveConfigs)) {
+        $content .= '<div class="notice">请先在上方添加至少一个 Cloudreve 连接配置。</div>';
+    } elseif (empty($netdiskShares)) {
+        $content .= '<p class="muted">暂无分享，先创建分享后再配置网盘。</p>';
+    } else {
+        $content .= '<div class="table-scroll table-scroll-has-actions" style="margin-top:12px"><table class="table table-has-actions"><thead><tr><th>标题</th><th>链接</th><th>启用网盘</th><th>绑定连接</th><th>网盘标签</th><th class="actions">操作</th></tr></thead><tbody>';
+        foreach ($netdiskShares as $ns) {
+            $nsTitle = htmlspecialchars((string)($ns['title'] ?? ''));
+            $nsUrl = share_url((string)$ns['slug']);
+            $nsRoot = htmlspecialchars((string)($ns['netdisk_root'] ?? ''));
+            $nsEnabled = (int)($ns['netdisk_enabled'] ?? 0) === 1;
+            $nsCfgId = (int)($ns['netdisk_config_id'] ?? 0);
+            $content .= '<tr>';
+            $content .= '<td>' . $nsTitle . '</td>';
+            $content .= '<td><a href="' . htmlspecialchars($nsUrl) . '" target="_blank">' . htmlspecialchars($nsUrl) . '</a></td>';
+            $content .= '<td><label class="checkbox"><input type="checkbox" form="netdisk-form" name="netdisk_enabled[' . (int)$ns['id'] . ']" value="1"' . ($nsEnabled ? ' checked' : '') . '> 开启</label></td>';
+            $content .= '<td><select class="input" form="netdisk-form" name="netdisk_config_id[' . (int)$ns['id'] . ']">';
+            foreach ($cloudreveConfigs as $cfgOpt) {
+                $optSelected = ($nsCfgId === (int)$cfgOpt['id']) ? ' selected' : '';
+                $optDisabled = (int)($cfgOpt['enabled'] ?? 0) !== 1 ? ' (停用)' : '';
+                $content .= '<option value="' . (int)$cfgOpt['id'] . '"' . $optSelected . '>' . htmlspecialchars((string)$cfgOpt['name']) . $optDisabled . '</option>';
+            }
+            $content .= '</select></td>';
+            $nsState = netdisk_tab_state($ns, $netdiskDocCounts);
+            $nsStateHtml = $nsState['show']
+                ? '<span style="color:#16a34a">可显示</span>'
+                : '<span style="color:#c00">' . htmlspecialchars($nsState['reason']) . '</span>';
+            $content .= '<td>' . $nsStateHtml . '</td>';
+            $content .= '<td class="actions">';
+            $content .= '<button class="button" type="button" data-netdisk-dl-manage data-share-id="' . (int)$ns['id'] . '" data-share-title="' . htmlspecialchars($nsTitle) . '" data-netdisk-config-id="' . (int)$nsCfgId . '">下载规则</button>';
+            $content .= '<a class="button" href="' . htmlspecialchars($nsUrl) . '" target="_blank">打开分享</a>';
+            $content .= '</td>';
+            $content .= '</tr>';
+        }
+        $content .= '</tbody></table></div>';
+        $content .= '<form id="netdisk-form" method="post" action="' . base_path() . '/admin/netdisk" style="margin-top:12px">';
+        $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+        $content .= '<button class="button primary" type="submit">保存分享绑定</button>';
+        $content .= '</form>';
+    }
+    // ===================== 文件预览 =====================
+    $content .= '<h3 id="netdisk-preview" style="margin-top:24px;margin-bottom:8px">文件预览</h3>';
+    $officeApps = netdisk_office_apps();
+    $officeDefaultEngine = strtolower((string)get_setting('netdisk_office_engine', 'auto'));
+    if (!in_array($officeDefaultEngine, ['auto', 'collabora', 'onlyoffice'], true)) { $officeDefaultEngine = 'auto'; }
+    $officeExtMap = json_decode((string)get_setting('netdisk_office_ext_map', '{}'), true);
+    if (!is_array($officeExtMap)) { $officeExtMap = []; }
+    // 生成多扩展名每行一个的显示文本：doc,docx,xlsx:collabora
+    $officeExtTextByEngine = [];
+    foreach ($officeExtMap as $ek => $ev) {
+        $officeExtTextByEngine[strtolower((string)$ev)][] = strtolower((string)$ek);
+    }
+    $officeExtMapText = '';
+    foreach ($officeExtTextByEngine as $eng => $exts) {
+        $officeExtMapText .= implode(',', array_unique($exts)) . ':' . $eng . "\n";
+    }
+    $officeExtMapText = trim($officeExtMapText);
+    if (empty($officeApps)) {
+        $content .= '<div class="notice">尚未添加 WOPI 应用（如 OnlyOffice / Collabora）。添加后，访客在网盘里即可只读预览 docx/xlsx/pptx/pdf 等文档（仅浏览权限，无法从中编辑保存）。</div>';
+    }
+    if (!empty($officeApps)) {
+        $content .= '<div class="table-scroll table-scroll-has-actions" style="margin-top:12px"><table class="table table-has-actions"><thead><tr><th>名称</th><th>引擎</th><th>地址</th><th>状态</th><th class="actions">操作</th></tr></thead><tbody>';
+        foreach ($officeApps as $oa) {
+            $oaName = htmlspecialchars((string)($oa['name'] ?? ''));
+            $oaEngine = netdisk_office_engine_label((string)($oa['engine'] ?? ''));
+            $oaUrl = htmlspecialchars((string)($oa['base_url'] ?? ''));
+            $oaActive = (int)($oa['enabled'] ?? 1) === 1;
+            $oaState = $oaActive ? '启用' : '停用';
+            $content .= '<tr>';
+            $content .= '<td>' . $oaName . '</td>';
+            $content .= '<td>' . htmlspecialchars($oaEngine) . '</td>';
+            $content .= '<td>' . $oaUrl . '</td>';
+            $content .= '<td>' . htmlspecialchars($oaState) . '</td>';
+            $content .= '<td class="actions">';
+            $content .= '<form method="post" action="' . base_path() . '/admin/netdisk/office/test" class="inline-form">';
+            $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+            $content .= '<input type="hidden" name="app_id" value="' . (int)$oa['id'] . '">';
+            $content .= '<button class="button" type="submit">测试</button>';
+            $content .= '</form>';
+            $content .= '<button class="button" type="button" data-office-edit data-app-id="' . (int)$oa['id'] . '" data-app-name="' . $oaName . '" data-app-url="' . htmlspecialchars((string)($oa['base_url'] ?? '')) . '" data-app-enabled="' . ($oaActive ? '1' : '0') . '">编辑</button>';
+            $content .= '<form method="post" action="' . base_path() . '/admin/netdisk/office/delete" class="inline-form" data-confirm-message="确定删除该 WOPI 应用？">';
+            $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+            $content .= '<input type="hidden" name="app_id" value="' . (int)$oa['id'] . '">';
+            $content .= '<button class="button danger" type="submit">删除</button>';
+            $content .= '</form>';
+            $content .= '</td>';
+            $content .= '</tr>';
+        }
+        $content .= '</tbody></table></div>';
+    }
+    // 编辑应用预填
+    $editOfficeApp = null;
+    $editOfficeAppId = (int)($_GET['edit_office_app'] ?? 0);
+    if ($editOfficeAppId > 0) {
+        $stmt = $pdo->prepare('SELECT * FROM office_apps WHERE id = :id');
+        $stmt->execute([':id' => $editOfficeAppId]);
+        $editOfficeApp = $stmt->fetch(PDO::FETCH_ASSOC);
+    }
+    $oaFormName = $editOfficeApp ? (string)$editOfficeApp['name'] : '';
+    $oaFormUrl = $editOfficeApp ? (string)$editOfficeApp['base_url'] : '';
+    $oaFormEnabled = !$editOfficeApp || (int)$editOfficeApp['enabled'] === 1;
+    $content .= '<button class="button ghost" type="button" data-netdisk-office-toggle style="margin-top:12px">' . ($editOfficeApp ? '正在编辑应用' : '添加应用') . '</button>';
+    $content .= '<div data-netdisk-office-form' . ($editOfficeApp ? '' : ' hidden') . '>';
+    $content .= '<form method="post" action="' . base_path() . '/admin/netdisk/office/save" style="margin-top:8px" class="card-sub-form">';
+    $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+    if ($editOfficeApp) {
+        $content .= '<input type="hidden" name="app_id" value="' . (int)$editOfficeApp['id'] . '">';
+        $content .= '<div class="muted" style="margin-bottom:8px">正在编辑应用「' . htmlspecialchars($oaFormName) . '」（ID ' . (int)$editOfficeApp['id'] . '）。引擎类型由 /hosting/discovery 自动识别，保存时重新校验。</div>';
+    } else {
+        $content .= '<div class="muted" style="margin-bottom:8px">添加时会自动抓取 /hosting/discovery 校验并识别引擎类型（参考 <a href="https://docs.cloudreve.org/zh/usage/wopi" target="_blank" rel="noopener">Cloudreve WOPI 文档</a>）。</div>';
+    }
+    $content .= '<div class="grid">';
+    $content .= '<div><label>应用名称</label><input class="input" name="app_name" placeholder="例如：OnlyOffice 主服务" required value="' . htmlspecialchars($oaFormName) . '"></div>';
+    $content .= '<div style="grid-column:1/-1"><label>WOPI 地址（根地址，需支持 /hosting/discovery，如 https://office.example.com:443）</label><input class="input" name="app_base_url" placeholder="https://office.example.com:443" required value="' . htmlspecialchars($oaFormUrl) . '"></div>';
+    $content .= '</div>';
+    $content .= '<label style="margin-top:8px;display:inline-block"><input type="checkbox" name="app_enabled" value="1"' . ($oaFormEnabled ? ' checked' : '') . '> 启用该应用</label>';
+    $content .= '<div style="margin-top:12px"><button class="button primary" type="submit">' . ($editOfficeApp ? '保存修改' : '添加应用') . '</button>';
+    if ($editOfficeApp) {
+        $content .= ' <a class="button ghost" href="' . build_admin_query_url('netdisk', ['edit_office_app' => null]) . '">取消编辑</a>';
+    }
+    $content .= '</div>';
+    $content .= '</form>';
+    $content .= '</div>';
+    // 默认引擎下拉：动态来自已添加应用（不再硬编码“自动”）
+    $officeEngineOptions = [];
+    foreach ($officeApps as $oa) {
+        $eng = strtolower((string)($oa['engine'] ?? ''));
+        if ($eng === '') {
+            continue;
+        }
+        $officeEngineOptions[$eng] = netdisk_office_engine_label($eng);
+    }
+    if ($officeDefaultEngine === 'auto' || !isset($officeEngineOptions[$officeDefaultEngine])) {
+        // 旧值 auto 或已失效的引擎：默认选中第一个已配置引擎
+        $officeDefaultEngine = count($officeEngineOptions) > 0 ? (string)array_key_first($officeEngineOptions) : '';
+    }
+    $content .= '<form method="post" action="' . base_path() . '/admin/netdisk/office/settings" style="margin-top:16px" class="card-sub-form">';
+    $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+    $content .= '<div class="grid">';
+    $content .= '<div><label>默认引擎</label><select class="input" name="app_default_engine">';
+    foreach ($officeEngineOptions as $engVal => $engLabel) {
+        $content .= '<option value="' . htmlspecialchars($engVal) . '"' . ($officeDefaultEngine === $engVal ? ' selected' : '') . '>' . htmlspecialchars($engLabel) . '</option>';
+    }
+    $content .= '</select></div>';
+    $content .= '<div style="grid-column:1/-1"><label>按扩展名指定引擎（每行一个，扩展名用逗号分隔，如 doc,docx,xlsx:collabora，留空表示用默认引擎）</label><textarea class="input code-input" name="app_ext_map" rows="4" placeholder="doc,docx,xlsx:collabora&#10;pdf:collabora">' . htmlspecialchars($officeExtMapText) . '</textarea></div>';
+    $content .= '</div>';
+    $content .= '<div style="margin-top:12px"><button class="button primary" type="submit">保存预览设置</button></div>';
+    $content .= '</form>';
+    $content .= '<h3 style="margin-top:20px;margin-bottom:8px">全文索引</h3>';
+    $content .= '<div class="muted" style="margin-bottom:8px">无需 Cloudreve 管理员权限即可检索文件名与正文；每个连接各自配置 OCR/索引参数（新增连接默认关闭 OCR），重建在后台运行、可独立重建/终止，进度见下方表格。</div>';
+    if (empty($cloudreveConfigs)) {
+        $content .= '<div class="notice">请先在上方添加至少一个 Cloudreve 连接配置。</div>';
+    } else {
+        $content .= '<div class="table-scroll table-scroll-has-actions" style="margin-top:8px"><table class="table table-has-actions"><thead><tr><th>连接</th><th>OCR</th><th>DPI</th><th>上限MB</th><th>跳过MB</th><th>刷新秒</th><th class="actions">操作</th></tr></thead><tbody>';
+        foreach ($cloudreveConfigs as $icfg) {
+            $icfgId = (int)$icfg['id'];
+            $icfgName = htmlspecialchars((string)($icfg['name'] ?? ''));
+            $icfgOcrOn = trim((string)($icfg['index_ocr_enabled'] ?? '')) === '' ? false : trim((string)$icfg['index_ocr_enabled']) !== '0';
+            $icCfgId = $icfgId;
+            $icDpiS = netdisk_index_ocr_dpi_start($icCfgId);
+            $icMax = netdisk_index_ocr_max_mb($icCfgId);
+            $icLow = netdisk_index_ocr_low_max_mb($icCfgId);
+            $icTtl = netdisk_index_refresh_ttl($icCfgId);
+            $icQty = netdisk_index_ocr_quality_threshold($icCfgId);
+            $icSkip = implode(',', array_keys(netdisk_index_skip_exts($icCfgId)));
+            $icVal = function (string $k, string $default) use ($icfg): string {
+                $v = trim((string)($icfg[$k] ?? ''));
+                return $v === '' ? $default : $v;
+            };
+            $content .= '<tr>';
+            $content .= '<td>' . $icfgName . '</td>';
+            $content .= '<td>' . ($icfgOcrOn ? '<span style="color:#16a34a">开</span>' : '<span class="muted">关</span>') . '</td>';
+            // 0027: OCR 关闭时 DPI/上限MB/跳过MB 无意义，显示占位符而非真实值
+            $icDash = '<span class="muted">—</span>';
+            $content .= '<td>' . ($icfgOcrOn ? (int)$icDpiS : $icDash) . '</td>';
+            $content .= '<td>' . ($icfgOcrOn ? (int)$icMax : $icDash) . '</td>';
+            $content .= '<td>' . ($icfgOcrOn ? (int)$icLow : $icDash) . '</td>';
+            $content .= '<td>' . (int)$icTtl . '</td>';
+            $content .= '<td class="actions">';
+            $content .= '<button class="button" type="button" data-netdisk-icfg-toggle data-cfg-id="' . $icfgId . '">配置</button>';
+            // 重建/终止二合一：初始显示"重建索引"，运行时报状态由前端根据 configs[].job_status 切换
+            $content .= '<button class="button" type="button" data-netdisk-cfg-action data-config-id="' . $icfgId . '" data-config-name="' . $icfgName . '" data-running="0">重建索引</button>';
+            $content .= '</td>';
+            $content .= '</tr>';
+            // 展开的配置编辑表单（默认隐藏）
+            $content .= '<tr class="nd-icfg-edit-row" data-nd-icfg-edit="' . $icfgId . '" hidden><td colspan="7">';
+            // 0018: 强制重跑 OCR 勾选框（默认不勾；勾选后重建请求附带 force_ocr=1，忽略已有高质量结果）
+            // 0027: 从操作列移入配置展开区，且置于 form 之外（它无 name，不参与保存）；重建按钮按 data-config-id 读取，行为不变
+            $content .= '<label class="checkbox" style="display:inline-flex;align-items:center;gap:4px;margin:8px 0 0;font-size:0.78rem" title="忽略已有高质量 OCR 结果，全部重新识别"><input type="checkbox" data-nd-force-ocr data-config-id="' . $icfgId . '"> 强制重跑 OCR（忽略已有高质量结果）</label>';
+            $content .= '<form method="post" action="' . base_path() . '/admin/netdisk/index-config/save" style="margin:8px 0" class="card-sub-form">';
+            $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+            $content .= '<input type="hidden" name="config_id" value="' . $icfgId . '">';
+            $content .= '<label class="checkbox" style="margin-bottom:6px;display:inline-block"><input type="checkbox" name="index_ocr_enabled" value="1" data-netdisk-index-ocr-toggle' . ($icfgOcrOn ? ' checked' : '') . '> 启用 OCR</label>';
+            $content .= '<div class="muted" style="margin-bottom:6px;font-size:0.75rem">OCR 引擎：PaddleOCR（PP-OCRv5，通过 serving 接入）。DPI 为 PDF 页转图分辨率。侧车模式下「DPI 上限 / 质量阈值 / 并发数」不生效，已改为隐藏保留值，保存时原样回传。跳过阈值MB 填 0 = 完全不做 OCR（只建索引）；正常上限MB 填 0 = 不设高优池，所有 OCR 候选只进低优先级队列。</div>';
+            $content .= '<div class="grid" data-netdisk-index-ocr-fields' . ($icfgOcrOn ? '' : ' hidden') . ' style="grid-template-columns:repeat(4,minmax(0,1fr));max-width:920px">';
+            // 0027: 只保留侧车模式下真正生效的 5 项
+            $icInputs = [
+                ['index_ocr_dpi_start', 'PDF转图DPI', '200'],
+                ['index_ocr_max_mb', '正常上限MB', '10'],
+                ['index_ocr_low_max_mb', '跳过阈值MB', '50'],
+                ['index_refresh_ttl', '刷新间隔秒', '3600'],
+                ['index_skip_exts', '跳过扩展名', 'zip,dwg,rar'],
+            ];
+            // 0027: 这三项在侧车模式下不生效，但仍须原样回传——保存接口对缺失字段取空串，
+            // 直接删输入框会把用户此前自定义的值覆盖成默认值（保存行为必须零变化）。
+            $icHiddenInputs = [
+                ['index_ocr_dpi_max', '600'],
+                ['index_ocr_quality_threshold', '0.3'],
+                ['index_ocr_concurrency', '4'],
+            ];
+            foreach ($icInputs as $icIn) {
+                $fName = $icIn[0];
+                $fVal = trim((string)($icfg[$fName] ?? ''));
+                $fDisp = $fVal === '' ? $icIn[2] : $fVal;
+                $content .= '<div style="display:flex;flex-direction:column;gap:4px"><label>' . htmlspecialchars($icIn[1]) . '</label><input class="input" name="' . $fName . '" value="' . htmlspecialchars($fDisp) . '"></div>';
+            }
+            foreach ($icHiddenInputs as $icHid) {
+                $hVal = trim((string)($icfg[$icHid[0]] ?? ''));
+                $content .= '<input type="hidden" name="' . $icHid[0] . '" value="' . htmlspecialchars($hVal === '' ? $icHid[1] : $hVal) . '">';
+            }
+            $content .= '</div>';
+            $content .= '<div style="margin-top:8px"><button class="button primary" type="submit">保存该连接配置</button></div>';
+            $content .= '</form>';
+            $content .= '</td></tr>';
+        }
+        $content .= '</tbody></table></div>';
+    }
+    $content .= '<div data-nd-reindex-status style="margin-top:14px"></div>';
     $content .= '</div>';
 
     $content .= '<div class="modal" data-share-announce-modal hidden>';
@@ -12355,7 +18761,7 @@ if ($path === '/admin/user-create' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($email !== '') {
         $checkEmail = $pdo->prepare('SELECT id FROM users WHERE email = :email LIMIT 1');
         $checkEmail->execute([':email' => $email]);
-        if ($checkEmail->fetch()) {
+        if (pdo_fetch_exists($checkEmail)) {
             $_SESSION['user_create_form'] = $createForm;
             flash('error', '邮箱已被其他账号使用');
             redirect('/admin#users');
@@ -12363,7 +18769,7 @@ if ($path === '/admin/user-create' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     $check = $pdo->prepare('SELECT id FROM users WHERE username = :username LIMIT 1');
     $check->execute([':username' => $username]);
-    if ($check->fetch()) {
+    if (pdo_fetch_exists($check)) {
         $_SESSION['user_create_form'] = $createForm;
         flash('error', '用户名已存在');
         redirect('/admin#users');
@@ -12428,14 +18834,14 @@ if ($path === '/admin/user-update' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($email !== '') {
         $checkEmail = $pdo->prepare('SELECT id FROM users WHERE email = :email AND id != :id');
         $checkEmail->execute([':email' => $email, ':id' => $userId]);
-        if ($checkEmail->fetch()) {
+        if (pdo_fetch_exists($checkEmail)) {
             flash('error', '邮箱已被其他账号使用');
             redirect('/admin#users');
         }
     }
     $check = $pdo->prepare('SELECT id FROM users WHERE username = :username AND id != :id');
     $check->execute([':username' => $username, ':id' => $userId]);
-    if ($check->fetch()) {
+    if (pdo_fetch_exists($check)) {
         flash('error', '用户名已存在');
         redirect('/admin#users');
     }
@@ -12459,6 +18865,870 @@ if ($path === '/admin/user-update' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     }
     flash('info', '用户信息已更新');
     redirect('/admin#users');
+}
+
+if ($path === '/admin/netdisk/config/save' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $configId = (int)($_POST['config_id'] ?? 0);
+    $name = trim((string)($_POST['name'] ?? ''));
+    $baseUrl = rtrim(trim((string)($_POST['base_url'] ?? '')), '/');
+    $email = trim((string)($_POST['email'] ?? ''));
+    $password = (string)($_POST['password'] ?? '');
+    $viewerId = '';
+    $defaultRoot = netdisk_normalize_root((string)($_POST['default_root'] ?? 'cloudreve://my'));
+    $officeEngine = trim((string)($_POST['office_engine'] ?? 'auto'));
+    if (!in_array($officeEngine, ['auto', 'collabora', 'onlyoffice'], true)) {
+        $officeEngine = 'auto';
+    }
+    $officeExtMapRaw = trim((string)($_POST['office_ext_map'] ?? ''));
+    $officeExtMapRaw = trim((string)($_POST["office_ext_map"] ?? ""));
+    $officeExtMap = "{}";
+    if ($officeExtMapRaw !== "") {
+        $decoded = json_decode($officeExtMapRaw, true);
+        if (!is_array($decoded)) {
+            $decoded = [];
+            foreach (preg_split("/\r\n|\n|\r/", $officeExtMapRaw) as $line) {
+                $line = trim((string)$line);
+                if ($line === "") continue;
+                $parts = explode(":", $line, 2);
+                if (count($parts) === 2) {
+                    $ek = strtolower(trim($parts[0]));
+                    $ev = strtolower(trim($parts[1]));
+                    if ($ek !== "" && in_array($ev, ["collabora", "onlyoffice"], true)) $decoded[$ek] = $ev;
+                }
+            }
+        }
+        if (is_array($decoded)) {
+            $officeExtMap = json_encode($decoded, JSON_UNESCAPED_UNICODE);
+        }
+    }
+    $officeCollaboraUrl = rtrim(trim((string)($_POST['office_collabora_url'] ?? '')), '/');
+    $officeOnlyofficeUrl = rtrim(trim((string)($_POST['office_onlyoffice_url'] ?? '')), '/');
+    $enabled = !empty($_POST['enabled']) ? 1 : 0;
+    // 连接级全文索引配置：编辑连接时不覆盖（OCR 配置已迁移至【全文索引】区的独立表单，
+    // 由 index-config/save 管理）；新增连接时初始化为"OCR 关闭 + 其余留空"（getter 用硬编码默认）。
+    $indexCfgFields = [];
+    if ($configId <= 0) {
+        $indexCfgFields = [
+            'index_ocr_enabled' => '0',
+            'index_ocr_concurrency' => '',
+            'index_ocr_dpi_start' => '',
+            'index_ocr_dpi_max' => '',
+            'index_ocr_quality_threshold' => '',
+            'index_ocr_max_mb' => '',
+            'index_ocr_low_max_mb' => '',
+            'index_refresh_ttl' => '',
+            'index_skip_exts' => '',
+        ];
+    }
+    if ($name === '' || $baseUrl === '' || $email === '') {
+        flash('error', '配置名称、网盘地址与服务账号邮箱不能为空');
+        redirect('/admin#netdisk');
+    }
+    $pdo = db();
+    if ($configId > 0) {
+        $existing = cloudreve_config_get($configId);
+        if (!$existing) {
+            flash('error', '配置不存在');
+            redirect('/admin#netdisk');
+        }
+        if ($password === '') {
+            $password = (string)$existing['password'];
+        } else {
+            $password = netdisk_encrypt_secret($password);
+            if ($password === '') {
+                flash('error', '密码加密失败：请检查 storage 目录是否可写');
+                redirect('/admin#netdisk');
+            }
+        }
+        $stmt = $pdo->prepare('UPDATE cloudreve_configs SET name=:name, base_url=:base_url, email=:email, password=:password, viewer_id=:viewer_id, default_root=:default_root, office_engine=:office_engine, office_ext_map=:office_ext_map, office_collabora_url=:office_collabora_url, office_onlyoffice_url=:office_onlyoffice_url, enabled=:enabled, ' . netdisk_index_cfg_sql_assign($indexCfgFields) . ' updated_at=:updated_at WHERE id=:id');
+        $stmt->execute(array_merge([
+            ':name' => $name,
+            ':base_url' => $baseUrl,
+            ':email' => $email,
+            ':password' => $password,
+            ':viewer_id' => $viewerId,
+            ':default_root' => $defaultRoot,
+            ':office_engine' => $officeEngine,
+            ':office_ext_map' => $officeExtMap,
+            ':office_collabora_url' => $officeCollaboraUrl,
+            ':office_onlyoffice_url' => $officeOnlyofficeUrl,
+            ':enabled' => $enabled,
+            ':updated_at' => now(),
+            ':id' => $configId,
+        ], netdisk_index_cfg_params($indexCfgFields)));
+        // 清空该连接的 token 缓存，下次自动重新登录
+        set_setting(cloudreve_token_key($configId, 'access'), '');
+        set_setting(cloudreve_token_key($configId, 'refresh'), '');
+        set_setting(cloudreve_token_key($configId, 'expires'), '0');
+        flash('info', '连接配置已更新');
+    } else {
+        if ($password === '') {
+            flash('error', '新增连接时必须填写服务账号密码');
+            redirect('/admin#netdisk');
+        }
+        $password = netdisk_encrypt_secret($password);
+        if ($password === '') {
+            flash('error', '密码加密失败：请检查 storage 目录是否可写');
+            redirect('/admin#netdisk');
+        }
+        $stmt = $pdo->prepare('INSERT INTO cloudreve_configs (name, base_url, email, password, viewer_id, default_root, office_engine, office_ext_map, office_collabora_url, office_onlyoffice_url, enabled, ' . implode(', ', array_keys($indexCfgFields)) . ', created_at, updated_at) VALUES (:name, :base_url, :email, :password, :viewer_id, :default_root, :office_engine, :office_ext_map, :office_collabora_url, :office_onlyoffice_url, :enabled, ' . implode(', ', array_map(fn($c) => ':' . $c, array_keys($indexCfgFields))) . ', :created_at, :updated_at)');
+        $stmt->execute(array_merge([
+            ':name' => $name,
+            ':base_url' => $baseUrl,
+            ':email' => $email,
+            ':password' => $password,
+            ':viewer_id' => $viewerId,
+            ':default_root' => $defaultRoot,
+            ':office_engine' => $officeEngine,
+            ':office_ext_map' => $officeExtMap,
+            ':office_collabora_url' => $officeCollaboraUrl,
+            ':office_onlyoffice_url' => $officeOnlyofficeUrl,
+            ':enabled' => $enabled,
+            ':created_at' => now(),
+            ':updated_at' => now(),
+        ], netdisk_index_cfg_params($indexCfgFields)));
+        flash('info', '连接配置已新增');
+    }
+    redirect('/admin#netdisk');
+}
+
+if ($path === '/admin/netdisk/config/delete' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $configId = (int)($_POST['config_id'] ?? 0);
+    if ($configId > 0) {
+        $pdo = db();
+        $stmt = $pdo->prepare('DELETE FROM cloudreve_configs WHERE id = :id');
+        $stmt->execute([':id' => $configId]);
+        $upd = $pdo->prepare('UPDATE shares SET netdisk_config_id = 0 WHERE netdisk_config_id = :id');
+        $upd->execute([':id' => $configId]);
+        flash('info', '连接配置已删除');
+    }
+    redirect('/admin#netdisk');
+}
+
+if ($path === '/admin/netdisk/config/test' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $configId = (int)($_POST['config_id'] ?? 0);
+    $cfg = null;
+    if ($configId > 0) {
+        $cfg = cloudreve_config_get($configId);
+    }
+    if (!$cfg) {
+        // 新增连接测试：用表单实时填写的连接信息构造临时配置
+        $baseUrl = rtrim(trim((string)($_POST['base_url'] ?? '')), '/');
+        $email = trim((string)($_POST['email'] ?? ''));
+        $password = (string)($_POST['password'] ?? '');
+        $viewerId = trim((string)($_POST['viewer_id'] ?? ''));
+        if ($baseUrl === '' || $email === '') {
+            api_response(400, null, '请先填写网盘地址与服务账号');
+        }
+        $cfg = [
+            'id' => 0,
+            'base_url' => $baseUrl,
+            'email' => $email,
+            'password' => $password,
+            'viewer_id' => $viewerId,
+        ];
+    }
+    $result = netdisk_test_connection($cfg);
+    if ($result['ok']) {
+        api_response(200, ['message' => $result['message']]);
+    } else {
+        api_response(400, null, '测试失败：' . $result['message']);
+    }
+}
+
+// 连接级全文索引/OCR 配置保存（全文索引区的"连接 OCR 配置"独立表单）
+if ($path === '/admin/netdisk/index-config/save' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $configId = (int)($_POST['config_id'] ?? 0);
+    if ($configId <= 0) {
+        api_response(400, null, '缺少配置 ID');
+    }
+    $cfg = cloudreve_config_get($configId);
+    if (!$cfg) {
+        api_response(400, null, '配置不存在');
+    }
+    $ocrEnabled = !empty($_POST['index_ocr_enabled']) ? '1' : '0';
+    $sub = [
+        'index_ocr_concurrency' => trim((string)($_POST['index_ocr_concurrency'] ?? '')),
+        'index_ocr_dpi_start' => trim((string)($_POST['index_ocr_dpi_start'] ?? '')),
+        'index_ocr_dpi_max' => trim((string)($_POST['index_ocr_dpi_max'] ?? '')),
+        'index_ocr_quality_threshold' => trim((string)($_POST['index_ocr_quality_threshold'] ?? '')),
+        'index_ocr_max_mb' => trim((string)($_POST['index_ocr_max_mb'] ?? '')),
+        'index_ocr_low_max_mb' => trim((string)($_POST['index_ocr_low_max_mb'] ?? '')),
+        'index_refresh_ttl' => trim((string)($_POST['index_refresh_ttl'] ?? '')),
+        'index_skip_exts' => trim((string)($_POST['index_skip_exts'] ?? '')),
+    ];
+    if ($ocrEnabled === '0') {
+        foreach ($sub as $k => $v) {
+            $sub[$k] = '';
+        }
+    }
+    $fields = array_merge(['index_ocr_enabled' => $ocrEnabled], $sub);
+    $pdo = db();
+    $sets = [];
+    $params = [];
+    foreach ($fields as $col => $val) {
+        $sets[] = $col . ' = :' . $col;
+        $params[':' . $col] = $val;
+    }
+    $params[':id'] = $configId;
+    $pdo->prepare('UPDATE cloudreve_configs SET ' . implode(', ', $sets) . ' WHERE id = :id')->execute($params);
+    api_response(0, null, '该连接 OCR/索引配置已保存');
+}
+
+// 文件夹选择器：列出某连接配置下的目录（含正在编辑的表单里的连接信息）
+if ($path === '/admin/netdisk/folders' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $configId = (int)($_POST['config_id'] ?? 0);
+    $uri = trim((string)($_POST['uri'] ?? ''));
+    $cfg = null;
+    if ($configId > 0) {
+        $cfg = cloudreve_config_get($configId);
+    }
+    if (!$cfg) {
+        $baseUrl = rtrim(trim((string)($_POST['base_url'] ?? '')), '/');
+        $email = trim((string)($_POST['email'] ?? ''));
+        $password = (string)($_POST['password'] ?? '');
+        $viewerId = trim((string)($_POST['viewer_id'] ?? ''));
+        if ($baseUrl === '' || $email === '') {
+            api_response(400, null, '请先在表单填写网盘地址与服务账号');
+        }
+        $cfg = [
+            'id' => 0,
+            'base_url' => $baseUrl,
+            'email' => $email,
+            'password' => $password,
+            'viewer_id' => $viewerId,
+        ];
+    }
+    if ($uri === '') {
+        $uri = netdisk_normalize_root((string)($cfg['default_root'] ?? 'cloudreve://my'));
+    }
+    $data = cloudreve_list_folder($cfg, $uri);
+    if ($data === null) {
+        // 用“根目录”再试一次，避免因子目录不可列而报错
+        $root = netdisk_normalize_root((string)($cfg['default_root'] ?? 'cloudreve://my'));
+        if ($uri !== $root) {
+            $data = cloudreve_list_folder($cfg, $root);
+            $uri = $root;
+        }
+    }
+    if ($data === null) {
+        api_response(502, null, 'Cloudreve 连接失败或目录不可访问');
+    }
+    $folders = [];
+    $files = [];
+    foreach (($data['files'] ?? []) as $f) {
+        if ((int)($f['type'] ?? 0) === 1) {
+            $redirect = (string)($f['metadata']['sys:shared_redirect'] ?? '');
+            $folders[] = [
+                'name' => (string)($f['name'] ?? ''),
+                'uri' => $redirect !== '' ? $redirect : (string)($f['path'] ?? ''),
+            ];
+        } else {
+            $files[] = [
+                'name' => (string)($f['name'] ?? ''),
+                'uri' => (string)($f['path'] ?? ''),
+            ];
+        }
+    }
+    api_response(200, [
+        'current' => $uri,
+        'root' => netdisk_normalize_root((string)($cfg['default_root'] ?? 'cloudreve://my')),
+        'folders' => $folders,
+        'files' => $files,
+    ]);
+}
+
+if ($path === '/admin/netdisk' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $pdo = db();
+    $enabledMap = isset($_POST['netdisk_enabled']) && is_array($_POST['netdisk_enabled']) ? $_POST['netdisk_enabled'] : [];
+    $permMap = isset($_POST['netdisk_permission']) && is_array($_POST['netdisk_permission']) ? $_POST['netdisk_permission'] : [];
+    $cfgMap = isset($_POST['netdisk_config_id']) && is_array($_POST['netdisk_config_id']) ? $_POST['netdisk_config_id'] : [];
+    $ids = array_unique(array_merge(
+        array_map('intval', array_keys($enabledMap)),
+        array_map('intval', array_keys($permMap)),
+        array_map('intval', array_keys($cfgMap))
+    ));
+    // 分享绑定的访问目录 = 绑定连接配置的 default_root（不再单独指定根目录）
+    $stmt = $pdo->prepare('UPDATE shares SET netdisk_enabled = :enabled, netdisk_root = "", netdisk_permission = :perm, netdisk_config_id = :cfg_id, updated_at = :updated_at WHERE id = :id');
+    foreach ($ids as $shareId) {
+        if ($shareId <= 0) {
+            continue;
+        }
+        $enabled = !empty($enabledMap[$shareId]) ? 1 : 0;
+        $perm = (string)($permMap[$shareId] ?? 'view');
+        $perm = ($perm === 'edit') ? 'edit' : 'view';
+        $cfgId = (int)($cfgMap[$shareId] ?? 0);
+        $stmt->execute([
+            ':enabled' => $enabled,
+            ':perm' => $perm,
+            ':cfg_id' => $cfgId,
+            ':updated_at' => now(),
+            ':id' => $shareId,
+        ]);
+    }
+    flash('info', '分享绑定已保存');
+    redirect('/admin#netdisk');
+}
+
+// 下载规则：新增（支持文件与文件夹）
+if ($path === '/admin/netdisk/download/save' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $shareId = (int)($_POST['share_id'] ?? 0);
+    $uri = trim((string)($_POST['uri'] ?? ''));
+    $isFolder = !empty($_POST['is_folder']) ? 1 : 0;
+    if ($shareId <= 0 || $uri === '') {
+        api_response(400, null, '参数不完整');
+    }
+    $pdo = db();
+    // 去重：同一分享下相同 uri + 类型 不重复插入
+    $dup = $pdo->prepare('SELECT id FROM share_download_rules WHERE share_id=:sid AND uri=:uri AND is_folder=:isf');
+    $dup->execute([':sid' => $shareId, ':uri' => $uri, ':isf' => $isFolder]);
+    if (!$dup->fetch()) {
+        $ins = $pdo->prepare('INSERT INTO share_download_rules (share_id, uri, is_folder, created_at) VALUES (:sid, :uri, :isf, :t)');
+        $ins->execute([':sid' => $shareId, ':uri' => $uri, ':isf' => $isFolder, ':t' => now()]);
+    }
+    // 管理员配置的下载规则视为该分享根目录下的授权路径，登记为重定向白名单
+    $ruleShare = find_share_by_id($shareId);
+    if ($ruleShare) {
+        $ruleCfg = netdisk_share_config($ruleShare);
+        if ($ruleCfg['enabled'] && $ruleCfg['cfg']) {
+            netdisk_register_redirect_alias($ruleCfg['cfg'], netdisk_normalize_root($ruleCfg['root']), $uri, $isFolder === 1);
+        }
+    }
+    api_response(200, ['id' => (int)$pdo->lastInsertId(), 'share_id' => $shareId, 'uri' => $uri, 'is_folder' => $isFolder]);
+}
+
+// 下载规则：删除
+if ($path === '/admin/netdisk/download/delete' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $ruleId = (int)($_POST['rule_id'] ?? 0);
+    if ($ruleId > 0) {
+        $pdo = db();
+        $stmt = $pdo->prepare('DELETE FROM share_download_rules WHERE id = :id');
+        $stmt->execute([':id' => $ruleId]);
+    }
+    api_response(200, ['id' => $ruleId]);
+}
+
+// 下载规则：列出某分享已配置的规则
+if ($path === '/admin/netdisk/download/rules' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $shareId = (int)($_POST['share_id'] ?? 0);
+    api_response(200, netdisk_download_rules($shareId));
+}
+
+// 全局 WOPI 应用：新增（含校验）
+if ($path === '/admin/netdisk/office/save' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $appId = (int)($_POST['app_id'] ?? 0);
+    $appName = trim((string)($_POST['app_name'] ?? ''));
+    $appBaseUrl = rtrim(trim((string)($_POST['app_base_url'] ?? '')), '/');
+    $appEnabled = !empty($_POST['app_enabled']) ? 1 : 0;
+    if ($appName === '' || $appBaseUrl === '') {
+        flash('error', '应用名称与 WOPI 地址不能为空');
+        redirect('/admin#netdisk');
+    }
+    $validated = netdisk_office_validate_base($appBaseUrl);
+    if (!$validated['ok']) {
+        flash('error', '校验失败：' . $validated['error'] . '（服务：' . $validated['app'] . '）');
+        redirect('/admin#netdisk');
+    }
+    // 按 discovery 自动识别引擎：urlsrc 含 cool.html 视为 Collabora，含 /hosting/wopi/ 视为 OnlyOffice，
+    // 其余按 urlsrc 模板存为自定义引擎
+    $appEngine = 'collabora';
+    $urlTemplate = '';
+    foreach ($validated['exts'] as $tmpExt) {
+        $map = netdisk_office_discovery_engine_map($appBaseUrl, (string)$tmpExt);
+        if ($map !== null) {
+            $appEngine = $map['engine'];
+            $urlTemplate = (string)($map['template'] ?? '');
+            break;
+        }
+    }
+    if ($appEngine !== 'collabora' && $appEngine !== 'onlyoffice' && $urlTemplate === '') {
+        // 无法识别时退回 collabora（可预览多数扩展），用户后续可自行调整
+        $appEngine = 'collabora';
+    }
+    $pdo = db();
+    $now = now();
+    if ($appId > 0) {
+        $existing = $pdo->prepare('SELECT id FROM office_apps WHERE id = :id');
+        $existing->execute([':id' => $appId]);
+        if (!$existing->fetch()) {
+            flash('error', '应用不存在');
+            redirect('/admin#netdisk');
+        }
+        $stmt = $pdo->prepare('UPDATE office_apps SET name=:name, engine=:engine, base_url=:base_url, url_template=:url_template, enabled=:enabled, updated_at=:updated_at WHERE id=:id');
+        $stmt->execute([
+            ':name' => $appName,
+            ':engine' => $appEngine,
+            ':base_url' => $appBaseUrl,
+            ':url_template' => $urlTemplate,
+            ':enabled' => $appEnabled,
+            ':updated_at' => $now,
+            ':id' => $appId,
+        ]);
+        $action = '更新';
+    } else {
+        $stmt = $pdo->prepare('INSERT INTO office_apps (name, engine, base_url, url_template, enabled, created_at, updated_at) VALUES (:name, :engine, :base_url, :url_template, :enabled, :created_at, :updated_at)');
+        $stmt->execute([
+            ':name' => $appName,
+            ':engine' => $appEngine,
+            ':base_url' => $appBaseUrl,
+            ':url_template' => $urlTemplate,
+            ':enabled' => $appEnabled,
+            ':created_at' => $now,
+            ':updated_at' => $now,
+        ]);
+        $action = '添加';
+    }
+    // 清理旧缓存，让新地址立即生效
+    set_setting('netdisk_office_disc_' . $appEngine . '_' . md5($appBaseUrl), '');
+    $extPreview = count($validated['exts']) > 0 ? implode('、', array_map('strval', array_slice($validated['exts'], 0, 12))) : '（无）';
+    flash('info', '已' . $action . ' WOPI 应用「' . $appName . '」，识别引擎：' . netdisk_office_engine_label($appEngine) . '，检测到服务：' . $validated['app'] . '，支持预览扩展：' . $extPreview);
+    redirect('/admin#netdisk');
+}
+
+// 探测某 base 地址下某扩展的 view urlsrc，并识别引擎类型
+// 返回 ['engine'=>string, 'template'=>string] 或 null
+function netdisk_office_discovery_engine_map(string $base, string $ext): ?array {
+    $base = rtrim($base, '/');
+    $url = $base . '/hosting/discovery';
+    $resp = netdisk_office_fetch($url);
+    $raw = $resp['ok'] ? $resp['raw'] : '';
+    if ($raw === '' || strpos($raw, '<') !== 0) {
+        return null;
+    }
+    $ext = strtolower(ltrim($ext, '.'));
+    $src = '';
+    preg_match_all('#<action[^>]*name="([^"]+)"[^>]*ext="([^"]+)"[^>]*urlsrc="([^"]+)"#i', $raw, $m, PREG_SET_ORDER);
+    foreach ($m as $row) {
+        if (strtolower($row[1]) === 'view' && strtolower($row[2]) === $ext) {
+            $src = html_entity_decode($row[3], ENT_QUOTES | ENT_HTML5);
+            break;
+        }
+    }
+    if ($src === '') {
+        preg_match_all('#<action[^>]*ext="([^"]+)"[^>]*name="([^"]+)"[^>]*urlsrc="([^"]+)"#i', $raw, $m2, PREG_SET_ORDER);
+        foreach ($m2 as $row) {
+            if (strtolower($row[2]) === 'view' && strtolower($row[1]) === $ext) {
+                $src = html_entity_decode($row[3], ENT_QUOTES | ENT_HTML5);
+                break;
+            }
+        }
+    }
+    if ($src === '') {
+        return null;
+    }
+    $src = preg_replace('#<[^>]*>#', '', $src);
+    if (strpos($src, 'cool.html') !== false || stripos($src, '/browser/') !== false) {
+        return ['engine' => 'collabora', 'template' => ''];
+    }
+    if (stripos($src, '/hosting/wopi/') !== false) {
+        return ['engine' => 'onlyoffice', 'template' => ''];
+    }
+    return ['engine' => 'custom', 'template' => $src];
+}
+
+// 全局 WOPI 应用：列表（JSON，供管理界面/自动化使用）
+if ($path === '/admin/netdisk/office/list' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    require_admin();
+    api_response(200, netdisk_office_apps(false));
+}
+
+// 全局 WOPI 应用：删除
+if ($path === '/admin/netdisk/office/delete' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $appId = (int)($_POST['app_id'] ?? 0);
+    if ($appId > 0) {
+        $pdo = db();
+        $stmt = $pdo->prepare('SELECT engine, base_url FROM office_apps WHERE id = :id');
+        $stmt->execute([':id' => $appId]);
+        $deletedApp = $stmt->fetch(PDO::FETCH_ASSOC);
+        $stmt->closeCursor();
+        $stmt = $pdo->prepare('DELETE FROM office_apps WHERE id = :id');
+        $stmt->execute([':id' => $appId]);
+        if ($deletedApp) {
+            // 清理该应用的 discovery 缓存，避免残留地址被误选
+            $cacheKey = 'netdisk_office_disc_' . strtolower((string)$deletedApp['engine']) . '_' . md5(rtrim((string)$deletedApp['base_url'], '/'));
+            set_setting($cacheKey, '');
+        }
+        flash('info', 'WOPI 应用已删除');
+    }
+    redirect('/admin#netdisk');
+}
+
+// 全局 WOPI 应用：测试连接
+if ($path === '/admin/netdisk/office/test' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $appId = (int)($_POST['app_id'] ?? 0);
+    $pdo = db();
+    $stmt = $pdo->prepare('SELECT * FROM office_apps WHERE id = :id');
+    $stmt->execute([':id' => $appId]);
+    $app = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$app) {
+        api_response(400, null, 'WOPI 应用不存在');
+    }
+    $validated = netdisk_office_validate_base((string)$app['base_url']);
+    if ($validated['ok']) {
+        $extPreview = count($validated['exts']) > 0 ? implode('、', array_map('strval', array_slice($validated['exts'], 0, 12))) : '（无）';
+        api_response(200, ['message' => '测试成功：「' . (string)$app['name'] . '」服务：' . $validated['app'] . '，支持预览扩展：' . $extPreview]);
+    } else {
+        api_response(400, null, '测试失败：' . $validated['error']);
+    }
+}
+
+// 全局 WOPI 应用：预览设置（默认引擎 + 扩展名映射）
+if ($path === '/admin/netdisk/office/settings' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $appDefaultEngine = strtolower(trim((string)($_POST['app_default_engine'] ?? '')));
+    // 校验：必须是当前已启用的引擎；否则退回第一个已启用引擎（不再使用 auto）
+    if ($appDefaultEngine === 'auto' || netdisk_office_base_url($appDefaultEngine) === '') {
+        $appDefaultEngine = '';
+        foreach (netdisk_office_apps(true) as $firstApp) {
+            $firstEng = strtolower((string)($firstApp['engine'] ?? ''));
+            if ($firstEng !== '') {
+                $appDefaultEngine = $firstEng;
+                break;
+            }
+        }
+    }
+    $appExtMapRaw = trim((string)($_POST['app_ext_map'] ?? ''));
+    $appExtMap = '{}';
+    if ($appExtMapRaw !== '') {
+        $decoded = json_decode($appExtMapRaw, true);
+        if (!is_array($decoded)) {
+            $decoded = [];
+            foreach (preg_split('/\r\n|\n|\r/', $appExtMapRaw) as $line) {
+                $line = trim((string)$line);
+                if ($line === '') {
+                    continue;
+                }
+                $parts = explode(':', $line, 2);
+                if (count($parts) === 2) {
+                    $ev = strtolower(trim($parts[1]));
+                    if ($ev !== '' && netdisk_office_base_url($ev) !== '') {
+                        // 扩展名支持逗号分隔多个：doc,docx,xlsx:collabora
+                        foreach (preg_split('/[\s,，]+/', $parts[0]) as $oneExt) {
+                            $oneExt = strtolower(ltrim(trim($oneExt), '.'));
+                            if ($oneExt !== '') {
+                                $decoded[$oneExt] = $ev;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (is_array($decoded)) {
+            $appExtMap = json_encode($decoded, JSON_UNESCAPED_UNICODE);
+        }
+    }
+    set_setting('netdisk_office_engine', $appDefaultEngine);
+    set_setting('netdisk_office_ext_map', $appExtMap);
+    $extCount = count((array)json_decode($appExtMap, true));
+    flash('info', '预览设置已保存（默认引擎：' . $appDefaultEngine . '，指定扩展 ' . $extCount . ' 项）');
+    redirect('/admin#netdisk');
+}
+
+// 网盘本地全文索引：手动全量重建（默认所有启用网盘的分享；传 config_id 时只重建绑定该连接的分享）
+if ($path === '/admin/netdisk/reindex' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $scopeConfigId = (int)($_POST['config_id'] ?? 0);
+    // 0018: 强制重跑 OCR——忽略 netdisk_ocr_files 状态表的全部跳过判定（前端勾选框传入）
+    $forceOcr = !empty($_POST['force_ocr']) || !empty($_GET['force_ocr']);
+    set_setting('netdisk_index_ocr', !empty($_POST['index_ocr']) ? '1' : '0');
+    set_setting('netdisk_index_ocr_concurrency', (string)max(1, (int)($_POST['ocr_concurrency'] ?? 4)));
+    set_setting('netdisk_index_ocr_max_mb', (string)max(0, (int)($_POST['ocr_max_mb'] ?? 10)));
+    set_setting('netdisk_index_ocr_low_max_mb', (string)max(0, (int)($_POST['ocr_low_max_mb'] ?? 50)));
+    set_setting('netdisk_index_refresh_ttl', (string)max(60, (int)($_POST['refresh_ttl'] ?? 3600)));
+    set_setting('netdisk_index_ocr_dpi_start', (string)max(50, min(600, (int)($_POST['ocr_dpi_start'] ?? 100))));
+    set_setting('netdisk_index_ocr_dpi_max', (string)max(100, min(600, (int)($_POST['ocr_dpi_max'] ?? 600))));
+    $thr = (float)($_POST['ocr_quality_threshold'] ?? 0.3);
+    $thr = max(0.0, min(1.0, $thr));
+    set_setting('netdisk_index_ocr_quality_threshold', (string)$thr);
+    $skipRaw = trim((string)($_POST['skip_exts'] ?? 'zip,dwg,rar'));
+    $skipNorm = [];
+    foreach (preg_split('/[,，\s]+/', $skipRaw) as $e) {
+        $e = strtolower(ltrim(trim($e), '.'));
+        if ($e !== '') {
+            $skipNorm[$e] = true;
+        }
+    }
+    set_setting('netdisk_index_skip_exts', implode(',', array_keys($skipNorm)));
+    $shares = db()->query('SELECT id, slug, title, netdisk_enabled, netdisk_config_id, netdisk_root, netdisk_permission FROM shares WHERE deleted_at IS NULL')->fetchAll(PDO::FETCH_ASSOC);
+    $queued = 0;
+    $skipped = 0;
+    $runningReused = []; // 0030: 复用了 running 行的分享（本次并未新建任务）
+    foreach ($shares as $s) {
+        // 按连接过滤：指定 config_id 时，仅重建绑定该连接的分享
+        if ($scopeConfigId > 0 && (int)($s['netdisk_config_id'] ?? 0) !== $scopeConfigId) {
+            continue;
+        }
+        $base = netdisk_share_config($s);
+        if (!$base['enabled'] || !$base['cfg']) {
+            $skipped++;
+            continue;
+        }
+        $reusedRunning = false;
+        $jobId = netdisk_index_job_create((int)$s['id'], $forceOcr, $reusedRunning);
+        if ($jobId > 0) {
+            $queued++;
+        }
+        // 0030: 复用 running 行不再静默——旧实现无论复用什么状态都回「已加入后台重建队列」，
+        // 用户会以为新配置已经生效，实际跑的还是旧任务。
+        if ($reusedRunning && $jobId > 0) {
+            $runningReused[] = ['slug' => (string)($s['slug'] ?? ''), 'job' => $jobId];
+        }
+    }
+    $resp = ['queued' => $queued, 'skipped' => $skipped];
+    if (!empty($runningReused)) {
+        $resp['running'] = $runningReused;
+        $ids = array_map(static fn($x) => '#' . (int)$x['job'], $runningReused);
+        $msg = '该连接已有任务在运行（job ' . implode('、', $ids) . '），本次未新建；如需按新配置重跑，请先点「终止索引」';
+    } else {
+        $msg = $scopeConfigId > 0 ? '已为该连接绑定分享加入后台重建队列' : '已加入后台重建队列';
+    }
+    api_response(0, $resp, $msg);
+}
+if ($path === '/admin/netdisk/reindex/status' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    require_admin();
+    $pdo = db();
+    // 按连接聚合进度：每个连接一行，汇总其下所有分享的索引/OCR 进度
+    $shares = $pdo->query('SELECT id, slug, title, netdisk_config_id FROM shares WHERE deleted_at IS NULL')->fetchAll(PDO::FETCH_ASSOC);
+    $configs = $pdo->query('SELECT * FROM cloudreve_configs ORDER BY id ASC')->fetchAll(PDO::FETCH_ASSOC);
+    $byCfg = [];
+    foreach ($shares as $s) {
+        $cfgId = (int)($s['netdisk_config_id'] ?? 0);
+        if (!isset($byCfg[$cfgId])) {
+            $byCfg[$cfgId] = [];
+        }
+        $byCfg[$cfgId][] = $s;
+    }
+    $configRows = [];
+    foreach ($configs as $c) {
+        $cfgId = (int)$c['id'];
+        $cfgShares = $byCfg[$cfgId] ?? [];
+        $agg = [
+            'share_total' => count($cfgShares),
+            'files_done' => 0,
+            'files_total' => 0,
+            'done_shares' => 0,
+            'running_shares' => 0,
+            'pending_shares' => 0,
+            'failed_shares' => 0,
+            'active_job' => null,
+            'notes' => [],
+        ];
+        foreach ($cfgShares as $s) {
+            $job = netdisk_index_job_latest((int)$s['id']);
+            if (!$job) {
+                continue;
+            }
+            if (!empty($job['notes'])) {
+                $agg['notes'][] = (string)$job['notes'];
+            }
+            $agg['files_done'] += (int)($job['files'] ?? 0);
+            $agg['files_total'] += (int)($job['total_files'] ?? 0);
+            if ($job['status'] === 'done') {
+                $agg['done_shares']++;
+            } elseif ($job['status'] === 'running') {
+                $agg['running_shares']++;
+                // 取最新 running 的 job 作为活动进度展示
+                if (!$agg['active_job'] || (int)$job['id'] > (int)$agg['active_job']['id']) {
+                    $agg['active_job'] = $job;
+                }
+            } elseif ($job['status'] === 'pending') {
+                $agg['pending_shares']++;
+                if (!$agg['active_job'] || (int)$job['id'] > (int)$agg['active_job']['id']) {
+                    $agg['active_job'] = $job;
+                }
+            } elseif ($job['status'] === 'failed') {
+                $agg['failed_shares']++;
+                if (!$agg['active_job'] || (int)$job['id'] > (int)$agg['active_job']['id']) {
+                    $agg['active_job'] = $job;
+                }
+            } elseif ($job['status'] === 'cancelled') {
+                // 视为完成（终止）
+                $agg['done_shares']++;
+            }
+        }
+        $agg['notes'] = implode('；', array_unique(array_filter($agg['notes'])));
+        $configRows[] = [
+            'config_id' => $cfgId,
+            'name' => (string)($c['name'] ?? ('连接 #' . $cfgId)),
+            'index_cfg' => netdisk_admin_index_cfg_snapshot($pdo, $cfgId),
+            'agg' => $agg,
+            'job_status' => $agg['active_job'] ? $agg['active_job']['status'] : 'idle',
+        ];
+    }
+    $queueStats = [
+        'pending' => (int)$pdo->query('SELECT COUNT(*) FROM netdisk_ocr_queue WHERE status="pending"')->fetchColumn(),
+        'running' => (int)$pdo->query('SELECT COUNT(*) FROM netdisk_ocr_queue WHERE status="running"')->fetchColumn(),
+        'done' => (int)$pdo->query('SELECT COUNT(*) FROM netdisk_ocr_queue WHERE status="done"')->fetchColumn(),
+        'failed' => (int)$pdo->query('SELECT COUNT(*) FROM netdisk_ocr_queue WHERE status="failed"')->fetchColumn(),
+    ];
+    $summary = [
+        'ocr_enabled' => netdisk_index_ocr_enabled(0),
+        'ocr_concurrency' => netdisk_index_ocr_concurrency(0),
+        'ocr_max_mb' => netdisk_index_ocr_max_mb(0),
+        'ocr_low_max_mb' => netdisk_index_ocr_low_max_mb(0),
+        'refresh_ttl' => netdisk_index_refresh_ttl(0),
+        'ocr_queue' => $queueStats,
+        'ocr_dpi_start' => netdisk_index_ocr_dpi_start(0),
+        'ocr_dpi_max' => netdisk_index_ocr_dpi_max(0),
+        'ocr_quality_threshold' => netdisk_index_ocr_quality_threshold(0),
+        'per_config' => netdisk_admin_index_cfg_map($pdo),
+    ];
+    api_response(0, ['configs' => $configRows, 'summary' => $summary]);
+}
+
+// 续跑重试：把某连接的 failed job 置回 pending（worker 拾取后增量续跑，不重头）
+if ($path === '/admin/netdisk/reindex/retry' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $pdo = db();
+    $configId = (int)($_POST['config_id'] ?? 0);
+    $shareId = (int)($_POST['share_id'] ?? 0);
+    if ($configId > 0) {
+        $rows = $pdo->query('SELECT id FROM netdisk_index_jobs WHERE share_id IN (SELECT id FROM shares WHERE netdisk_config_id=' . (int)$configId . ') AND status="failed"')->fetchAll(PDO::FETCH_COLUMN);
+    } elseif ($shareId > 0) {
+        $rows = $pdo->query('SELECT id FROM netdisk_index_jobs WHERE share_id=' . (int)$shareId . ' AND status="failed"')->fetchAll(PDO::FETCH_COLUMN);
+    } else {
+        api_response(400, null, '缺少参数');
+    }
+    // 0023: 续跑同样刷新 created_at（口径=最后一次被触发的时间，防 6 小时回收误杀）；
+    //       清 current_detail 残留展示，进度字段 ocr_files_done/ocr_files_total 保留以续跑。
+    $upd = $pdo->prepare('UPDATE netdisk_index_jobs SET status="pending", started_at=0, finished_at=0, error="", cancel_requested=0, crash_count=0, heartbeat_at=:now, created_at=:now, current_detail="" WHERE id=:id');
+    $n = 0;
+    foreach ($rows as $jid) {
+        $upd->execute([':now' => time(), ':id' => (int)$jid]);
+        $n++;
+    }
+    api_response(0, ['retried' => $n], $n > 0 ? '已续跑 ' . $n . ' 个失败任务（从断点继续）' : '没有可续跑的失败任务');
+}
+if ($path === '/admin/netdisk/reindex/cancel' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    require_admin();
+    check_csrf();
+    $pdo = db();
+    $shareId = (int)($_POST['share_id'] ?? 0);
+    $configId = (int)($_POST['config_id'] ?? 0);
+    if ($configId > 0) {
+        // 按连接取消：取消所有绑定该连接分享的 pending/running 任务
+        $pdo->prepare('UPDATE netdisk_index_jobs SET cancel_requested=1
+            WHERE share_id IN (SELECT id FROM shares WHERE netdisk_config_id=:c) AND status IN ("pending","running")')
+            ->execute([':c' => $configId]);
+        api_response(0, null, '已请求终止该连接所有分享的索引重建');
+    } elseif ($shareId > 0) {
+        // 将该分享最新 pending/running 的 job 标记取消请求；worker 在下个检查点响应。
+        $pdo->prepare('UPDATE netdisk_index_jobs SET cancel_requested=1
+            WHERE share_id=:s AND status IN ("pending","running")')
+            ->execute([':s' => $shareId]);
+        api_response(0, null, '已请求终止该分享的索引重建');
+    } else {
+        api_response(400, null, '缺少参数');
+    }
+}
+// 0025: 两个端点的 CORS 预检（PC 端带 X-Api-Key 头时浏览器环境会预检；Python 端不走，一并支持）
+if (($path === '/admin/netdisk/ocr/params' || $path === '/admin/netdisk/ocr/import') && $_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    header('Access-Control-Allow-Origin: *');
+    header('Access-Control-Allow-Headers: Content-Type, X-Api-Key, Authorization, X-CSRF-Token');
+    header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+    http_response_code(204);
+    exit;
+}
+// 0025: GET /admin/netdisk/ocr/params —— PC 端（tools/ocr-win）启动先拉本接口：用回包的 dpi / max_side
+// 渲染、原样使用 params_key 回传。只读、无副作用（不写任何 OCR 表、不触发重建）；
+// params_key 与 0024 写库同出 netdisk_ocr_params_key()，不存在第二份拼接。
+if ($path === '/admin/netdisk/ocr/params' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    netdisk_ocr_api_user();
+    netdisk_ocr_api_json(200, netdisk_ocr_params_payload(0));
+}
+
+// 0025: POST /admin/netdisk/ocr/import —— PC 端识别结果批量回导（唯一写入口；禁止 PC 直连 app.db，
+// SQLite WAL 经 SMB 共享会锁错甚至损坏库）。限额：单批 ≤ 50 行、请求体 ≤ 4 MB，超限整体拒收；
+// 逐行校验，单行失败不影响其他行。成功只写 netdisk_ocr_results（source='win'），
+// 不主动触发索引重建——NAS 下一轮遍历按 0024 判定顺序②自会命中（唯一入口）。
+if ($path === '/admin/netdisk/ocr/import' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $ndAu = netdisk_ocr_api_user();
+    if (!netdisk_ocr_import_csrf_ok((string)$ndAu['via'])) {
+        netdisk_ocr_api_json(400, ['code' => 400, 'msg' => 'CSRF 校验失败']);
+    }
+    // 请求体限流：只读 4 MB + 1 字节，超出部分不进内存即可判定超限
+    $ndMaxBody = 4 * 1048576;
+    $ndRaw = (string)file_get_contents('php://input', false, null, 0, $ndMaxBody + 1);
+    if (strlen($ndRaw) > $ndMaxBody) {
+        netdisk_ocr_api_json(413, ['code' => 413, 'msg' => '请求体超过 4 MB 上限，整批未写入']);
+    }
+    $ndBody = json_decode($ndRaw, true);
+    if (!is_array($ndBody)) {
+        netdisk_ocr_api_json(400, ['code' => 400, 'msg' => '请求体不是合法 JSON 对象']);
+    }
+    if (!isset($ndBody['items']) || !is_array($ndBody['items'])) {
+        netdisk_ocr_api_json(400, ['code' => 400, 'msg' => '缺少 items 数组']);
+    }
+    $ndItems = array_values($ndBody['items']);
+    if (count($ndItems) > 50) {
+        netdisk_ocr_api_json(400, ['code' => 400, 'msg' => '单批最多 50 行（本次 ' . count($ndItems) . ' 行），整批未写入']);
+    }
+    $ndPdo = db();
+    // 单一来源：与 0024 写库、GET /admin/netdisk/ocr/params 同一函数
+    $ndExpected = netdisk_ocr_params_key(0);
+    $ndBodyKey = trim((string)($ndBody['params_key'] ?? ''));
+    $ndBatchMismatch = ($ndBodyKey !== '' && $ndBodyKey !== $ndExpected);
+    $ndAccepted = 0;
+    $ndRejected = [];
+    foreach ($ndItems as $ndIt) {
+        $ndIt = is_array($ndIt) ? $ndIt : [];
+        $ndHint = strtolower(trim((string)($ndIt['content_hash'] ?? '')));
+        if ($ndBatchMismatch) {
+            // 顶层 params_key 与服务端不一致 → 整批拒收（逐行给原因）并回带 expected_params_key
+            $ndRejected[] = ['content_hash' => $ndHint, 'reason' => 'params_mismatch'];
+            continue;
+        }
+        $ndRow = netdisk_ocr_import_item($ndIt, $ndExpected, $ndPdo);
+        if (empty($ndRow['ok'])) {
+            $ndRejected[] = ['content_hash' => $ndHint, 'reason' => (string)($ndRow['reason'] ?? 'invalid')];
+            continue;
+        }
+        // 落库复用 0024 的 netdisk_ocr_result_save：source='win'、created_at 仅首次插入置值、
+        // chars/quality 服务端重算、text 再过一次 netdisk_normalize_ocr_text（幂等）
+        $ndOk = netdisk_ocr_result_save((string)$ndRow['hash'], $ndExpected, (int)$ndRow['size'],
+            (int)$ndRow['pages'], (string)$ndRow['text'], (string)$ndRow['engine'], 'win', $ndPdo);
+        if ($ndOk) {
+            $ndAccepted++;
+        } else {
+            $ndRejected[] = ['content_hash' => $ndHint, 'reason' => 'save_failed'];
+        }
+    }
+    $ndResp = ['code' => 0, 'msg' => '', 'accepted' => $ndAccepted, 'rejected' => $ndRejected];
+    foreach ($ndRejected as $ndR) {
+        if ((string)($ndR['reason'] ?? '') === 'params_mismatch') {
+            $ndResp['expected_params_key'] = $ndExpected;
+            break;
+        }
+    }
+    @error_log('[nd-index] ocr import accepted=' . $ndAccepted . ' rejected=' . count($ndRejected));
+    netdisk_ocr_api_json(200, $ndResp);
 }
 
 if ($path === '/admin/share-batch' && $_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -12947,6 +20217,7 @@ if ($path === '/admin/comment/edit' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         WHERE share_comments.id = :id');
     $stmt->execute([':id' => $commentId]);
     $comment = $stmt->fetch(PDO::FETCH_ASSOC);
+    $stmt->closeCursor();
     if (!$comment) {
         flash('error', '评论不存在');
         redirect('/admin#scan');
@@ -13176,4 +20447,3 @@ if ($path === '/') {
 }
 
 render_404_page();
-
