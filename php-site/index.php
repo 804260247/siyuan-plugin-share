@@ -3812,10 +3812,10 @@ function netdisk_ocr_quality_conf(array $stats): float {
 }
 
 // 连接级索引配置值：configId>0 时优先取该连接的 index_* 列（非空），否则回退全局 settings。
-function netdisk_index_cfg_value(int $configId, string $cfgCol, string $settingKey, string $default): string {
+function netdisk_index_cfg_value(int $configId, string $cfgCol, string $settingKey, string $default, bool $refresh = false): string {
     if ($configId > 0) {
         try {
-            $cfg = netdisk_index_cfg_cached($configId);
+            $cfg = netdisk_index_cfg_cached($configId, $refresh);
             if ($cfg !== null) {
                 $v = (string)($cfg[$cfgCol] ?? '');
                 if ($v !== '' && $v !== null) {
@@ -3831,9 +3831,11 @@ function netdisk_index_cfg_value(int $configId, string $cfgCol, string $settingK
 }
 
 // 连接配置行缓存（进程内，避免同函数内多次查库）
-function netdisk_index_cfg_cached(int $configId): ?array {
+// 0030: $refresh=true 跳过进程内静态缓存，供长驻 worker 中途重读连接配置
+// （worker 一轮只跑一次，旧实现缓存到进程死，运行中改配置永远读不到）
+function netdisk_index_cfg_cached(int $configId, bool $refresh = false): ?array {
     static $cache = [];
-    if (isset($cache[$configId])) {
+    if (!$refresh && isset($cache[$configId])) {
         return $cache[$configId];
     }
     try {
@@ -3956,7 +3958,13 @@ function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PD
             }
         }
         $dpiStart = netdisk_index_ocr_dpi_start($ocrPoolCfgId);
+        $poolOff = false; // 0030: 运行中被关掉 OCR
         foreach ($jobs as $j) {
+            // 0030: 每个文件前重读开关（$refresh=true 穿透进程内配置缓存）；关掉即停手，剩余 tmp 由调用方清理
+            if (netdisk_index_ocr_enabled($ocrPoolCfgId, true) === false) {
+                $poolOff = true;
+                break;
+            }
             if ($jobId > 0 && netdisk_index_job_cancelled($jobId, $jobPdo)) {
                 foreach ($jobs as $jj) {
                     if (isset($jj['tmp']) && is_file($jj['tmp'])) {
@@ -3998,7 +4006,7 @@ function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PD
                 $errors++;
             }
         }
-        return ['results' => $results, 'done' => $done, 'texts' => $texts, 'errors' => $errors];
+        return ['results' => $results, 'done' => $done, 'texts' => $texts, 'errors' => $errors, 'ocr_off' => $poolOff];
     }
     $tess = trim((string)shell_exec('command -v tesseract 2>/dev/null'));
     if ($tess === '') {
@@ -4020,6 +4028,7 @@ function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PD
     // 每次调用固定用起点 DPI 栅格化（惰性逐页）；池结束后由 netdisk_ocr_finalize_results
     // 做质量评估 + 自适应升级重试 + 文本规范化。
     $curDpi = $dpiStart;
+    $poolOff = false; // 0030: 运行中被关掉 OCR（已起跑的 tesseract 自然收尾，不再取新文件）
 
     $jobIdx = 0;
     $totalJobs = count($jobs);
@@ -4027,7 +4036,24 @@ function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PD
     $toClean = [];       // 每个 job 结束清理：图片 tmp / PDF 副本
 
     // 取下一个待 tesseract 的输入文件；返回 null 表示没有更多
-    $nextInput = function () use (&$jobIdx, &$totalJobs, $jobs, $ppm, &$activePages, &$errors, &$toClean, &$curDpi) {
+    $lastOffChk = 0.0; // 0030: 页内重读开关的节流时间戳（每页查一次库太重，≥1s 才复查一次）
+    $nextInput = function () use (&$jobIdx, &$totalJobs, $jobs, $ppm, &$activePages, &$errors, &$toClean, &$curDpi, &$poolOff, $ocrPoolCfgId, &$results, &$lastOffChk) {
+        // 0030: 页内循环也要能停——大 PDF 一本几百页，只在换文件时检查等于关不掉。
+        // 已关则丢弃该文件已出的半截页结果（绝不写半本正文），页 PNG 一并清理。
+        if (microtime(true) - $lastOffChk >= 1.0) {
+            $lastOffChk = microtime(true);
+            if (netdisk_index_ocr_enabled($ocrPoolCfgId, true) === false) {
+                if ($activePages !== null) {
+                    foreach ($activePages['pages'] as $pg) {
+                        @unlink($pg);
+                    }
+                    unset($results[$activePages['uri']]);
+                    $activePages = null;
+                }
+                $poolOff = true;
+                return null;
+            }
+        }
         if ($activePages !== null && $activePages['pi'] < count($activePages['pages'])) {
             $pg = $activePages['pages'][$activePages['pi']];
             $activePages['pi']++;
@@ -4041,6 +4067,11 @@ function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PD
             $activePages = null;
         }
         while ($jobIdx < $totalJobs) {
+            // 0030: 每个新文件前重读开关；关掉即不再取新文件
+            if (netdisk_index_ocr_enabled($ocrPoolCfgId, true) === false) {
+                $poolOff = true;
+                break;
+            }
             $j = $jobs[$jobIdx++];
             $uri = (string)($j['uri'] ?? '');
             $ext = strtolower(ltrim((string)($j['ext'] ?? ''), '.'));
@@ -4216,7 +4247,7 @@ function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PD
             $texts++;
         }
     }
-    return ['results' => $results, 'done' => $done, 'texts' => $texts, 'errors' => $errors];
+    return ['results' => $results, 'done' => $done, 'texts' => $texts, 'errors' => $errors, 'ocr_off' => $poolOff];
 }
 
 // 判断 OCR 结果是否含"汉字+空格+汉字"模式（旧版 tesseract 未做字间空格归一化，
@@ -4500,8 +4531,9 @@ function netdisk_admin_index_cfg_snapshot(PDO $pdo, int $configId): ?array {
 }
 
 // 是否启用 OCR（扫描 PDF/图片），默认开启；configId>0 时按连接独立
-function netdisk_index_ocr_enabled(?int $configId = 0): bool {
-    $v = netdisk_index_cfg_value((int)$configId, 'index_ocr_enabled', 'netdisk_index_ocr', '1');
+// 0030: $refresh=true 时穿透进程内配置缓存——长驻 worker 运行中关掉 OCR 也能立刻生效
+function netdisk_index_ocr_enabled(?int $configId = 0, bool $refresh = false): bool {
+    $v = netdisk_index_cfg_value((int)$configId, 'index_ocr_enabled', 'netdisk_index_ocr', '1', $refresh);
     return trim((string)$v) !== '0';
 }
 
@@ -4548,13 +4580,21 @@ function netdisk_index_skip_exts(?int $configId = 0): array {
 }
 
 // 创建/追加一个后台重建 job。若该分享已有 running 或 pending 任务则复用返回其 id。
-function netdisk_index_job_create(int $shareId, bool $forceOcr = false): int {
+function netdisk_index_job_create(int $shareId, bool $forceOcr = false, ?bool &$reusedRunning = null): int {
     $pdo = db();
-    $ex = $pdo->prepare('SELECT id FROM netdisk_index_jobs WHERE share_id=:s AND status IN ("pending","running") ORDER BY id DESC LIMIT 1');
+    // 0030: $reusedRunning 通过引用回传「本次复用的是已经在跑的 running 行」——
+    // 旧实现无条件返回既有 job id，调用方无从区分「新建」与「复用 running」，
+    // 用户点重建后界面回成功、实际一个新任务都没建（静默空操作）。
+    $reusedRunning = false;
+    $ex = $pdo->prepare('SELECT id, status FROM netdisk_index_jobs WHERE share_id=:s AND status IN ("pending","running") ORDER BY id DESC LIMIT 1');
     $ex->execute([':s' => $shareId]);
-    $existing = (int)($ex->fetchColumn() ?: 0);
+    $existingRow = $ex->fetch(PDO::FETCH_ASSOC) ?: [];
     $ex->closeCursor();
+    $existing = (int)($existingRow['id'] ?? 0);
     if ($existing > 0) {
+        if ((string)($existingRow['status'] ?? '') === 'running') {
+            $reusedRunning = true;
+        }
         // 0018: 复用未开始/进行中的 job 时，本次请求带强制重跑则升级标记（worker 拾取时读取）
         // 0023: 复用 pending 行时一并刷新 created_at——其口径为「最后一次被触发的时间」，
         //       worker 的「pending 超 6 小时判死」即「触发后 6 小时仍未被拾取」。旧实现不刷新，
@@ -5064,6 +5104,12 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
             'current_detail' => '预扫描目录',
         ], $pdo);
     }
+    // 0030: job 开跑即把 OCR 文件级进度归零（不论本轮是否做 OCR）——旧任务残留的
+    // ocr_files_total（真机 219）会让「OCR 文件 2/219」跨轮显示，用户以为 OCR 没关掉；
+    // 本轮真做 OCR 时下面池前会重新写入 count($ocrTasks)。
+    if ($jobId > 0) {
+        netdisk_index_job_update($jobId, ['ocr_files_total' => 0, 'ocr_files_done' => 0], $pdo);
+    }
     // 0018: 不再整表清空低优先级 OCR 队列——改在遍历结束后仅清理 uri 已消失的行，
     // 保留 pending/failed 任务可续跑，避免"改并发→重建→队列重排"导致已完成/排队任务重复下载。
     $ocrMaxBytes = $allowOcr ? (netdisk_index_ocr_max_mb($configId) * 1048576) : 0;
@@ -5512,6 +5558,25 @@ $text = '';
         }
         $currentLevel = $nextLevel;
     }
+    // 0030: $allowOcr 是开跑时的快照（worker 一轮只读一次），用户中途关掉 OCR 后旧实现会一路跑到底。
+    // 这里穿透进程内配置缓存重读一次；已关则本轮剩余候选整批不收（删临时文件、不写状态行、不计数）。
+    $ocrOffMid = false;
+    if ($allowOcr && !netdisk_index_ocr_enabled($configId, true)) {
+        $ocrOffMid = true;
+        $ocrAbortAtEntry = count($ocrTasks);
+        foreach ($ocrTasks as $task) {
+            if (isset($task['tmp']) && is_file($task['tmp'])) {
+                @unlink($task['tmp']);
+            }
+        }
+        $ocrTasks = [];
+        if ($ocrAbortAtEntry > 0) {
+            $notes[] = 'OCR 已在运行中被关闭：剩余 ' . $ocrAbortAtEntry . ' 个候选未识别（本轮只建索引）';
+        }
+        if ($jobId > 0) {
+            netdisk_index_job_update($jobId, ['ocr_files_total' => 0, 'ocr_files_done' => 0], $pdo);
+        }
+    }
     // 高优先级 OCR 并发池：遍历结束后统一执行（同时 ≤concurrency 个 tesseract）
     if (!empty($ocrTasks) && $allowOcr) {
         // 记录本次高优 OCR 文件总数（供前端 OCR 文件级进度条）
@@ -5519,6 +5584,11 @@ $text = '';
             netdisk_index_job_update($jobId, ['ocr_files_total' => count($ocrTasks), 'ocr_files_done' => 0], $pdo);
         }
         $poolRes = netdisk_ocr_run_pool($ocrTasks, netdisk_index_ocr_concurrency($configId), $jobId, $pdo);
+        // 0030: 池内逐文件重读开关后可能中途停手——剩余候选不 finalize、不写状态行
+        $ocrOffMid = $ocrOffMid || !empty($poolRes['ocr_off']);
+        if ($ocrOffMid && $jobId > 0) {
+            netdisk_index_job_update($jobId, ['ocr_files_total' => 0, 'ocr_files_done' => 0], $pdo);
+        }
         $stEngine = (netdisk_ocr_sidecar_enabled() && netdisk_ocr_sidecar_available()) ? 'paddleocr-sidecar'
             : (trim((string)shell_exec('command -v tesseract 2>/dev/null')) !== '' ? 'tesseract' : '');
         // 0018: 池起点计时——elapsed_ms/pages_per_min 供 0021 自动定档做历史样本
@@ -5529,9 +5599,18 @@ $text = '';
         // 配合 0018 增量判定，重启后天然按文件粒度续跑。
         $finTotal = count($ocrTasks);
         $finIdx = 0;
+        $ocrAbortedOff = 0; // 0030: 因运行中关闭 OCR 而未识别的候选数
         foreach ($ocrTasks as $task) {
             $uri = $task['uri'];
             $finIdx++;
+            // 0030: 运行中关闭 OCR → 池里已出结果的照常 finalize，其余整批丢弃（删 tmp、不写状态行）
+            if ($ocrOffMid && !isset($poolRes['results'][$uri])) {
+                if (isset($task['tmp']) && is_file($task['tmp'])) {
+                    @unlink($task['tmp']);
+                }
+                $ocrAbortedOff++;
+                continue;
+            }
             // 0018: finalize 会删除 tmp，先抓该文件 PDF 总页数供状态表落库（尽力而为，取不到记 0）
             $stPages = 0;
             if (strtolower(ltrim((string)($task['ext'] ?? ''), '.')) === 'pdf' && isset($task['tmp']) && is_file($task['tmp'])) {
@@ -5682,6 +5761,10 @@ $text = '';
     }
     if ($ocrStarvedMark > 0) {
         $notes[] = $ocrStarvedMark . ' 个低优队列文件标记为待处理（starved）——排队/让位不计入失败次数，不会触发≥3 次永久跳过';
+    }
+    if (!empty($ocrAbortedOff)) {
+        // 0030: 运行中关闭 OCR 的收尾提示（与「跳过阈值MB=0」是两种不同情形，各自一条）
+        $notes[] = 'OCR 已在运行中被关闭：' . $ocrAbortedOff . ' 个候选未识别，临时文件已清理';
     }
     if ($allowOcr && $ocrLowBytes === 0) {
         // 0028: 跳过阈值MB=0 → 本轮完全不做 OCR；旧实现会输出「n 个超大文件（>0MB）跳过 OCR」这种误导文案
@@ -19395,6 +19478,7 @@ if ($path === '/admin/netdisk/reindex' && $_SERVER['REQUEST_METHOD'] === 'POST')
     $shares = db()->query('SELECT id, slug, title, netdisk_enabled, netdisk_config_id, netdisk_root, netdisk_permission FROM shares WHERE deleted_at IS NULL')->fetchAll(PDO::FETCH_ASSOC);
     $queued = 0;
     $skipped = 0;
+    $runningReused = []; // 0030: 复用了 running 行的分享（本次并未新建任务）
     foreach ($shares as $s) {
         // 按连接过滤：指定 config_id 时，仅重建绑定该连接的分享
         if ($scopeConfigId > 0 && (int)($s['netdisk_config_id'] ?? 0) !== $scopeConfigId) {
@@ -19405,12 +19489,26 @@ if ($path === '/admin/netdisk/reindex' && $_SERVER['REQUEST_METHOD'] === 'POST')
             $skipped++;
             continue;
         }
-        $jobId = netdisk_index_job_create((int)$s['id'], $forceOcr);
+        $reusedRunning = false;
+        $jobId = netdisk_index_job_create((int)$s['id'], $forceOcr, $reusedRunning);
         if ($jobId > 0) {
             $queued++;
         }
+        // 0030: 复用 running 行不再静默——旧实现无论复用什么状态都回「已加入后台重建队列」，
+        // 用户会以为新配置已经生效，实际跑的还是旧任务。
+        if ($reusedRunning && $jobId > 0) {
+            $runningReused[] = ['slug' => (string)($s['slug'] ?? ''), 'job' => $jobId];
+        }
     }
-    api_response(0, ['queued' => $queued, 'skipped' => $skipped], $scopeConfigId > 0 ? '已为该连接绑定分享加入后台重建队列' : '已加入后台重建队列');
+    $resp = ['queued' => $queued, 'skipped' => $skipped];
+    if (!empty($runningReused)) {
+        $resp['running'] = $runningReused;
+        $ids = array_map(static fn($x) => '#' . (int)$x['job'], $runningReused);
+        $msg = '该连接已有任务在运行（job ' . implode('、', $ids) . '），本次未新建；如需按新配置重跑，请先点「终止索引」';
+    } else {
+        $msg = $scopeConfigId > 0 ? '已为该连接绑定分享加入后台重建队列' : '已加入后台重建队列';
+    }
+    api_response(0, $resp, $msg);
 }
 if ($path === '/admin/netdisk/reindex/status' && $_SERVER['REQUEST_METHOD'] === 'GET') {
     require_admin();
