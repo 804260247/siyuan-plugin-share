@@ -3801,6 +3801,14 @@ function netdisk_ocr_index_quality_ok(?string $text, int $minChars = 20, float $
     return netdisk_ocr_quality($text) >= $minRatio;
 }
 
+// 0038: 「这段正文还需不需要送 OCR」的唯一判定口径——空文本，或旧文本虽非空但未达
+// netdisk_ocr_index_quality_ok() 门槛（典型是扫描件残留的页眉/水印，如 "CAD ( )"），都算需要 OCR。
+// 入池三处判定（CA 复用探测 / 跳过阈值=0 / 低优体积闸）必须同时用本函数，不许只改其中一处：
+// 只改一处时，文本层有脏残留的文件仍会被当成「已有正文」，force_ocr 也救不回来。
+function netdisk_ocr_text_needs_ocr(string $t): bool {
+    return $t === '' || !netdisk_ocr_index_quality_ok($t);
+}
+
 // 从 tesseract TSV 输出解析 word 级识别文本与置信度统计。
 // 输入：多页 tesseract -c tessedit_create_tsv=1 生成的原始 TSV 文本（可跨页拼接）。
 // 返回 ['text'=>合并后的原始文本, 'avg'=>平均置信度0-100, 'low_pct'=>置信<60 的 word 占比(0-100), 'n'=>有效 word 数]。
@@ -5425,7 +5433,7 @@ $text = '';
                         }
                         $text = netdisk_extract_text_from_bytes($ext, $raw, false);
                         // 0024 判定顺序②：文本层为空需 OCR 时，先查内容寻址结果表；命中达标即复用，不进池/队
-                        $caHitG = ($isOcr && $text === '' && $caHash !== '' && !$forceOcr)
+                        $caHitG = ($isOcr && netdisk_ocr_text_needs_ocr($text) && $caHash !== '' && !$forceOcr)
                             ? netdisk_ocr_result_lookup($caHash, $caParamsKey, $pdo) : null;
                         if ($caHitG !== null) {
                             $text = (string)$caHitG['text'];
@@ -5444,10 +5452,10 @@ $text = '';
                                 ->execute([':h' => $caHash, ':s' => $shareId, ':u' => $navigateUri]));
                             netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_ocr_results SET last_hit_at=:t WHERE content_hash=:h AND params_key=:k')
                                 ->execute([':t' => $rhNow, ':h' => $caHash, ':k' => $caParamsKey]));
-                        } elseif ($isOcr && $text === '' && $ocrLowBytes === 0) {
+                        } elseif ($isOcr && ($forceOcr || netdisk_ocr_text_needs_ocr($text)) && $ocrLowBytes === 0) {
                             // 0028: 跳过阈值MB=0——下载/哈希/文件名索引照旧，但不进 OCR 池、不进队列
                             $ocrZeroSkipped++;
-                        } elseif ($isOcr && $text === '' && $size <= $ocrLowBytes) {
+                        } elseif ($isOcr && ($forceOcr || netdisk_ocr_text_needs_ocr($text)) && $size <= $ocrLowBytes) {
                             if ($size <= $ocrMaxBytes) {
                                 $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
                                 if ($tmp !== false) {
