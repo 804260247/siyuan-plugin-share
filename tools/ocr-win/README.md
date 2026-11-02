@@ -38,6 +38,26 @@ pip install -r requirements.txt
 `paddlex[ocr]==3.0.3` + `paddlepaddle==3.0.0` 必须与 NAS 侧车**同版本**，否则模型/结果口径不一致，
 字符数没法对照。首次 `run` 会自动下载 PP-OCRv5 模型到 `%USERPROFILE%\.paddlex`。
 
+### 若 `pip install -r` 报 `'gbk' codec can't decode`
+
+`pip` 只按 **BOM** 判断需求文件的编码；文件没有 BOM 时退回系统 locale，中文 Windows 上就是
+`cp936/GBK`。所以需求文件里只要出现任何非 ASCII 字节（例如中文注释），就会在**读文件阶段**崩溃：
+
+```
+UnicodeDecodeError: 'gbk' codec can't decode byte 0xa1 in position 6: illegal multibyte sequence
+```
+
+两个需求文件（`requirements.txt` / `requirements-build.txt`）因此**只许写纯 ASCII**，注释也写英文；
+`tests/run_tests.py` 有断言守着（全字节 < 0x80 且无 BOM），包名行逐字节不许改。
+**不要用加 BOM 的办法绕过**（仓库文件带 BOM 更脏，且会与既有行尾/编码约定打架）。
+
+临时绕过（不改任何文件）：把包名直接写在命令行，别用 `-r`：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install "paddlex[ocr]==3.0.3" "paddlepaddle==3.0.0" "PyMuPDF>=1.24,<2" "Pillow>=10,<13" "requests>=2.31"
+.\.venv\Scripts\python.exe -m pip install "pyinstaller>=6,<7"
+```
+
 ## 取 API Key
 
 后台用管理员账号登录 → 打开 `/dashboard` → 点「生成 API Key」。**Key 只显示一次**，复制保存。

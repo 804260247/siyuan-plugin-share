@@ -1156,5 +1156,42 @@ class TestFriendlyInitError(unittest.TestCase):
         self.assertNotIn("cuDNN", msg)
 
 
+class TestRequirementsAscii(unittest.TestCase):
+    """0035：需求文件必须纯 ASCII、无 BOM。
+
+    根因：pip 只按 BOM 判断需求文件编码，没有 BOM 时退回系统 locale（中文 Windows 为
+    cp936/GBK），文件里任何非 ASCII 字节（如中文注释）都会让 `pip install -r` 直接抛
+    `UnicodeDecodeError: 'gbk' codec can't decode byte ...` 而中止。
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+    FILES = ("requirements.txt", "requirements-build.txt")
+
+    def test_no_bom(self):
+        for name in self.FILES:
+            data = (self.ROOT / name).read_bytes()
+            self.assertFalse(
+                data.startswith(b"\xef\xbb\xbf"),
+                "%s 不许带 UTF-8 BOM（仓库文件带 BOM 更脏，注释改英文解决）" % name)
+
+    def test_all_bytes_ascii(self):
+        for name in self.FILES:
+            data = (self.ROOT / name).read_bytes()
+            bad = [i for i, b in enumerate(data) if b >= 0x80]
+            self.assertEqual(
+                [], bad[:8],
+                "%s 含非 ASCII 字节（首个位置 %s）：pip 在中文 Windows 上会按 GBK 解码并崩溃，"
+                "注释必须是英文" % (name, bad[0] if bad else None))
+
+    def test_vendored_pins_unchanged(self):
+        """包名行逐字节不许动：必须与 NAS 侧车同版本。"""
+        rt = (self.ROOT / "requirements.txt").read_bytes()
+        bt = (self.ROOT / "requirements-build.txt").read_bytes()
+        for line in (b"paddlex[ocr]==3.0.3", b"paddlepaddle==3.0.0",
+                     b"PyMuPDF>=1.24,<2", b"Pillow>=10,<13", b"requests>=2.31"):
+            self.assertIn(line + b"\n", rt, "requirements.txt 缺少原样包名行：%r" % line)
+        self.assertIn(b"pyinstaller>=6,<7\n", bt, "requirements-build.txt 缺少原样包名行")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

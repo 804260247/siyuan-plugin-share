@@ -1,2 +1,2 @@
-# 仅打包用（运行不需要）
+# Build only (not needed at runtime). ASCII only -- see the header of requirements.txt
 pyinstaller>=6,<7
