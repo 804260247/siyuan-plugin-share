@@ -20,6 +20,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -167,6 +168,20 @@ def make_png(path: Path, w: int = 1200, h: int = 800):
     from PIL import Image
 
     Image.new("RGB", (w, h), (255, 255, 255)).save(str(path))
+
+
+def _fake_paddle_tree(root: Path, libs=("mklml.dll", "common.dll", "libiomp5md.dll",
+                                      "mkldnn.dll"),
+                      base=("libpaddle.pyd", "notes.txt")) -> Path:
+    """造一个假 `site-packages/paddle` 目录（0036 派生原生库用）。"""
+    pdir = Path(root) / "paddle"
+    (pdir / "libs").mkdir(parents=True, exist_ok=True)
+    (pdir / "base").mkdir(parents=True, exist_ok=True)
+    for name in libs:
+        (pdir / "libs" / name).write_bytes(b"MZ" + name.encode())
+    for name in base:
+        (pdir / "base" / name).write_bytes(b"MZ" + name.encode())
+    return pdir
 
 
 def sha256_of(path: Path) -> str:
@@ -554,13 +569,18 @@ class TestBuildExe(unittest.TestCase):
     def test_argv_contains_derived_collect_all(self):
         import build_exe
         orig = pydeps.module_pairs
+        orig_root = build_exe.paddle_root
+        tmp = Path(tempfile.mkdtemp(prefix="ocrwin-argv2-"))
         pydeps.module_pairs = lambda *a, **k: [("opencv-contrib-python", "cv2"),
                                                ("scikit-learn", "sklearn")]
+        build_exe.paddle_root = lambda: _fake_paddle_tree(tmp)
         try:
             onedir = build_exe.pyinstaller_argv(False)
             onefile = build_exe.pyinstaller_argv(True)
         finally:
             pydeps.module_pairs = orig
+            build_exe.paddle_root = orig_root
+            shutil.rmtree(str(tmp), ignore_errors=True)
         self.assertIn("--onedir", onedir)
         self.assertIn("--onefile", onefile)
         for arg in ("--collect-all", "cv2", "sklearn", "run_ocr_win.py"):
@@ -580,16 +600,19 @@ class TestBuildExe(unittest.TestCase):
         """真走派生：假 paddlex 元数据 + 假 cv2 发行包 → 两类参数都要出现。"""
         import build_exe
         tmp = Path(tempfile.mkdtemp(prefix="ocrwin-argv-"))
+        orig_root = build_exe.paddle_root
         try:
             _fake_dist(tmp, "paddlex", "3.0.3", "paddlex",
                        requires=['opencv-contrib-python==4.10.0.84; extra == "ocr"'])
             _fake_dist(tmp, "opencv-contrib-python", "4.10.0.84", "cv2")
+            build_exe.paddle_root = lambda: _fake_paddle_tree(tmp)
             sys.path.insert(0, str(tmp))
             try:
                 argv = build_exe.pyinstaller_argv(False)
             finally:
                 sys.path.remove(str(tmp))
         finally:
+            build_exe.paddle_root = orig_root
             shutil.rmtree(str(tmp), ignore_errors=True)
         self.assertIn("--collect-all", argv)          # 模块/数据进包
         self.assertIn("--copy-metadata", argv)        # 元数据进包
@@ -624,6 +647,128 @@ class TestBuildExe(unittest.TestCase):
             (pydeps.requirement_names, pydeps.uninstalled, pydeps.metadata_names,
              pydeps.missing_metadata) = orig
         self.assertEqual(rc, build_exe.EXIT_DEPENDENCY)
+
+
+class TestPaddleNativeLibs(unittest.TestCase):
+    """0036：paddle 自己的原生运行库必须逐文件 `--add-binary` 收进包。
+
+    真机：`dist\\ocr-win\\_internal\\paddle\\libs` 里只有 common/libiomp5md/mkldnn，
+    **缺 mklml.dll** → exe 初始化 `error code is 126`，而源码模式完全正常。
+    这类库运行时才 LoadLibrary，静态依赖树查不到，`--collect-all paddle` 收不全。
+    """
+
+    LIBS = ("mklml.dll", "mkldnn.dll", "libiomp5md.dll", "common.dll")
+
+    def setUp(self):
+        import build_exe
+        self.build_exe = build_exe
+        self.tmp = Path(tempfile.mkdtemp(prefix="ocrwin-native-"))
+        self.root = _fake_paddle_tree(self.tmp, libs=self.LIBS)
+
+    def tearDown(self):
+        shutil.rmtree(str(self.tmp), ignore_errors=True)
+
+    def test_covers_every_file_under_libs(self):
+        pairs = self.build_exe.native_lib_files(self.root)
+        on_disk = sorted(f.name for f in (self.root / "libs").iterdir() if f.is_file())
+        got = sorted(Path(src).name for src, dest in pairs if dest == "paddle/libs")
+        self.assertEqual(got, on_disk, "paddle/libs 下每个文件都必须收，禁止写死文件名")
+        self.assertEqual(len(got), len(self.LIBS))
+        self.assertIn("mklml.dll", got)          # 这次真机漏的就是它
+
+    def test_entry_count_matches_disk(self):
+        pairs = self.build_exe.native_lib_files(self.root)
+        disk = sum(1 for d in ("libs", "base")
+                   for f in (self.root / d).iterdir()
+                   if f.is_file() and (d == "libs" or f.suffix.lower() in (".pyd", ".dll")))
+        self.assertEqual(len(pairs), disk)
+
+    def test_base_only_pyd_and_dll(self):
+        pairs = self.build_exe.native_lib_files(self.root)
+        base = [Path(src).name for src, dest in pairs if dest == "paddle/base"]
+        self.assertEqual(base, ["libpaddle.pyd"], "base 下只收 .pyd/.dll，别的文件不收")
+
+    def test_dest_keeps_site_packages_layout(self):
+        """dest 必须是 `paddle/libs` / `paddle/base`，否则 paddle 仍按原路径找。"""
+        for _src, dest in self.build_exe.native_lib_files(self.root):
+            self.assertIn(dest, ("paddle/libs", "paddle/base"))
+
+    def test_add_binary_arg_per_file(self):
+        pairs = self.build_exe.native_lib_files(self.root)
+        argv = self.build_exe.native_pyinstaller_args(pairs)
+        specs = [argv[i + 1] for i, a in enumerate(argv) if a == "--add-binary"]
+        self.assertEqual(argv.count("--add-binary"), len(pairs))
+        self.assertEqual(len(specs), len(pairs))
+        dests = set()
+        for spec in specs:
+            src, _, dest = spec.partition(os.pathsep)
+            self.assertTrue(os.path.isabs(src), spec)
+            self.assertTrue(os.path.isfile(src), spec)
+            dests.add(dest)
+        self.assertEqual(dests, {"paddle/libs", "paddle/base"})
+
+    def test_argv_includes_add_binary(self):
+        argv = self.build_exe.pyinstaller_argv(
+            False, native=self.build_exe.native_lib_files(self.root))
+        self.assertIn("--add-binary", argv)
+        self.assertEqual(argv[-1], "run_ocr_win.py", "entry 必须是最后一个参数")
+
+    # --- 早失败 ---------------------------------------------------------
+
+    def test_missing_libs_dir_raises(self):
+        shutil.rmtree(str(self.root / "libs"))
+        with self.assertRaises(self.build_exe.NativeLibsMissing):
+            self.build_exe.native_lib_files(self.root)
+
+    def test_empty_libs_dir_raises(self):
+        for f in (self.root / "libs").iterdir():
+            f.unlink()
+        with self.assertRaises(self.build_exe.NativeLibsMissing):
+            self.build_exe.native_lib_files(self.root)
+
+    def test_missing_paddle_package_raises(self):
+        with self.assertRaises(self.build_exe.NativeLibsMissing):
+            self.build_exe.native_lib_files(self.tmp / "nope")
+
+    def test_main_aborts_with_exit_dependency(self):
+        """打包机装错环境：`--print-only` 也必须退 4，不许假装能打包。"""
+        import build_exe
+        orig = (pydeps.requirement_names, pydeps.uninstalled, pydeps.metadata_names,
+                pydeps.missing_metadata, build_exe.paddle_root)
+        pydeps.requirement_names = lambda *a, **k: ["opencv-contrib-python"]
+        pydeps.uninstalled = lambda *a, **k: []
+        pydeps.metadata_names = lambda *a, **k: ["paddlex"]
+        pydeps.missing_metadata = lambda *a, **k: []
+        build_exe.paddle_root = lambda: self.tmp / "nope"
+        try:
+            rc = build_exe.main(["--print-only"])
+        finally:
+            (pydeps.requirement_names, pydeps.uninstalled, pydeps.metadata_names,
+             pydeps.missing_metadata, build_exe.paddle_root) = orig
+        self.assertEqual(rc, build_exe.EXIT_DEPENDENCY)
+
+    def test_print_only_lists_add_binary(self):
+        """`--print-only` 必须把第三类派生单独打一行（与另两类并列核对）。"""
+        import build_exe
+        from contextlib import redirect_stdout
+        orig = (pydeps.requirement_names, pydeps.uninstalled, pydeps.metadata_names,
+                pydeps.missing_metadata, build_exe.paddle_root)
+        pydeps.requirement_names = lambda *a, **k: ["opencv-contrib-python"]
+        pydeps.uninstalled = lambda *a, **k: []
+        pydeps.metadata_names = lambda *a, **k: ["paddlex"]
+        pydeps.missing_metadata = lambda *a, **k: []
+        build_exe.paddle_root = lambda: self.root
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                rc = build_exe.main(["--print-only"])
+        finally:
+            (pydeps.requirement_names, pydeps.uninstalled, pydeps.metadata_names,
+             pydeps.missing_metadata, build_exe.paddle_root) = orig
+        out = buf.getvalue()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("--add-binary 派生 paddle 原生库 %d 个" % len(self.LIBS + ("libpaddle.pyd",)), out)
+        self.assertIn("mklml.dll", out)
 
 
 class TestSelfCheckPipeline(unittest.TestCase):
@@ -1129,13 +1274,19 @@ class TestGpuCliGuard(BaseCase):
 
 
 class TestFriendlyInitError(unittest.TestCase):
-    """0033：原生 `error code is 126` 不许原样糊给用户。"""
+    """0033 + 0036：原生 `error code is 126` 的翻译只在 GPU 设备下成立。
+
+    0036 真机教训：打包产物缺 `mklml.dll`（打包漏收），`device=cpu`，原实现把
+    这条 126 翻译成「缺 CUDA / cuDNN，请装 cuDNN 9.x」，把排障方向带偏了一整轮。
+    """
 
     RAW = ("(PreconditionNotMet) The third-party dynamic library (cudnn64_9.dll) that "
            "Paddle depends on is not configured correctly. (error code is 126)")
+    RAW_CPU = ("(PreconditionNotMet) The third-party dynamic library (mklml.dll) that "
+               "Paddle depends on is not configured correctly. (error code is 126)")
 
-    def test_dll_error_translated(self):
-        msg = engine_mod._friendly_init_error(RuntimeError(self.RAW))
+    def test_dll_error_translated_on_gpu(self):
+        msg = engine_mod._friendly_init_error(RuntimeError(self.RAW), "gpu:0")
         self.assertIn("cuDNN", msg)
         self.assertIn("cudnn64_9.dll", msg)
         self.assertIn("README", msg)
@@ -1145,15 +1296,56 @@ class TestFriendlyInitError(unittest.TestCase):
     def test_debug_env_keeps_raw(self):
         os.environ["OCR_WIN_DEBUG"] = "1"
         try:
-            msg = engine_mod._friendly_init_error(RuntimeError(self.RAW))
+            msg = engine_mod._friendly_init_error(RuntimeError(self.RAW), "gpu:0")
         finally:
             del os.environ["OCR_WIN_DEBUG"]
         self.assertIn("error code is 126", msg)
 
     def test_unrelated_error_untouched(self):
-        msg = engine_mod._friendly_init_error(RuntimeError("OCR requires additional dependencies"))
+        msg = engine_mod._friendly_init_error(
+            RuntimeError("OCR requires additional dependencies"), "gpu:0")
         self.assertIn("OCR requires additional dependencies", msg)
         self.assertNotIn("cuDNN", msg)
+
+    # --- 0036：CPU 下必须原样抛出 ----------------------------------------
+
+    def test_cpu_126_not_translated_to_gpu(self):
+        for device in ("cpu", None, ""):
+            msg = engine_mod._friendly_init_error(RuntimeError(self.RAW_CPU), device)
+            self.assertIn("mklml.dll", msg, device)          # 必须保留真实缺的 DLL 名
+            self.assertIn("error code is 126", msg, device)  # 与原生 error code
+            self.assertNotIn("cuDNN", msg, device)
+            self.assertNotIn("GPU 运行库", msg, device)
+
+    def test_cpu_dll_error_keeps_full_text(self):
+        """CPU 下不许截断成一行——用户要拿完整原文去搜。"""
+        exc = RuntimeError("Error loading \"mklml.dll\"\n[WinError 126] 找不到指定的模块。")
+        msg = engine_mod._friendly_init_error(exc, "cpu")
+        self.assertIn("mklml.dll", msg)
+        self.assertIn("WinError 126", msg)
+
+    def test_engine_cpu_error_message_raw(self):
+        """整条路径：PaddleEngine(device=cpu) 初始化失败 → 报错里不许出现 GPU 措辞。"""
+        fake = types.ModuleType("paddlex")
+
+        def _boom(**_kw):
+            raise RuntimeError(self.RAW_CPU)
+
+        fake.create_pipeline = _boom
+        orig = sys.modules.get("paddlex")
+        sys.modules["paddlex"] = fake
+        try:
+            eng = engine_mod.PaddleEngine(device="cpu")
+            with self.assertRaises(engine_mod.OcrEngineError) as ctx:
+                eng.ensure_ready()
+        finally:
+            if orig is None:
+                sys.modules.pop("paddlex", None)
+            else:
+                sys.modules["paddlex"] = orig
+        text = str(ctx.exception)
+        self.assertIn("mklml.dll", text)
+        self.assertNotIn("cuDNN", text)
 
 
 class TestRequirementsAscii(unittest.TestCase):

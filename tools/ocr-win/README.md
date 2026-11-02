@@ -87,7 +87,7 @@ python -m ocrwin self-check --server http://192.168.1.111:3003 --token <你的 K
 - 自检查**两个维度**：`import` 能不能找到模块（对应 `--collect-all`），以及**发行包元数据在不在**
   （`importlib.metadata.version()`，对应 `--copy-metadata`）。缺后者会逐条打印
   `元数据缺失：scikit-learn（发行包已打包但无 dist-info，paddlex 会误判 extras 未安装，需 --copy-metadata）`，
-  同样退出码 `4` —— 这条正是「模块全在、paddlex 却说没装依赖」的真凶（见「打包 exe → 两类派生」）。
+  同样退出码 `4` —— 这条正是「模块全在、paddlex 却说没装依赖」的真凶（见「打包 exe → 三类派生」）。
 
 ## 第二步：先 dry-run，再真跑
 
@@ -255,19 +255,21 @@ dir .venv\Lib\site-packages\paddle\libs\*cudnn*
 静态分析追不到它依赖的第三方包 —— 打出来的 exe 一初始化就报
 `OCR requires additional dependencies`。上游给 `ocr` extra 加包时**无需改任何脚本**。
 
-### 两类派生，缺一不可：`--collect-all` 与 `--copy-metadata`
+### 三类派生，缺一不可：`--collect-all`、`--copy-metadata`、`--add-binary`
 
-`--print-only` 会把两类都打全（排障先看这两行）：
+`--print-only` 会把三类都打全（排障先看这三行）：
 
 ```
 [build] --collect-all 派生模块 15 个：einops, ftfy, imagesize, jinja2, lxml, cv2, openpyxl, …
 [build] --copy-metadata 派生发行包 16 个：paddlex, einops, ftfy, imagesize, jinja2, lxml, opencv-contrib-python, …
+[build] --add-binary 派生 paddle 原生库 N 个：paddle/libs/mklml.dll, paddle/libs/mkldnn.dll, …
 ```
 
 | 参数 | 解决什么 | 缺了会怎样 |
 | --- | --- | --- |
 | `--collect-all <模块名>` | 把**模块本体**（`.py`/`.pyd`/数据文件）打进包 | `ModuleNotFoundError` / `import cv2 失败` |
 | `--copy-metadata <发行包名>` | 把 **`.dist-info` 元数据**打进包 | 模块明明都在，paddlex 仍报 `OCR requires additional dependencies` |
+| `--add-binary <abs>;<dest>` | 把 **paddle 自己的原生运行库**打进包 | 一初始化就 `(PreconditionNotMet) The third-party dynamic library (mklml.dll) … (error code is 126)` |
 
 为什么第二条不能省：paddlex 判定 extras 是否可用**不看 import**，而是
 `importlib.metadata.version(<发行包>)`（`paddlex/utils/deps.py:is_dep_available`）。
@@ -287,6 +289,34 @@ PyInstaller 的产物只有 `.py`/`.pyd`，默认不带 `.dist-info`，元数据
   `packaging.version`；`self-check` 也会单独打一行
   `packaging: 可 import，Requirement 可解析 Requires-Dist`，不可用时独立退 `4` 并在结论里点明是
   `ImportError` 而不是 extras 判定失败。
+
+#### `--add-binary`：paddle 自己的原生运行库
+
+真机教训（0036）：`dist\ocr-win\_internal\paddle\libs` 里只有 `common.dll` / `libiomp5md.dll` /
+`mkldnn.dll`，**缺 `mklml.dll`** —— exe 初始化 OCR 流水线直接
+
+```
+(PreconditionNotMet) The third-party dynamic library (mklml.dll) that Paddle depends on
+is not configured correctly. (error code is 126)
+```
+
+而同一个 `.venv` 用 `python run_ocr_win.py self-check` **完全通过**（5 个模型全建好）。
+差的不是依赖包，是 paddle 自己的 `.dll`。
+
+原因：`paddle/libs`（`mklml.dll` / `mkldnn.dll` / `libiomp5md.dll` / `common.dll` …）与
+`paddle/base`（`libpaddle.pyd`）里的东西**运行时才 `LoadLibrary` 加载**，PyInstaller 顺着
+import 链做的静态依赖分析看不到它们，`--collect-all paddle` 也收不全。这类库只能逐文件
+`--add-binary` 点名收：
+
+- `build_exe.py` 遍历 `site-packages/paddle/libs` 下**每一个文件**、`paddle/base` 下的
+  `.pyd`/`.dll`，逐个生成 `--add-binary "<绝对路径>;<dest>"`；
+- **不写死文件名**：今天漏的是 `mklml.dll`，上游换一批也不用改脚本；
+- `dest` 必须与 site-packages 内的相对路径一致（`paddle/libs`、`paddle/base`）——
+  paddle 是按 `paddle/libs/xxx.dll` 去加载的，放进别的目录等于没加；
+- `paddle/libs` 不存在或是空目录 → 直接退 `4` 中止（打包机装错环境，越早失败越好）。
+
+注意区分：**不要手工往 `paddle/libs` 里拷 CUDA / cuDNN 的 DLL**。那是 GPU 源码模式的事
+（见「GPU 加速」），而打包出来的 exe 永远是 CPU 版。
 
 打包末尾还有**冒烟断言**：两个脚本都会跑一次 `dist\ocr-win\ocr-win.exe self-check`（默认带流水线初始化），
 非 0 即判定打包失败 —— 「打包完成但产物跑不起来」不会再悄悄通过。

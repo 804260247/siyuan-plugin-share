@@ -94,7 +94,7 @@ class PaddleEngine:
             # 个别版本不接受 device 关键字
             self._pipeline = create_pipeline(pipeline="OCR")
         except Exception as exc:
-            raise OcrEngineError(_friendly_init_error(exc))
+            raise OcrEngineError(_friendly_init_error(exc, self.device))
 
     def ensure_ready(self):
         """公开的初始化检查（启动阶段 fail-fast 用）。"""
@@ -304,14 +304,21 @@ _DLL_ERROR_HINTS = ("third-party dynamic library", "dynamic library", "cudnn64",
                     "cudart64", "cublas64", "error code is 126")
 
 
-def _friendly_init_error(exc) -> str:
-    """把 paddle 的原生 DLL 报错换成能照着做的说明（0033）。
+def _friendly_init_error(exc, device=None) -> str:
+    """把 paddle 的原生 DLL 报错换成能照着做的说明（GPU 场景，0033）。
 
     真机报的是 `(PreconditionNotMet) The third-party dynamic library
     (cudnn64_9.dll) ... error code is 126`，用户看不懂也定位不到。
     原始首行只在 `OCR_WIN_DEBUG=1` 时附带，避免默认就把原生报错糊到脸上。
+
+    **只在 GPU 设备下翻译**（0036 修）：`error code is 126` 是「某个原生库加载
+    失败」的通用错误码，与 CUDA/cuDNN 无关。纯 CPU / frozen 场景缺的是
+    `mklml.dll`（打包漏收），原实现会把它翻译成「缺 CUDA / cuDNN，请装 cuDNN 9.x」，
+    把排障方向整个带偏。CPU 下原样抛出，保留 DLL 名与 error code。
     """
     text = str(exc).strip() or exc.__class__.__name__
+    if not is_gpu_device(device):
+        return "OCR 流水线初始化失败：%s" % text
     low = text.lower()
     missing = ""
     for name in ("cudnn64_9.dll", "cudnn64_8.dll", "cudart64_12.dll", "cudart64_110.dll"):
