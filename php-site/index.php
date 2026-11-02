@@ -4950,9 +4950,46 @@ function netdisk_ocr_api_json(int $code, array $payload): void {
     header('Access-Control-Allow-Origin: *');
     header('Access-Control-Allow-Headers: Content-Type, X-Api-Key, Authorization, X-CSRF-Token');
     header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
+    // 0037: 取参口径走响应头（响应体保持 0025 的严格 8 字段，不加第 9 个字段）
+    header('Access-Control-Expose-Headers: X-OCR-Scope, X-OCR-Config-Id');
     http_response_code($code);
     echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
+}
+
+// 0037: params / import 两端点与服务端重建**必须**用同一个 configId 口径取 OCR 参数。
+// 背景：netdisk_index_cfg_value() 在 configId<=0 时直接返回硬编码默认值（全局 settings 已取消），
+// 而重建走 share 所属连接的 config_id（nd-worker.php 取 netdisk_share_config() → index.php 的 build 分支）。
+// 于是任一连接 DPI ≠ 200 时：params 端恒回 200，PC 按 200 渲染并回传 params_key，
+// 重建按连接真实 DPI 算 key → 永远命中不了，PC 那一轮等于白扫（且现象极难发现）。
+// 本函数是两端点唯一的取参口径（禁止端点各自读配置，也禁止另造第二份分享→连接解析）：
+//   - 带 ?share=<slug>：find_share_by_slug() + netdisk_share_config() 解析出绑定连接，scope=share
+//   - 不带：configId=0（走硬编码默认值），scope=default
+// 错误语义必须显式，禁止静默回落 default（回落就等于又回到白扫）：
+//   - slug 不存在 / 已删除 → 404 share_not_found
+//   - 分享未绑定可用网盘连接（config_id=0 / 连接被禁用）→ 400 share_no_netdisk_config
+// scope / config_id 同时写响应头（X-OCR-Scope / X-OCR-Config-Id），响应体维持严格 8 字段不变。
+function netdisk_ocr_params_config_ctx(?PDO $pdo = null): array {
+    $slug = trim((string)($_GET['share'] ?? ''));
+    $scope = 'default';
+    $configId = 0;
+    if ($slug !== '') {
+        // 已删除的分享由 find_share_by_slug 的 deleted_at IS NULL 过滤掉，与分享页同口径
+        $share = find_share_by_slug($slug);
+        if (!$share) {
+            netdisk_ocr_api_json(404, ['code' => 404, 'msg' => '分享不存在或已删除', 'error' => 'share_not_found']);
+        }
+        $nd = netdisk_share_config($share, $pdo);
+        $configId = (int)($nd['config_id'] ?? 0);
+        $cfg = $nd['cfg'] ?? null;
+        if ($configId <= 0 || !is_array($cfg) || (int)($cfg['enabled'] ?? 0) !== 1) {
+            netdisk_ocr_api_json(400, ['code' => 400, 'msg' => '该分享未绑定可用的网盘连接', 'error' => 'share_no_netdisk_config']);
+        }
+        $scope = 'share';
+    }
+    header('X-OCR-Scope: ' . $scope);
+    header('X-OCR-Config-Id: ' . $configId);
+    return ['config_id' => $configId, 'scope' => $scope];
 }
 
 // 0025: 后台鉴权（沿用既有机制，不另造一套）——先按会话（current_user() + role=admin，与 require_admin()
@@ -19740,7 +19777,9 @@ if (($path === '/admin/netdisk/ocr/params' || $path === '/admin/netdisk/ocr/impo
 // params_key 与 0024 写库同出 netdisk_ocr_params_key()，不存在第二份拼接。
 if ($path === '/admin/netdisk/ocr/params' && $_SERVER['REQUEST_METHOD'] === 'GET') {
     netdisk_ocr_api_user();
-    netdisk_ocr_api_json(200, netdisk_ocr_params_payload(0));
+    // 0037: 取参口径统一走 ctx（?share=<slug> → 该分享绑定连接；不带 → 硬编码默认值 + scope=default）
+    $ndCtx = netdisk_ocr_params_config_ctx();
+    netdisk_ocr_api_json(200, netdisk_ocr_params_payload((int)$ndCtx['config_id']));
 }
 
 // 0025: POST /admin/netdisk/ocr/import —— PC 端识别结果批量回导（唯一写入口；禁止 PC 直连 app.db，
@@ -19752,6 +19791,8 @@ if ($path === '/admin/netdisk/ocr/import' && $_SERVER['REQUEST_METHOD'] === 'POS
     if (!netdisk_ocr_import_csrf_ok((string)$ndAu['via'])) {
         netdisk_ocr_api_json(400, ['code' => 400, 'msg' => 'CSRF 校验失败']);
     }
+    // 0037: 与 GET /params 同一取参口径（?share=<slug>）；两端不同源就等于整批 params_mismatch
+    $ndCtx = netdisk_ocr_params_config_ctx();
     // 请求体限流：只读 4 MB + 1 字节，超出部分不进内存即可判定超限
     $ndMaxBody = 4 * 1048576;
     $ndRaw = (string)file_get_contents('php://input', false, null, 0, $ndMaxBody + 1);
@@ -19770,8 +19811,8 @@ if ($path === '/admin/netdisk/ocr/import' && $_SERVER['REQUEST_METHOD'] === 'POS
         netdisk_ocr_api_json(400, ['code' => 400, 'msg' => '单批最多 50 行（本次 ' . count($ndItems) . ' 行），整批未写入']);
     }
     $ndPdo = db();
-    // 单一来源：与 0024 写库、GET /admin/netdisk/ocr/params 同一函数
-    $ndExpected = netdisk_ocr_params_key(0);
+    // 单一来源：与 0024 写库、GET /admin/netdisk/ocr/params 同一函数，且同一 configId 口径（0037）
+    $ndExpected = netdisk_ocr_params_key((int)$ndCtx['config_id']);
     $ndBodyKey = trim((string)($ndBody['params_key'] ?? ''));
     $ndBatchMismatch = ($ndBodyKey !== '' && $ndBodyKey !== $ndExpected);
     $ndAccepted = 0;

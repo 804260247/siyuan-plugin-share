@@ -82,6 +82,7 @@
 - [x] 修复在根目录输入框里手工粘贴中文/裸 `&` 会存成坏值：新增 `netdisk_root_encode()`，保存前**逐段**判断——只有「含非 ASCII 字节」或「含裸 `&`」的段才 `rawurlencode`，其余段（含已编码段）原样拼接，因此对已编码串幂等、字节不变（不需要「是否已编码」的启发式探测）；scheme 段（`my` / `xxx@share`）整体跳过，否则 `@` 会变 `%40`。配合上一项，界面显示解码路径、库里存编码路径，来回保存不漂移
 - [x] 修复「改完根目录点测试连接，提示里还是旧路径」：`/admin/netdisk/config/test` 编辑态原先只要 `config_id > 0` 就直接 `cloudreve_config_get()` 读库，POST 上来的 `base_url`/`email`/`password`/`viewer_id`/`default_root` 一个都不看；改为**表单值优先、缺失才回退数据库**（密码留空即用库内旧值），新增分支与 `/admin/netdisk/folders` 的临时 `$cfg` 都漏了 `default_root` 键（`?? ''` → 回落 `cloudreve://my`，于是选择目录永远只看到网盘根、测试也永远显示「根目录」），一并补齐
 - [x] 修复「选择目录」弹窗面包屑只剩一个写死的「根目录」：`app.js` 打开弹窗时无条件 `pickStack = []`，首次 `loadFolders()` 又不传 `name`，栈永远为空，`renderCrumbs()` 只画得出根节点。现按初始 URI 逐段生成栈（每段 `uri` 逐级累加、`name` 用 `netdiskRootDecode()` 解码显示），并在「服务端因目录不可列回落到别的目录」（`data.current` 与请求 uri 不一致）时按返回值重建栈。选中结果本身一直是对的，坏的只是面包屑与「根目录」按钮的落点
+- [x] 修复 PC 工具回导结果「明明回导成功、重建却仍然重扫同一批文件」（OCR 参数口径与重建口径不一致）：`GET /admin/netdisk/ocr/params` 原先把 `config_id` 硬编码为 0，于是永远按硬编码默认值 `paddle5|low|200|960|r1` 发参，而重建侧是按**该分享绑定连接**的真实 OCR 参数（每连接独立的 `index_ocr_*` 列）算 `params_key`；连接 DPI ≠ 200 时两串 key 天生不同，回导行全部落库成功却在重建时命中不了 `(content_hash, params_key)` 主键，NAS 又从头 OCR 一遍（用户实测的一次白扫即此因）。① 新增 `netdisk_ocr_params_config_ctx()` 解析分享上下文：支持 `?share=<slug>`（复用 `find_share_by_slug()` 与 `netdisk_share_config()`，与分享页完全同口径，`deleted_at` 非空的视为不存在）；params 与 import 两端**必须调同一个 ctx**，import 的 `$ndExpected` 也换成 `netdisk_ocr_params_key((int)$ndCtx['config_id'])`，否则一端按连接值、一端按默认值，整批 `params_mismatch`；② 取参口径走 HTTP 响应头 `X-OCR-Scope: share|default` / `X-OCR-Config-Id: <int>`，并加 `Access-Control-Expose-Headers: X-OCR-Scope, X-OCR-Config-Id`，**响应体保持严格 8 字段**（`v/engine/engine_version/profile/dpi/max_side/render_ver/params_key`，不多一个键）；③ 错误语义显式化，禁止静默回落默认值：slug 不存在或已删除 → `404` + `share_not_found`；分享存在但未绑定网盘连接 / 连接不可用 → `400` + `share_no_netdisk_config`；④ PC 工具 `tools/ocr-win` 新增 `--share`（`run` 与 `self-check`）：`ApiClient` 把 `share=` 同时拼到 params 与 import 两个 URL，运行日志打出「参数口径：scope=… config_id=…」，不带 `--share` 时追加一句「连接 DPI≠200 则回导结果不会被重建复用」的提示；①–④ 之外 `params_key` 格式、`ON CONFLICT` 语义、8 字段白名单、≤50 行 / ≤4MB 上限、七类 reason、CSRF 规则、`source='win'` 一律未动（`settings` 里 `netdisk_index_ocr_*` 那几行死数据也不在本轮删除范围）。README 新增「分享上下文：`--share`」小节，写明**连接 DPI ≠ 200 时必须带 `--share`**、两种失败语义与「看到 `scope=default` 就是白扫」的判据
 - [x] 顺带修两处管理端连接配置的隐性丢值：① 连接表格「编辑」按钮的 `data-cfg-root` 存在二次 `htmlspecialchars`（`$cfgRoot` 在上一行已转义过），值里出现字面 `&` 时点「编辑」会把 `&amp;` 回填进输入框并被原样保存；现表格列用解码值、`data-cfg-root` 用存储值（各自单次转义）分开承载。② `/admin/netdisk/config/save` 原先把 `$viewerId = ''` 硬写成空串（表单里根本没有 `viewer_id` 输入框），每保存一次连接就把已存的 `viewer_id` 清空；现补隐藏域并在 save 端「POST 为空则保留旧值」，其它字段（尤其密码空值策略）语义一律不变
 
 ### 部署
@@ -101,6 +102,8 @@
 - 「强制重跑 OCR」勾选框已移入「配置」展开区：配置面板折叠时它不可见、勾不到，须先点「配置」展开——这是为压缩操作列做的有意取舍，不是缺陷；重建按钮的读取方式（`data-config-id`）与勾选框语义均未变
 - 根目录里若存在目录名含转义斜杠（`a%2Fb` 这种，正常文件系统不可能出现），显示层逐段解码后与两级目录同形，来回保存会被规范化成 `a/b`；属理论边界，不另加启发式探测
 - 编辑连接时若只改了密码，「测试连接」在旧 access token 仍有效期内会复用它而不重新登录，此时验证的是连接可达性而非新密码正确性（token 缓存行为与本次改动前一致）
+- 分享绑到**已禁用**的网盘连接时，`?share=` 取参接口一律回 `400 share_no_netdisk_config`（按「连接不可用即拒」处理）；但后台 worker 的重建路径用的是 `netdisk_share_config()`，它只判连接行是否存在（`cloudreve_config_get()` 不校验 `enabled`），重建仍会照常执行——API 与重建在这一点上口径不一致，属已知边界，本轮不改判定逻辑
+- PC 工具不带 `--share` 时按服务端硬编码默认值（`200 / 960 / r1 / low`）取参，此时若目标分享绑定的连接 OCR DPI ≠ 200，回导结果会全部落库成功但**不会被重建复用**（`params_key` 不同），表现为 NAS 又重扫一遍；这不是丢数据，加 `--share` 重跑即可
 
 ## v0.5.6 2026-10-19
 

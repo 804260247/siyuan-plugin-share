@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ocrwin import cli, engine as engine_mod, params as params_mod, upload as upload_mod  # noqa: E402
 from ocrwin import pydeps  # noqa: E402
-from ocrwin.httpapi import ApiClient, UrllibTransport  # noqa: E402
+from ocrwin.httpapi import ApiClient, ApiError, UrllibTransport  # noqa: E402
 from ocrwin.state import StateStore  # noqa: E402
 
 TOKEN = "test-token-123456"
@@ -49,6 +49,10 @@ class NasStub:
         self.posts: list[dict] = []
         self.texts: dict[str, str] = {}
         self.reject_reason: str | None = None
+        # 0037：share slug → 绑定连接 id（模拟服务端 ctx 的三态）
+        self.share_slugs: dict[str, int] = {}
+        self.share_no_netdisk: set[str] = set()
+        self.share_calls: list[str] = []
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -57,29 +61,65 @@ class NasStub:
             def log_message(self, *a):  # 静音
                 pass
 
-            def _json(self, code, payload):
+            def _json(self, code, payload, scope=None, config_id=None):
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                # 0037：取参口径走响应头，响应体保持严格 8 字段
+                if scope is not None:
+                    self.send_header("X-OCR-Scope", scope)
+                    self.send_header("X-OCR-Config-Id", str(config_id or 0))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _split(self):
+                from urllib.parse import urlparse, parse_qs
+                u = urlparse(self.path)
+                return u.path, parse_qs(u.query)
+
+            def _ctx(self):
+                """模拟服务端 netdisk_ocr_params_config_ctx() 的三态；返回 (scope, config_id) 或直接回错误。"""
+                _path, q = self._split()
+                share = (q.get("share") or [""])[0].strip()
+                stub.share_calls.append(share)
+                if share == "":
+                    return "default", 0
+                if share in stub.share_no_netdisk:
+                    self._json(400, {"code": 400, "msg": "该分享未绑定可用的网盘连接",
+                                     "error": "share_no_netdisk_config"})
+                    return None
+                if share in stub.share_slugs:
+                    return "share", stub.share_slugs[share]
+                self._json(404, {"code": 404, "msg": "分享不存在或已删除",
+                                 "error": "share_not_found"})
+                return None
 
             def _auth_ok(self):
                 return self.headers.get("X-Api-Key", "") == stub.token
 
             def do_GET(self):
-                if self.path != "/admin/netdisk/ocr/params":
+                path, _q = self._split()
+                if path != "/admin/netdisk/ocr/params":
                     return self._json(404, {"code": 404, "msg": "not found"})
                 if not self._auth_ok():
                     return self._json(401, {"code": 401, "msg": "未登录或 API Key 无效"})
-                return self._json(200, stub.params)
+                ctx = self._ctx()
+                if ctx is None:
+                    return None
+                scope, cid = ctx
+                return self._json(200, stub.params, scope=scope, config_id=cid)
 
             def do_POST(self):
-                if self.path != "/admin/netdisk/ocr/import":
+                path, _q = self._split()
+                if path != "/admin/netdisk/ocr/import":
                     return self._json(404, {"code": 404, "msg": "not found"})
                 if not self._auth_ok():
                     return self._json(401, {"code": 401, "msg": "未登录或 API Key 无效"})
+                ctx = self._ctx()
+                if ctx is None:
+                    return None
+                scope, cid = ctx
                 n = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(n)
                 if len(raw) > 4 * 1048576:
@@ -88,14 +128,15 @@ class NasStub:
                 items = body.get("items") or []
                 if len(items) > 50:
                     return self._json(400, {"code": 400, "msg": "单批最多 50 行"})
-                stub.posts.append({"key": body.get("params_key"), "items": items, "bytes": len(raw)})
+                stub.posts.append({"key": body.get("params_key"), "items": items, "bytes": len(raw),
+                                   "scope": scope, "config_id": cid})
                 if body.get("params_key") != stub.expected_key:
                     return self._json(200, {
                         "code": 0, "msg": "", "accepted": 0,
                         "rejected": [{"content_hash": str(it.get("content_hash", "")),
                                       "reason": "params_mismatch"} for it in items],
                         "expected_params_key": stub.expected_key,
-                    })
+                    }, scope=scope, config_id=cid)
                 rejected = []
                 accepted = 0
                 for it in items:
@@ -105,7 +146,8 @@ class NasStub:
                         continue
                     stub.texts[h] = str(it.get("text", ""))
                     accepted += 1
-                return self._json(200, {"code": 0, "msg": "", "accepted": accepted, "rejected": rejected})
+                return self._json(200, {"code": 0, "msg": "", "accepted": accepted, "rejected": rejected},
+                                  scope=scope, config_id=cid)
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self.httpd.server_address[1]
@@ -376,6 +418,102 @@ class TestUploader(BaseCase):
         self.assertEqual(len(stub.texts), 1)
         self.assertEqual(len(stub.posts), 1)
         self.assertLess(stub.posts[0]["bytes"], 4 * 1048576)
+
+
+class TestShareScope(BaseCase):
+    """0037：params / import 用 ?share= 把取参口径钉到分享绑定的连接。
+
+    服务端行为由 NasStub._ctx() 模拟三态：不带 → default/0；已知 slug → share/<连接 id>；
+    未知 slug → 404 share_not_found；未绑定网盘 → 400 share_no_netdisk_config。
+    """
+
+    def test_url_carries_share_query(self):
+        c = ApiClient("http://h", TOKEN, share="ade6b52a")
+        self.assertTrue(c.params_url.endswith("/admin/netdisk/ocr/params?share=ade6b52a"), c.params_url)
+        self.assertIn("?share=ade6b52a", c._import_url)
+
+    def test_no_share_keeps_url_clean(self):
+        c = ApiClient("http://h", TOKEN)
+        self.assertNotIn("share=", c.params_url)
+        self.assertNotIn("share=", c._import_url)
+
+    def test_share_is_url_encoded(self):
+        """slug 里出现空格 / & 时不能被拼成第二个查询参数。"""
+        c = ApiClient("http://h", TOKEN, share="a b&c")
+        self.assertIn("share=a%20b%26c", c.params_url)
+        after = c.params_url.split("share=")[1]
+        self.assertNotIn("&", after)
+
+    def test_scope_share_from_header(self):
+        with NasStub() as stub:
+            stub.share_slugs["ade6b52a"] = 7
+            client = ApiClient(stub.base, TOKEN, share="ade6b52a")
+            data = client.get_params()
+        self.assertEqual(client.last_scope, "share")
+        self.assertEqual(client.last_config_id, 7)
+        self.assertEqual(stub.share_calls, ["ade6b52a"])
+        # 响应体仍是严格 8 字段（多一个 scope 字段就会破 0025 契约）
+        self.assertEqual(sorted(data.keys()), sorted(params_mod.REQUIRED_FIELDS))
+
+    def test_scope_default_without_share(self):
+        with NasStub() as stub:
+            client = ApiClient(stub.base, TOKEN)
+            data = client.get_params()
+        self.assertEqual(client.last_scope, "default")
+        self.assertEqual(client.last_config_id, 0)
+        self.assertEqual(stub.share_calls, [""])
+        self.assertEqual(sorted(data.keys()), sorted(params_mod.REQUIRED_FIELDS))
+
+    def test_unknown_share_404_no_fallback(self):
+        """未知 slug 必须 404 报错，**不许**静默回落 default（回落就等于又回到白扫）。"""
+        with NasStub() as stub:
+            client = ApiClient(stub.base, TOKEN, share="nope")
+            with self.assertRaises(ApiError) as ctx:
+                client.get_params()
+        self.assertEqual(ctx.exception.status, 404)
+        self.assertIn("share_not_found", ctx.exception.body)
+        self.assertEqual(client.last_scope, "")
+
+    def test_share_without_netdisk_400(self):
+        with NasStub() as stub:
+            stub.share_no_netdisk.add("bare")
+            client = ApiClient(stub.base, TOKEN, share="bare")
+            with self.assertRaises(ApiError) as ctx:
+                client.get_params()
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertIn("share_no_netdisk_config", ctx.exception.body)
+
+    def test_import_uses_same_scope(self):
+        """回导与拉参必须同一口径，否则服务端整批 params_mismatch。"""
+        with NasStub() as stub:
+            stub.share_slugs["ade6b52a"] = 7
+            client = ApiClient(stub.base, TOKEN, share="ade6b52a")
+            data = client.post_import(KEY, [{"content_hash": "%064x" % 9, "size": 10,
+                                             "pages": 1, "text": "x", "engine": "paddle5"}])
+        self.assertEqual(client.last_scope, "share")
+        self.assertEqual(client.last_config_id, 7)
+        self.assertEqual(stub.posts[0]["scope"], "share")
+        self.assertEqual(stub.posts[0]["config_id"], 7)
+        self.assertEqual(data["accepted"], 1)
+
+    def test_cli_run_logs_share_scope(self):
+        make_pdf(self.input / "a.pdf", pages=1)
+        with NasStub() as stub:
+            stub.share_slugs["ade6b52a"] = 7
+            rc, out = run_cli(["run", "--input", str(self.input), "--server", stub.base,
+                               "--token", TOKEN, "--share", "ade6b52a"])
+        self.assertEqual(rc, cli.EXIT_OK, out)
+        self.assertIn("scope=share config_id=7", out)
+        self.assertNotIn("未带 --share", out)
+
+    def test_cli_run_default_scope_warns(self):
+        make_pdf(self.input / "a.pdf", pages=1)
+        with NasStub() as stub:
+            rc, out = run_cli(["run", "--input", str(self.input), "--server", stub.base,
+                               "--token", TOKEN])
+        self.assertEqual(rc, cli.EXIT_OK, out)
+        self.assertIn("scope=default config_id=0", out)
+        self.assertIn("未带 --share", out)
 
 
 class TestParamsValidation(unittest.TestCase):

@@ -128,6 +128,7 @@ python -m ocrwin run --input "D:\扫描" --server http://192.168.1.111:3003 --to
 | `--server` | 必填 | NAS 站点根地址，如 `http://192.168.1.111:3003` |
 | `--token` | 空 | 后台 API Key（走 `X-Api-Key`，不依赖 cookie） |
 | `--params-url` | `<server>/admin/netdisk/ocr/params` | 覆盖参数接口地址（走反代时用） |
+| `--share` | 空 | 分享 slug（如 `ade6b52a`）。**连接 DPI ≠ 200 时必须带**，否则回导结果重建时复用不上（见下节） |
 | `--workers` | 1 | 并发 worker 数；**每个 worker 一份模型**，16 GB 机器建议 ≤2 |
 | `--resume` / `--no-resume` | 续跑开启 | 本地 `done.jsonl` 已有的 `(hash, params_key)` 跳过 |
 | `--dry-run` | 关 | 只扫描 + 算哈希 + 校验参数 |
@@ -139,6 +140,42 @@ python -m ocrwin run --input "D:\扫描" --server http://192.168.1.111:3003 --to
 
 支持扩展名：`.pdf .png .jpg .jpeg .bmp .tif .tiff .webp`（多帧 TIFF 按帧逐页处理）；其他一律跳过并计数。
 不支持 office 文档（任务书明确不做 PC 侧 office OCR）。
+
+## 分享上下文：`--share`（连接 DPI ≠ 200 时必带）
+
+服务端同一个分享可能绑定到不同的网盘连接，每个连接有自己的 OCR 参数（PDF 转图 DPI、
+最大边长、档位）。PC 工具不带 `--share` 时，服务端只能按**硬编码默认值**
+（`paddle5|low|200|960|r1`）发参；而重建索引时是按**该分享绑定连接的真实值**算 `params_key`。
+
+两者不一致的后果不是报错，而是**静默不复用**：回导的 50 行全部落库成功，但重建时
+`(content_hash, params_key)` 命中不了，于是 NAS 又从头 OCR 一遍，白跑一趟。
+
+所以规矩只有一条：
+
+> **目标连接的 OCR DPI ≠ 200 时，`run` / `self-check` 必须带 `--share <slug>`。**
+
+slug 在分享链接里：`https://<站点>:4344/s/ade6b52a` → `--share ade6b52a`。
+
+```bat
+.venv\Scripts\python.exe run_ocr_win.py run --input "E:\待扫目录" ^
+  --server https://<你的站点>:4344 --token <Key> --share ade6b52a
+```
+
+带 `--share` 后运行日志会多一行「参数口径：scope=share config_id=N」；不带时是
+`scope=default config_id=0` 并追加一句提示。**看到 `scope=default` 而该连接 DPI 又不是 200，
+就说明这次白扫了**，加上 `--share` 重来即可。本地 `done.jsonl` 是按 `(hash, params_key)` 存的，
+key 一变那批文件就会自动重算，不需要额外加 `--no-resume`。
+
+取参口径走 HTTP 响应头（`X-OCR-Scope` / `X-OCR-Config-Id`），响应体仍是严格 8 字段，
+`--params-url` 的语义不变——`share=` 会自动拼到 params 与 import 两个地址上
+（两端必须同源，否则一边按连接值、一边按默认值，整批 `params_mismatch`）。
+
+服务端两种失败语义（客户端均按启动失败退 2，**不会静默回落到默认值**）：
+
+| 情况 | HTTP | 响应体 `error` |
+|---|---|---|
+| slug 不存在或已删除 | 404 | `share_not_found` |
+| 分享未绑定网盘连接 / 连接不可用 | 400 | `share_no_netdisk_config` |
 
 ## 退出码
 

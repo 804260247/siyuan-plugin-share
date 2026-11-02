@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 USER_AGENT = "ocr-win/1.0 (+siyuan-plugin-share)"
@@ -31,7 +32,7 @@ class RequestsTransport:
         import requests  # 延迟导入：没装时由 default_transport() 决定退回 urllib
 
         resp = requests.request(method, url, headers=headers, data=body, timeout=timeout)
-        return resp.status_code, resp.content
+        return resp.status_code, resp.content, _lower_headers(dict(resp.headers))
 
 
 class UrllibTransport:
@@ -41,9 +42,24 @@ class UrllibTransport:
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return int(resp.status), resp.read()
+                return int(resp.status), resp.read(), _lower_headers(dict(resp.headers))
         except urllib.error.HTTPError as exc:  # 4xx/5xx 也当正常回包返回，交给上层判读
-            return int(exc.code), exc.read()
+            return int(exc.code), exc.read(), _lower_headers(dict(exc.headers or {}))
+
+
+def _lower_headers(raw) -> dict:
+    """响应头统一小写键（requests 的 CaseInsensitiveDict 与 urllib 的 email.message 行为不一致，
+    这里归一化后上层只按小写取，避免因大小写差异读不到 0037 的 X-OCR-Scope）。
+
+    transport 允许只返回 (status, body) —— 老实现/自定义 transport 不返回头时按空字典处理。
+    """
+    out = {}
+    try:
+        for k, v in dict(raw or {}).items():
+            out[str(k).strip().lower()] = str(v).strip()
+    except Exception:
+        return {}
+    return out
 
 
 def default_transport():
@@ -65,13 +81,18 @@ class ApiClient:
     """
 
     def __init__(self, server: str, token: str = "", transport=None,
-                 params_url: str | None = None,
+                 params_url: str | None = None, share: str = "",
                  params_timeout: float = 30.0, import_timeout: float = 300.0):
         self.server = (server or "").strip().rstrip("/")
         self.token = (token or "").strip()
         self.transport = transport or default_transport()
-        self.params_url = params_url or self._url("/admin/netdisk/ocr/params")
-        self._import_url = self._url("/admin/netdisk/ocr/import")
+        # 0037: 分享 slug —— 服务端用它把 OCR 参数解析到该分享绑定的网盘连接。
+        # 不带时服务端回 scope=default（硬编码默认值），连接 DPI≠200 时回导结果不会被重建复用。
+        self.share = (share or "").strip()
+        self.last_scope = ""
+        self.last_config_id = 0
+        self.params_url = self._with_share(params_url or self._url("/admin/netdisk/ocr/params"))
+        self._import_url = self._with_share(self._url("/admin/netdisk/ocr/import"))
         self.params_timeout = params_timeout
         self.import_timeout = import_timeout
 
@@ -79,6 +100,29 @@ class ApiClient:
     def _url(self, path: str) -> str:
         base = (self.server or "").strip().rstrip("/")
         return base + path
+
+    def _with_share(self, url: str) -> str:
+        if not self.share:
+            return url
+        sep = "&" if "?" in url else "?"
+        return url + sep + "share=" + urllib.parse.quote(self.share, safe="")
+
+    def _call(self, method: str, url: str, headers: dict, body, timeout: float):
+        """发请求 + 归一化回包。transport 允许返回 2 元组（老签名）或 3 元组（含响应头）。"""
+        res = self.transport.request(method, url, headers, body, timeout)
+        if isinstance(res, (tuple, list)) and len(res) >= 3:
+            status, raw, hdrs = res[0], res[1], res[2]
+        else:
+            status, raw = res[0], res[1]
+            hdrs = {}
+        hdrs = _lower_headers(hdrs)
+        # 0037: 服务端把取参口径放在响应头里（响应体保持严格 8 字段）
+        self.last_scope = str(hdrs.get("x-ocr-scope") or "")
+        try:
+            self.last_config_id = int(hdrs.get("x-ocr-config-id") or 0)
+        except (TypeError, ValueError):
+            self.last_config_id = 0
+        return int(status), raw
 
     def _headers(self, content_type: str) -> dict:
         h = {
@@ -108,7 +152,7 @@ class ApiClient:
         """GET /admin/netdisk/ocr/params —— 只读无副作用，失败必须报错退出。"""
         url = self.params_url
         try:
-            status, raw = self.transport.request("GET", url, self._headers(""), None, self.params_timeout)
+            status, raw = self._call("GET", url, self._headers(""), None, self.params_timeout)
         except Exception as exc:
             raise ApiError("参数接口请求失败：%s" % exc, 0, "", url)
         data = self._parse(raw) if raw else {}
@@ -124,8 +168,8 @@ class ApiClient:
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         url = self._import_url
         try:
-            status, raw = self.transport.request("POST", url, self._headers("application/json"),
-                                                 payload, self.import_timeout)
+            status, raw = self._call("POST", url, self._headers("application/json"),
+                                     payload, self.import_timeout)
         except Exception as exc:
             raise ApiError("回导请求失败：%s" % exc, 0, "", url)
         data = self._parse(raw) if raw else {}

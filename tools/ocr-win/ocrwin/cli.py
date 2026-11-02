@@ -71,6 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--token", default="", help="后台 API Key（X-Api-Key）；会话 cookie 方式不支持")
     r.add_argument("--params-url", default=None,
                    help="覆盖参数接口地址（默认 <server>/admin/netdisk/ocr/params）")
+    r.add_argument("--share", default="",
+                   help="分享 slug（如 ade6b52a）：服务端据此把 OCR 参数解析到该分享绑定的网盘连接。"
+                        "不填则用服务端默认值；连接 DPI≠200 时回导结果不会被重建复用（0037）")
     r.add_argument("--workers", type=int, default=1, help="并发 worker 数（默认 1；每 worker 一份模型）")
     r.add_argument("--resume", dest="resume", action="store_true", default=True,
                    help="断点续跑：本地 done.jsonl 已有的 (hash, params_key) 跳过（默认开启）")
@@ -90,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--server", default="", help="可选：顺带验证参数接口可达")
     s.add_argument("--token", default="", help="可选：API Key")
     s.add_argument("--params-url", default=None, help="可选：覆盖参数接口地址")
+    s.add_argument("--share", default="", help="可选：分享 slug（与 run --share 同义，用于验证取参口径）")
     s.add_argument("--no-pipeline", action="store_true",
                    help="跳过 OCR 流水线初始化（只查依赖，不加载模型/不下载模型）")
     return p
@@ -167,7 +171,7 @@ def cmd_run(a) -> int:
         return EXIT_STARTUP
     store = StateStore(out_dir)
 
-    client = ApiClient(a.server, a.token, params_url=a.params_url)
+    client = ApiClient(a.server, a.token, params_url=a.params_url, share=getattr(a, "share", ""))
     log("拉取服务端参数：%s" % client.params_url)
     try:
         raw = client.get_params()
@@ -181,6 +185,11 @@ def cmd_run(a) -> int:
         log("参数回包不可用：%s" % exc)
         return EXIT_STARTUP
     log("服务端参数：" + params_mod.describe(params))
+    # 0037: 取参口径必须写进日志——scope=default 且连接 DPI≠200 时，回导结果重建时命中不了
+    log("参数口径：scope=%s config_id=%d" % (client.last_scope or "?", client.last_config_id))
+    if client.last_scope == "default":
+        log("提示：未带 --share，按服务端硬编码默认值取参；"
+            "若该分享绑定的连接 DPI≠200，回导结果不会被重建复用")
 
     files, skipped_ext = scan.iter_files(inp, exclude_dirs=[out_dir])
     log("扫描完成：可处理 %d 个、扩展名跳过 %d 个（%s）" % (len(files), len(skipped_ext), inp))
@@ -493,7 +502,7 @@ def cmd_self_check(a) -> int:
         log("自检结论：关键依赖齐全（含 OCR extras 与流水线初始化）")
 
     if a.server and rc == EXIT_OK:
-        client = ApiClient(a.server, a.token, params_url=a.params_url)
+        client = ApiClient(a.server, a.token, params_url=a.params_url, share=getattr(a, "share", ""))
         log("验证参数接口：%s" % client.params_url)
         try:
             p = params_mod.validate(client.get_params())
