@@ -3863,6 +3863,8 @@
     const syncCfgActionButtons = (configs) => {
       document.querySelectorAll("[data-netdisk-cfg-action]").forEach((btn) => {
         const cfgId = btn.getAttribute("data-config-id");
+        // 0040: 全量入口没有自己的 job 状态，保留自带文案，别被轮询改写成「重建索引」
+        if (String(cfgId) === "0") return;
         const cfg = (configs || []).find((c) => String(c.config_id) === String(cfgId));
         const status = cfg ? (cfg.job_status || "idle") : "idle";
         const running = status === "running" || status === "pending";
@@ -3889,9 +3891,13 @@
         const cfgId = btn.getAttribute("data-config-id");
         const cfgName = btn.getAttribute("data-config-name") || "该连接";
         const running = btn.getAttribute("data-running") === "1";
+        // 0040: config_id=0 是「全部连接」入口，确认文案要说清范围
+        const isAll = String(cfgId) === "0";
         const msg = running
           ? "确定终止「" + cfgName + "」所有分享的索引重建？"
-          : "确定重建「" + cfgName + "」绑定的所有分享的索引？";
+          : (isAll
+            ? "确定重建所有连接下全部分享的索引？"
+            : "确定重建「" + cfgName + "」绑定的所有分享的索引？");
         if (!window.confirm(msg)) return;
         btn.disabled = true;
         const original = btn.textContent;
@@ -3908,7 +3914,18 @@
           const resp = await fetch(url, { method: "POST", credentials: "same-origin", body: fd });
           const payload = await resp.json().catch(() => null);
           const ok = resp.ok || (payload && payload.code === 0);
-          showToast(ok ? (running ? "已请求终止该连接所有分享的索引重建" : "已为该连接加入重建队列") : "请求失败", ok ? "" : "error");
+          // 0040: code:0 只代表「请求被受理」；queued=0 时必须照服务端 msg 说真话，
+          // 不能再把「一个任务都没建」报成「已加入队列」。ok 判定一行不动。
+          const queuedN = payload && payload.data && typeof payload.data.queued === "number" ? payload.data.queued : -1;
+          if (!ok) {
+            showToast((payload && payload.msg) || "请求失败", "error");
+          } else if (running) {
+            showToast("已请求终止该连接所有分享的索引重建", "");
+          } else if (queuedN === 0) {
+            showToast((payload && payload.msg) || "本次未创建任何任务", "error");
+          } else {
+            showToast(isAll ? "已加入重建队列" : "已为该连接加入重建队列", "");
+          }
           if (ok) setTimeout(() => {
             const box = document.querySelector("[data-nd-reindex-status]");
             if (box && typeof box._ndPoll === "function") box._ndPoll();

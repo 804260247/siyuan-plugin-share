@@ -2701,8 +2701,11 @@ function netdisk_root_encode(string $uri): string {
         if ($i === 0 || $seg === '') {
             continue;
         }
-        if (preg_match('/[^\x20-\x7E]/', $seg) === 1 || strpos($seg, '&') !== false) {
-            $segs[$i] = rawurlencode($seg);
+        // 0040: 触发集扩到空格 / # / ?（段内出现即在 URL 里会被当成 query 或 fragment 截断）。
+        // 触发时必须先 rawurldecode 再 rawurlencode：段内可能已带 %E6 之类编码，直接编码会把 % 变成 %25，
+        // 既不幂等、又会让 Cloudreve 列错目录。字面 % 不在触发集内（无法与已编码串区分，主动编码会破坏幂等）。
+        if (preg_match('/[^\x21-\x7E]/', $seg) === 1 || strpbrk($seg, '&#?') !== false) {
+            $segs[$i] = rawurlencode(rawurldecode($seg));
         }
     }
     return $prefix . implode('/', $segs);
@@ -18302,6 +18305,12 @@ if ($path === '/admin') {
         }
         $content .= '</tbody></table></div>';
     }
+    // 0040: 「全部重建」入口 —— config_id=0 是后端既有的全量语义（不过滤），此前界面无任何按钮可触发，
+    // 于是 netdisk_config_id=0 的未绑定分享完全没有重建入口。此处复用同一事件处理器，不引入新参数。
+    $content .= '<div style="margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">';
+    $content .= '<button class="button ghost" type="button" data-netdisk-cfg-action data-config-id="0" data-config-name="全部连接" data-running="0">重建全部索引</button>';
+    $content .= '<span class="muted" style="font-size:0.75rem">重建所有已启用网盘连接的分享索引（含未绑定连接的分享）；该入口不带「强制重跑 OCR」，需要强制重跑请用上方各连接自己的按钮。</span>';
+    $content .= '</div>';
     $content .= '<div data-nd-reindex-status style="margin-top:14px"></div>';
     $content .= '</div>';
 
@@ -19602,10 +19611,21 @@ if ($path === '/admin/netdisk/reindex' && $_SERVER['REQUEST_METHOD'] === 'POST')
     $shares = db()->query('SELECT id, slug, title, netdisk_enabled, netdisk_config_id, netdisk_root, netdisk_permission FROM shares WHERE deleted_at IS NULL')->fetchAll(PDO::FETCH_ASSOC);
     $queued = 0;
     $skipped = 0;
+    // 0040: 范围外的分享不再静默丢弃——计数并回执，界面才能说真话（旧实现静默 continue，却回「已加入队列」）
+    $outOfScope = 0;
+    $outOfScopeShares = [];
     $runningReused = []; // 0030: 复用了 running 行的分享（本次并未新建任务）
     foreach ($shares as $s) {
         // 按连接过滤：指定 config_id 时，仅重建绑定该连接的分享
         if ($scopeConfigId > 0 && (int)($s['netdisk_config_id'] ?? 0) !== $scopeConfigId) {
+            $outOfScope++;
+            if (count($outOfScopeShares) < 20) {
+                $outOfScopeShares[] = [
+                    'id' => (int)($s['id'] ?? 0),
+                    'slug' => (string)($s['slug'] ?? ''),
+                    'config_id' => (int)($s['netdisk_config_id'] ?? 0),
+                ];
+            }
             continue;
         }
         $base = netdisk_share_config($s);
@@ -19624,13 +19644,22 @@ if ($path === '/admin/netdisk/reindex' && $_SERVER['REQUEST_METHOD'] === 'POST')
             $runningReused[] = ['slug' => (string)($s['slug'] ?? ''), 'job' => $jobId];
         }
     }
-    $resp = ['queued' => $queued, 'skipped' => $skipped];
-    if (!empty($runningReused)) {
+    $resp = ['queued' => $queued, 'skipped' => $skipped, 'out_of_scope' => $outOfScope, 'out_of_scope_shares' => $outOfScopeShares];
+    if ($queued > 0 && !empty($runningReused)) {
         $resp['running'] = $runningReused;
         $ids = array_map(static fn($x) => '#' . (int)$x['job'], $runningReused);
         $msg = '该连接已有任务在运行（job ' . implode('、', $ids) . '），本次未新建；如需按新配置重跑，请先点「终止索引」';
-    } else {
+    } elseif ($queued > 0) {
         $msg = $scopeConfigId > 0 ? '已为该连接绑定分享加入后台重建队列' : '已加入后台重建队列';
+    } elseif ($skipped > 0) {
+        // 0040: 范围内有分享但都没启用网盘 —— 不能再报「已加入队列」
+        $msg = '范围内共 ' . $skipped . ' 个分享未启用网盘（或连接不可用），本次未创建任何任务'
+            . ($outOfScope > 0 ? '；另有 ' . $outOfScope . ' 个分享绑定的是其它连接，已跳过' : '');
+    } elseif ($outOfScope > 0) {
+        // 0040: 全部落在所选连接范围之外 —— 旧实现静默 continue 后仍回「已加入后台重建队列」
+        $msg = '所选连接下没有绑定任何分享（' . $outOfScope . ' 个分享绑定的是其它连接），本次未创建任何任务';
+    } else {
+        $msg = '没有可重建的分享';
     }
     api_response(0, $resp, $msg);
 }
