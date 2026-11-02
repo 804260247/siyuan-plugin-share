@@ -3167,6 +3167,65 @@
     }
   };
 
+  // 根目录 URI：Cloudreve 的 path 原生 percent-encoded，存储与请求一律用编码态，
+  // 界面只做回显解码。逐段处理，段内的 %2F 不会被打散成层级分隔符。
+  const netdiskRootDecode = (value) => {
+    const raw = String(value == null ? "" : value).trim();
+    if (!raw) return "cloudreve://my";
+    return raw
+      .split("/")
+      .map((seg) => {
+        try {
+          return decodeURIComponent(seg);
+        } catch (err) {
+          return seg;
+        }
+      })
+      .join("/");
+  };
+  // 与 PHP netdisk_root_encode() 同口径：只有「含非 ASCII 或含裸 &」的段才编码，
+  // 已编码段原样返回（天然幂等）
+  const netdiskRootEncode = (value) => {
+    const raw = String(value == null ? "" : value).trim();
+    if (!raw) return "cloudreve://my";
+    let prefix = "";
+    let rest = raw;
+    if (rest.indexOf("cloudreve://") === 0) {
+      prefix = "cloudreve://";
+      rest = rest.slice(prefix.length);
+    }
+    const segs = rest.split("/");
+    return (
+      prefix +
+      segs
+        .map((seg, i) => {
+          if (i === 0 || seg === "") return seg;
+          if (/[^\x20-\x7E]/.test(seg) || seg.indexOf("&") >= 0) {
+            return encodeURIComponent(seg);
+          }
+          return seg;
+        })
+        .join("/")
+    );
+  };
+  // 按 URI 层级生成导航栈：每段一个面包屑，uri 逐级累加、name 解码后显示
+  const netdiskPickStackFrom = (uri) => {
+    const stack = [];
+    const scheme = "cloudreve://";
+    const raw = String(uri == null ? "" : uri).trim();
+    if (raw.indexOf(scheme) !== 0) return stack;
+    let acc = scheme;
+    raw
+      .slice(scheme.length)
+      .split("/")
+      .forEach((seg) => {
+        if (seg === "") return;
+        acc += (acc === scheme ? "" : "/") + seg;
+        stack.push({ uri: acc, name: netdiskRootDecode(seg) });
+      });
+    return stack;
+  };
+
   const initNetdiskRootPicker = () => {
     const btns = document.querySelectorAll("[data-netdisk-pick-root]");
     if (!btns.length) return;
@@ -3210,18 +3269,19 @@
       modalEl.querySelector("[data-netdisk-pick-confirm]").addEventListener("click", () => {
         const input = form.querySelector('input[name="default_root"]');
         if (input && currentUri) {
-          input.value = currentUri;
+          input.value = netdiskRootDecode(currentUri);
         }
         closeModal();
       });
       const current = (form.querySelector('input[name="default_root"]') || {}).value || "";
       // 初始：清空导航栈，default_root 为空或已是 my 前缀时从该处打开；否则从 my 根打开
       // （@share 等非 my 前缀的默认根直接列出可能为空，用户可通过面包屑回到 my 根选择）
-      pickStack = [];
-      let initial = current || "cloudreve://my";
+      let initial = netdiskRootEncode(current || "cloudreve://my");
       if (initial.indexOf("cloudreve://my") !== 0) {
         initial = "cloudreve://my";
       }
+      // 按初始 URI 逐段预填导航栈，弹窗一打开就有完整面包屑（不再只剩「根目录」）
+      pickStack = netdiskPickStackFrom(initial);
       loadFolders(btn, initial);
     };
     const closeModal = () => {
@@ -3260,7 +3320,13 @@
           pickStack.push({ uri: payload.data.current || uri || "", name: name });
         }
       }
-      currentUri = payload.data.current || "";
+      const serverUri = payload.data.current || "";
+      // 服务端因目录不可列会回落到别的目录，此时栈必须跟着改，
+      // 否则面包屑指向一个并不存在的深层路径
+      if (serverUri && uri && serverUri !== uri) {
+        pickStack = netdiskPickStackFrom(serverUri);
+      }
+      currentUri = serverUri;
       renderCrumbs(btn, payload.data);
       const folders = payload.data.folders || [];
       if (!folders.length) {
@@ -3697,7 +3763,7 @@
           pwd.required = false;
           pwd.placeholder = "留空表示不修改密码";
         }
-        set('input[name="default_root"]', btn.getAttribute("data-cfg-root") || "cloudreve://my");
+        set('input[name="default_root"]', netdiskRootDecode(btn.getAttribute("data-cfg-root") || "cloudreve://my"));
         const en = form.querySelector('input[name="enabled"]');
         if (en) en.checked = btn.getAttribute("data-cfg-enabled") === "1";
         startEdit(btn, "[data-netdisk-cfg-form]", "[data-netdisk-cfg-toggle]", "config_id", btn.getAttribute("data-cfg-id"), "保存修改");

@@ -2666,6 +2666,48 @@ function netdisk_normalize_root(?string $root): string {
     return rtrim($root, '/');
 }
 
+// 根目录 URI 的显示/存储互转。Cloudreve 的 path 原生就是 percent-encoded，
+// 因此 cloudreve_configs.default_root 必须存编码态（前端 list / 前缀判权全靠它）；
+// 界面回显时才按 / 逐段解码成人可读路径，保存时再把非 ASCII 段编码回去。
+// 禁止整体 rawurldecode/rawurlencode：段内的 %2F 会被解成层级分隔符，破坏目录结构。
+function netdisk_root_display(string $uri): string {
+    $uri = trim($uri);
+    if ($uri === '') {
+        return netdisk_default_root_uri();
+    }
+    $parts = explode('/', $uri);
+    foreach ($parts as $i => $seg) {
+        $parts[$i] = rawurldecode($seg);
+    }
+    return implode('/', $parts);
+}
+
+// 逐段判断、不做整串开关：只有「含非 ASCII 字节」或「含裸 &」的段才编码，
+// 其余（含已编码段）原样拼接 —— 于是对已编码串幂等，字节不变。
+function netdisk_root_encode(string $uri): string {
+    $uri = trim($uri);
+    if ($uri === '') {
+        return netdisk_default_root_uri();
+    }
+    $prefix = '';
+    $rest = $uri;
+    if (strpos($uri, 'cloudreve://') === 0) {
+        $prefix = 'cloudreve://';
+        $rest = substr($uri, strlen($prefix));
+    }
+    $segs = explode('/', $rest);
+    foreach ($segs as $i => $seg) {
+        // 第 0 段是 scheme 段（my / xxx@share），整体跳过，编码会把 @ 变成 %40
+        if ($i === 0 || $seg === '') {
+            continue;
+        }
+        if (preg_match('/[^\x20-\x7E]/', $seg) === 1 || strpos($seg, '&') !== false) {
+            $segs[$i] = rawurlencode($seg);
+        }
+    }
+    return $prefix . implode('/', $segs);
+}
+
 function cloudreve_list_folder(array $cfg, string $uri): ?array {
     $resp = cloudreve_api($cfg, 'GET', '/file?uri=' . rawurlencode($uri) . '&page_size=1000&order_by=name&order_direction=asc');
     if (!$resp || (int)($resp['code'] ?? 1) !== 0) {
@@ -7242,10 +7284,10 @@ function netdisk_test_connection(array $cfg): array {
     $root = netdisk_normalize_root((string)($cfg['default_root'] ?? ''));
     $data = cloudreve_list_folder($cfg, $root);
     if ($data === null) {
-        return ['ok' => false, 'message' => '连接成功，但无法访问根目录「' . $root . '」'];
+        return ['ok' => false, 'message' => '连接成功，但无法访问根目录「' . netdisk_root_display($root) . '」'];
     }
     $count = count($data['files'] ?? []);
-    return ['ok' => true, 'message' => '连接成功，根目录「' . $root . '」可访问，共 ' . $count . ' 项'];
+    return ['ok' => true, 'message' => '连接成功，根目录「' . netdisk_root_display($root) . '」可访问，共 ' . $count . ' 项'];
 }
 
 // ============================================================
@@ -17893,7 +17935,9 @@ if ($path === '/admin') {
             $cfgName = htmlspecialchars((string)($cfg['name'] ?? ''));
             $cfgBase = htmlspecialchars((string)($cfg['base_url'] ?? ''));
             $cfgEmail = htmlspecialchars((string)($cfg['email'] ?? ''));
-            $cfgRoot = htmlspecialchars((string)($cfg['default_root'] ?? 'cloudreve://my'));
+            // 存储值（编码态）供编辑按钮回填，显示值（逐段解码）供表格与输入框回显
+            $cfgRootStore = htmlspecialchars((string)($cfg['default_root'] ?? 'cloudreve://my'));
+            $cfgRoot = htmlspecialchars(netdisk_root_display((string)($cfg['default_root'] ?? 'cloudreve://my')));
             $cfgEnabled = (int)($cfg['enabled'] ?? 0) === 1;
             $cfgState = $cfgEnabled ? '启用' : '停用';
             $content .= '<tr>';
@@ -17908,7 +17952,7 @@ if ($path === '/admin') {
             $content .= '<input type="hidden" name="config_id" value="' . (int)$cfg['id'] . '">';
             $content .= '<button class="button" type="submit">测试连接</button>';
             $content .= '</form>';
-            $content .= '<button class="button" type="button" data-cfg-edit data-cfg-id="' . (int)$cfg['id'] . '" data-cfg-name="' . $cfgName . '" data-cfg-base="' . $cfgBase . '" data-cfg-email="' . $cfgEmail . '" data-cfg-root="' . htmlspecialchars($cfgRoot) . '" data-cfg-enabled="' . ($cfgEnabled ? '1' : '0') . '">编辑</button>';
+            $content .= '<button class="button" type="button" data-cfg-edit data-cfg-id="' . (int)$cfg['id'] . '" data-cfg-name="' . $cfgName . '" data-cfg-base="' . $cfgBase . '" data-cfg-email="' . $cfgEmail . '" data-cfg-root="' . $cfgRootStore . '" data-cfg-enabled="' . ($cfgEnabled ? '1' : '0') . '">编辑</button>';
             $content .= '<form method="post" action="' . base_path() . '/admin/netdisk/config/delete" class="inline-form" data-confirm-message="确定删除该 Cloudreve 连接配置？其绑定的分享网盘将失效。">';
             $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
             $content .= '<input type="hidden" name="config_id" value="' . (int)$cfg['id'] . '">';
@@ -17931,10 +17975,13 @@ if ($path === '/admin') {
     $cfgFormEmail = $editCfg ? (string)$editCfg['email'] : '';
     $cfgFormRoot = $editCfg ? (string)$editCfg['default_root'] : 'cloudreve://my';
     $cfgFormEnabled = !$editCfg || (int)$editCfg['enabled'] === 1;
+    $cfgFormViewerId = $editCfg ? (string)($editCfg['viewer_id'] ?? '') : '';
     $content .= '<button class="button ghost" type="button" data-netdisk-cfg-toggle style="margin-top:12px">' . ($editCfg ? '正在编辑连接' : '新增连接') . '</button>';
     $content .= '<div data-netdisk-cfg-form' . ($editCfg ? '' : ' hidden') . '>';
     $content .= '<form method="post" action="' . base_path() . '/admin/netdisk/config/save" style="margin-top:12px" class="card-sub-form">';
     $content .= '<input type="hidden" name="csrf" value="' . csrf_token() . '">';
+    // viewer_id 只在此隐藏域里往返：没有输入框，save 端「POST 为空则保留旧值」
+    $content .= '<input type="hidden" name="viewer_id" value="' . htmlspecialchars($cfgFormViewerId) . '">';
     if ($editCfg) {
         $content .= '<input type="hidden" name="config_id" value="' . (int)$editCfg['id'] . '">';
         $content .= '<div class="muted" style="margin-bottom:8px">正在编辑配置「' . htmlspecialchars($cfgFormName) . '」（ID ' . (int)$editCfg['id'] . '）</div>';
@@ -17944,7 +17991,7 @@ if ($path === '/admin') {
     $content .= '<div><label>Cloudreve 网盘地址</label><input class="input" name="base_url" placeholder="https://cloud.example.com" required value="' . htmlspecialchars($cfgFormBase) . '"></div>';
     $content .= '<div><label>服务账号邮箱</label><input class="input" name="email" placeholder="用于 API 登录" required value="' . htmlspecialchars($cfgFormEmail) . '"></div>';
     $content .= '<div><label>服务账号密码</label><input class="input" type="password" name="password" autocomplete="new-password" placeholder="' . ($editCfg ? '留空表示不修改密码' : '') . '"' . ($editCfg ? '' : ' required') . ' value=""></div>';
-    $content .= '<div><label>默认分享根目录 URI</label><div class="netdisk-root-pick"><input class="input" name="default_root" id="netdisk-default-root" placeholder="cloudreve://my 或 cloudreve://my/目录" value="' . htmlspecialchars($cfgFormRoot) . '"><button class="button ghost" type="button" data-netdisk-pick-root>选择目录</button></div></div>';
+    $content .= '<div><label>默认分享根目录 URI</label><div class="netdisk-root-pick"><input class="input" name="default_root" id="netdisk-default-root" placeholder="cloudreve://my 或 cloudreve://my/目录" value="' . htmlspecialchars(netdisk_root_display($cfgFormRoot)) . '"><button class="button ghost" type="button" data-netdisk-pick-root>选择目录</button></div></div>';
     $content .= '</div>';
     // ===== 连接级全文索引配置（留空 = 使用全局默认） =====
     $cfgIndexVals = $editCfg ? [
@@ -18875,8 +18922,9 @@ if ($path === '/admin/netdisk/config/save' && $_SERVER['REQUEST_METHOD'] === 'PO
     $baseUrl = rtrim(trim((string)($_POST['base_url'] ?? '')), '/');
     $email = trim((string)($_POST['email'] ?? ''));
     $password = (string)($_POST['password'] ?? '');
-    $viewerId = '';
-    $defaultRoot = netdisk_normalize_root((string)($_POST['default_root'] ?? 'cloudreve://my'));
+    $viewerId = trim((string)($_POST['viewer_id'] ?? ''));
+    // 输入框回显的是解码后的可读路径，落库前统一编码回 Cloudreve 的 path 口径
+    $defaultRoot = netdisk_root_encode(netdisk_normalize_root((string)($_POST['default_root'] ?? 'cloudreve://my')));
     $officeEngine = trim((string)($_POST['office_engine'] ?? 'auto'));
     if (!in_array($officeEngine, ['auto', 'collabora', 'onlyoffice'], true)) {
         $officeEngine = 'auto';
@@ -18932,6 +18980,10 @@ if ($path === '/admin/netdisk/config/save' && $_SERVER['REQUEST_METHOD'] === 'PO
         if (!$existing) {
             flash('error', '配置不存在');
             redirect('/admin#netdisk');
+        }
+        if ($viewerId === '') {
+            // 旧库没有表单入口时不会带上来，保留已存的 viewer_id，避免保存一次就清空
+            $viewerId = (string)($existing['viewer_id'] ?? '');
         }
         if ($password === '') {
             $password = (string)$existing['password'];
@@ -19013,27 +19065,40 @@ if ($path === '/admin/netdisk/config/test' && $_SERVER['REQUEST_METHOD'] === 'PO
     require_admin();
     check_csrf();
     $configId = (int)($_POST['config_id'] ?? 0);
-    $cfg = null;
-    if ($configId > 0) {
-        $cfg = cloudreve_config_get($configId);
+    $storedCfg = $configId > 0 ? cloudreve_config_get($configId) : null;
+    // 表单值优先、缺失才回退数据库：编辑态即使尚未保存，也要测到当前输入（含根目录）
+    $baseUrl = rtrim(trim((string)($_POST['base_url'] ?? '')), '/');
+    if ($baseUrl === '' && $storedCfg) {
+        $baseUrl = rtrim((string)($storedCfg['base_url'] ?? ''), '/');
     }
-    if (!$cfg) {
-        // 新增连接测试：用表单实时填写的连接信息构造临时配置
-        $baseUrl = rtrim(trim((string)($_POST['base_url'] ?? '')), '/');
-        $email = trim((string)($_POST['email'] ?? ''));
-        $password = (string)($_POST['password'] ?? '');
-        $viewerId = trim((string)($_POST['viewer_id'] ?? ''));
-        if ($baseUrl === '' || $email === '') {
-            api_response(400, null, '请先填写网盘地址与服务账号');
-        }
-        $cfg = [
-            'id' => 0,
-            'base_url' => $baseUrl,
-            'email' => $email,
-            'password' => $password,
-            'viewer_id' => $viewerId,
-        ];
+    $email = trim((string)($_POST['email'] ?? ''));
+    if ($email === '' && $storedCfg) {
+        $email = (string)($storedCfg['email'] ?? '');
     }
+    $password = (string)($_POST['password'] ?? '');
+    if ($password === '' && $storedCfg) {
+        $password = (string)($storedCfg['password'] ?? '');
+    }
+    $viewerId = trim((string)($_POST['viewer_id'] ?? ''));
+    if ($viewerId === '' && $storedCfg) {
+        $viewerId = (string)($storedCfg['viewer_id'] ?? '');
+    }
+    $rootRaw = trim((string)($_POST['default_root'] ?? ''));
+    if ($rootRaw === '' && $storedCfg) {
+        $rootRaw = (string)($storedCfg['default_root'] ?? '');
+    }
+    if ($baseUrl === '' || $email === '') {
+        api_response(400, null, '请先填写网盘地址与服务账号');
+    }
+    // 表单里的根目录可能是解码后的可读路径，落库口径统一走编码态
+    $cfg = [
+        'id' => $configId,
+        'base_url' => $baseUrl,
+        'email' => $email,
+        'password' => $password,
+        'viewer_id' => $viewerId,
+        'default_root' => netdisk_root_encode(netdisk_normalize_root($rootRaw)),
+    ];
     $result = netdisk_test_connection($cfg);
     if ($result['ok']) {
         api_response(200, ['message' => $result['message']]);
@@ -19089,26 +19154,40 @@ if ($path === '/admin/netdisk/folders' && $_SERVER['REQUEST_METHOD'] === 'POST')
     check_csrf();
     $configId = (int)($_POST['config_id'] ?? 0);
     $uri = trim((string)($_POST['uri'] ?? ''));
-    $cfg = null;
-    if ($configId > 0) {
-        $cfg = cloudreve_config_get($configId);
+    $storedCfg = $configId > 0 ? cloudreve_config_get($configId) : null;
+    // 与「测试连接」同口径：表单值优先、缺失回退数据库；default_root 必须带上，
+    // 否则 uri 为空时回落 cloudreve://my，选择器永远只能看到网盘根目录
+    $baseUrl = rtrim(trim((string)($_POST['base_url'] ?? '')), '/');
+    if ($baseUrl === '' && $storedCfg) {
+        $baseUrl = rtrim((string)($storedCfg['base_url'] ?? ''), '/');
     }
-    if (!$cfg) {
-        $baseUrl = rtrim(trim((string)($_POST['base_url'] ?? '')), '/');
-        $email = trim((string)($_POST['email'] ?? ''));
-        $password = (string)($_POST['password'] ?? '');
-        $viewerId = trim((string)($_POST['viewer_id'] ?? ''));
-        if ($baseUrl === '' || $email === '') {
-            api_response(400, null, '请先在表单填写网盘地址与服务账号');
-        }
-        $cfg = [
-            'id' => 0,
-            'base_url' => $baseUrl,
-            'email' => $email,
-            'password' => $password,
-            'viewer_id' => $viewerId,
-        ];
+    $email = trim((string)($_POST['email'] ?? ''));
+    if ($email === '' && $storedCfg) {
+        $email = (string)($storedCfg['email'] ?? '');
     }
+    $password = (string)($_POST['password'] ?? '');
+    if ($password === '' && $storedCfg) {
+        $password = (string)($storedCfg['password'] ?? '');
+    }
+    $viewerId = trim((string)($_POST['viewer_id'] ?? ''));
+    if ($viewerId === '' && $storedCfg) {
+        $viewerId = (string)($storedCfg['viewer_id'] ?? '');
+    }
+    $rootRaw = trim((string)($_POST['default_root'] ?? ''));
+    if ($rootRaw === '' && $storedCfg) {
+        $rootRaw = (string)($storedCfg['default_root'] ?? '');
+    }
+    if ($baseUrl === '' || $email === '') {
+        api_response(400, null, '请先在表单填写网盘地址与服务账号');
+    }
+    $cfg = [
+        'id' => $configId,
+        'base_url' => $baseUrl,
+        'email' => $email,
+        'password' => $password,
+        'viewer_id' => $viewerId,
+        'default_root' => netdisk_root_encode(netdisk_normalize_root($rootRaw)),
+    ];
     if ($uri === '') {
         $uri = netdisk_normalize_root((string)($cfg['default_root'] ?? 'cloudreve://my'));
     }

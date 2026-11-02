@@ -78,6 +78,12 @@
 - [x] apt 源不可达时支持 `OCR_APT_MIRROR` 切换 Debian 镜像源，修 OCR sidecar 装系统库时 `apt-get update` 全量超时（用户 NAS 实测 `deb.debian.org:80` 不通、日志刷 200+ 行 `Err: Unable to connect` 后 `[ocr-init] FATAL`）：compose 新增 `OCR_APT_MIRROR` 环境变量透传，非空时自动把 `deb.debian.org` / `security.debian.org` 替换为该镜像主机名（deb822 的 `/etc/apt/sources.list.d/debian.sources` 与旧版 `/etc/apt/sources.list` 两种格式都处理，重写前备份 `.bak-ocr`），如 `mirrors.aliyun.com`；`apt-get update` 单独判 rc 快速失败并提示设置该变量，所有 apt 命令加 `Acquire::http(s)::Timeout=15` 与 `Acquire::Retries=3` 不再干等；glib 包名改为 `apt-cache policy` 按 Candidate 探测自适应（trixie 用 `libglib2.0-0t64`、旧版用 `libglib2.0-0`），一条 install 装齐不再先失败再回退
 - [x] pip 源配置改为环境变量驱动并加持久缓存，修 OCR sidecar 装依赖时官方 CDN 慢速 `ReadTimeoutError`（用户 NAS 实测 `paddlepaddle` 192 MB 下到 95 MB、速率仅 13 kB/s 超时）：`OCR_PIP_INDEX` 改经 `PIP_INDEX_URL`/`PIP_TRUSTED_HOST` 导出（`paddlex --install serving` 内部自调 pip 子进程，只继承环境变量、不接受命令行传参，原 `-i` 方案对其无效）；新增 `OCR_PIP_TIMEOUT`（默认 120 秒，替代 pip 自带 15 秒）与 `OCR_PIP_RETRIES`（默认 5 次）并 compose 透传；pip 缓存目录移到模型卷内（`$PADDLEX_HOME/pip-cache`，去掉 `--no-cache-dir`），重建容器不再重下已下载的 wheel；pip install / paddlex --install 失败均输出 `[ocr-init] FATAL` 并提示设置 `OCR_PIP_INDEX`，不再靠 `set -e` 沉默退出
 
+- [x] 修复根目录 URI 在管理端被原样显示成 `%E7%9F%A5%E8%AF%86` 编码串：Cloudreve 的 `path` 原生就是 percent-encoded，`cloudreve_configs.default_root` 存编码态才是对的（`/file?uri=` 与索引前缀判权都依赖它），过去的做法是把库值原样塞进表格列与输入框。新增 `netdisk_root_display()`，走「按 `/` 分段、逐段 `rawurldecode`」拼回人可读路径（不做整体 `rawurldecode`，避免段内的 `%2F` 被打散成层级），只用于表格「默认根目录」列、表单输入框与「测试连接」回执文案；数据库值一个字不改，`netdisk_normalize_root()` 及其 18 个调用点零改动
+- [x] 修复在根目录输入框里手工粘贴中文/裸 `&` 会存成坏值：新增 `netdisk_root_encode()`，保存前**逐段**判断——只有「含非 ASCII 字节」或「含裸 `&`」的段才 `rawurlencode`，其余段（含已编码段）原样拼接，因此对已编码串幂等、字节不变（不需要「是否已编码」的启发式探测）；scheme 段（`my` / `xxx@share`）整体跳过，否则 `@` 会变 `%40`。配合上一项，界面显示解码路径、库里存编码路径，来回保存不漂移
+- [x] 修复「改完根目录点测试连接，提示里还是旧路径」：`/admin/netdisk/config/test` 编辑态原先只要 `config_id > 0` 就直接 `cloudreve_config_get()` 读库，POST 上来的 `base_url`/`email`/`password`/`viewer_id`/`default_root` 一个都不看；改为**表单值优先、缺失才回退数据库**（密码留空即用库内旧值），新增分支与 `/admin/netdisk/folders` 的临时 `$cfg` 都漏了 `default_root` 键（`?? ''` → 回落 `cloudreve://my`，于是选择目录永远只看到网盘根、测试也永远显示「根目录」），一并补齐
+- [x] 修复「选择目录」弹窗面包屑只剩一个写死的「根目录」：`app.js` 打开弹窗时无条件 `pickStack = []`，首次 `loadFolders()` 又不传 `name`，栈永远为空，`renderCrumbs()` 只画得出根节点。现按初始 URI 逐段生成栈（每段 `uri` 逐级累加、`name` 用 `netdiskRootDecode()` 解码显示），并在「服务端因目录不可列回落到别的目录」（`data.current` 与请求 uri 不一致）时按返回值重建栈。选中结果本身一直是对的，坏的只是面包屑与「根目录」按钮的落点
+- [x] 顺带修两处管理端连接配置的隐性丢值：① 连接表格「编辑」按钮的 `data-cfg-root` 存在二次 `htmlspecialchars`（`$cfgRoot` 在上一行已转义过），值里出现字面 `&` 时点「编辑」会把 `&amp;` 回填进输入框并被原样保存；现表格列用解码值、`data-cfg-root` 用存储值（各自单次转义）分开承载。② `/admin/netdisk/config/save` 原先把 `$viewerId = ''` 硬写成空串（表单里根本没有 `viewer_id` 输入框），每保存一次连接就把已存的 `viewer_id` 清空；现补隐藏域并在 save 端「POST 为空则保留旧值」，其它字段（尤其密码空值策略）语义一律不变
+
 ### 部署
 
 - [x] Dockerfile 增加 `supervisor`、`poppler-utils`、`tesseract-ocr` 及中英文语言包；`memory_limit` 1G、`max_execution_time` 0
@@ -93,6 +99,8 @@
 - 升级或修改网盘 root 后，`@share` 索引命中可能短暂隐藏，待 worker 重建别名缓存后恢复
 - 尚未在真实 Docker/NAS 环境完成构建验证；合并前需执行 `docker compose up -d --build` 并按验收清单逐项确认
 - 「强制重跑 OCR」勾选框已移入「配置」展开区：配置面板折叠时它不可见、勾不到，须先点「配置」展开——这是为压缩操作列做的有意取舍，不是缺陷；重建按钮的读取方式（`data-config-id`）与勾选框语义均未变
+- 根目录里若存在目录名含转义斜杠（`a%2Fb` 这种，正常文件系统不可能出现），显示层逐段解码后与两级目录同形，来回保存会被规范化成 `a/b`；属理论边界，不另加启发式探测
+- 编辑连接时若只改了密码，「测试连接」在旧 access token 仍有效期内会复用它而不重新登录，此时验证的是连接可达性而非新密码正确性（token 缓存行为与本次改动前一致）
 
 ## v0.5.6 2026-10-19
 
