@@ -5,9 +5,9 @@
 
 ---
 
-## 未发布（待验证）：Cloudreve 网盘扩展
+## v0.5.7 2026-11-03：Cloudreve 网盘扩展
 
-> 本节的改动位于分支 `feat/netdisk-cloudreve`，以 PR 形式提交，尚未合并、尚未发布；验证通过后再确定版本号。
+> 本节改动位于分支 `feat/netdisk-cloudreve`，以 PR #1 提交并已合并到 `main`，随 v0.5.7 发布。
 > 移植自 `siyuan-share-netdisk:fix-final` 镜像（基线：上游 v0.5.5 `263921d5`），并保留本仓库 v0.5.6 的全部分叉改动。
 
 ### 网盘接入与文件浏览
