@@ -1,0 +1,11 @@
+# Runtime deps (Python 3.11). ASCII only, English comments: on Chinese Windows pip
+# decodes requirement files with the system locale (cp936/GBK) unless a UTF-8 BOM is
+# present, so any non-ASCII byte here breaks `pip install -r` with
+# `UnicodeDecodeError: 'gbk' codec can't decode byte ...`. Do not add BOM instead.
+# Versions must match the NAS sidecar: paddlex[ocr]==3.0.3 + paddlepaddle==3.0.0
+# Rendering uses PyMuPDF (no poppler/pdftoppm needed on Windows); resizing uses Pillow
+paddlex[ocr]==3.0.3
+paddlepaddle==3.0.0
+PyMuPDF>=1.24,<2
+Pillow>=10,<13
+requests>=2.31

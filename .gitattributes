@@ -1,3 +1,9 @@
 # Shell scripts and Dockerfile heredocs break on CRLF (shebang, nginx conf)
 php-site/Dockerfile text eol=lf
 *.sh text eol=lf
+
+# Windows 专用脚本：必须按原字节入库（CRLF；build.ps1 另带 UTF-8 BOM）。
+# PowerShell 5.1 对纯 LF 文件的行尾续行解析不可靠，且无 BOM 时按系统代码页（中文 Windows 为 GBK）解码中文注释。
+# 用 -text 关掉任何换行归一化，保证任何平台 checkout 出来都是 CRLF。
+*.ps1 -text
+*.cmd -text

@@ -5,6 +5,11 @@ RUN set -eux; \
     apk add --no-cache \
         curl \
         nginx \
+        supervisor \
+        poppler-utils \
+        tesseract-ocr \
+        tesseract-ocr-data-chi_sim \
+        tesseract-ocr-data-eng \
         freetype \
         libjpeg-turbo \
         libpng \
@@ -37,13 +42,27 @@ COPY --chown=www-data:www-data php-site/ /var/www/html/
 RUN chmod -R a+rX /var/www/html
 
 # Configure PHP runtime limits
+# display_errors=Off + log_errors=On：生产页面不再泄露堆栈/绝对路径（上游镜像无 php.ini，
+# 内置默认 display_errors=1，SQLite 撞锁的 Fatal error 曾直接打给用户）。
 RUN set -eux; \
     { \
         echo "upload_max_filesize = 100M"; \
         echo "post_max_size = 100M"; \
-        echo "memory_limit = 256M"; \
-        echo "max_execution_time = 300"; \
-    } > /usr/local/etc/php/conf.d/uploads.ini
+        echo "memory_limit = 1G"; \
+        echo "max_execution_time = 0"; \
+        echo "display_errors = Off"; \
+        echo "log_errors = On"; \
+    } > /usr/local/etc/php/conf.d/uploads.ini; \
+    { \
+        echo ""; \
+        echo "; --- 错误可见性加固（随网盘扩展移植追加） ---"; \
+        echo "; worker stderr 交给 master，否则 error_log 会落到 /dev/null"; \
+        echo "catch_workers_output = yes"; \
+        echo "decorate_workers_output = no"; \
+        echo "php_admin_value[error_log] = /proc/self/fd/2"; \
+        echo "php_admin_flag[log_errors] = on"; \
+        echo "php_admin_flag[display_errors] = off"; \
+    } >> /usr/local/etc/php-fpm.d/www.conf
 
 # Configure nginx
 # user www-data：nginx worker 与 php-fpm 同 uid，宿主 clone 的 640/750 权限也不会挡住静态资源。
@@ -98,36 +117,19 @@ server {
 }
 SERVERCONF
 
+# Process supervisor: php-fpm + nginx + nd-worker（常驻索引/OCR Worker）
+COPY deploy/supervisord.conf /etc/supervisord.conf
+
 # Runtime entrypoint
 RUN cat > /usr/local/bin/docker-entrypoint.sh <<'ENTRYPOINT'
 #!/bin/sh
 set -eu
 
-mkdir -p /var/www/html/storage /var/www/html/uploads /run/nginx /var/lib/nginx/tmp /var/log/nginx
-chown -R www-data:www-data /var/www/html/storage /var/www/html/uploads
-chmod -R 775 /var/www/html/storage /var/www/html/uploads
+mkdir -p /var/www/html/storage /var/www/html/uploads /run/nginx /var/lib/nginx/tmp /var/log/nginx /var/log/supervisor /ocr
+chown -R www-data:www-data /var/www/html/storage /var/www/html/uploads /ocr
+chmod -R 775 /var/www/html/storage /var/www/html/uploads /ocr
 
-# Start both processes and keep their PIDs for signal forwarding.
-php-fpm --nodaemonize &
-FPM_PID=$!
-
-nginx -g 'daemon off;' &
-NGINX_PID=$!
-
-# Graceful shutdown handler for SIGTERM/SIGINT.
-_shutdown() {
-    kill -QUIT "$NGINX_PID" 2>/dev/null || true
-    kill -TERM "$FPM_PID" 2>/dev/null || true
-    wait "$NGINX_PID" "$FPM_PID" 2>/dev/null || true
-}
-trap '_shutdown; exit 0' TERM INT
-
-# Exit container if either process exits unexpectedly.
-while kill -0 "$NGINX_PID" 2>/dev/null && kill -0 "$FPM_PID" 2>/dev/null; do
-    sleep 5
-done
-_shutdown
-exit 1
+exec /usr/bin/supervisord -n -c /etc/supervisord.conf
 ENTRYPOINT
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

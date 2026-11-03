@@ -1,0 +1,2 @@
+# Build only (not needed at runtime). ASCII only -- see the header of requirements.txt
+pyinstaller>=6,<7
