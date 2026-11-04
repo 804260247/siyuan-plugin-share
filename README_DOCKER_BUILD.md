@@ -265,4 +265,5 @@ RUN docker-php-ext-install -j"$(nproc)" gd pdo pdo_sqlite zip opcache
 
 - [Docker 官方文档](https://docs.docker.com/)
 - [Docker Compose 文档](https://docs.docker.com/compose/)
-- [原项目 README](README.md)
+- [本仓库 README](README.md)
+- [原项目 README](https://github.com/b8l8u8e8/siyuan-plugin-share/blob/main/README.md)
