@@ -15,7 +15,7 @@
 > - 保姆级使用教程：[share.b0x.top/s/8c34c022](https://share.b0x.top/s/8c34c022)
 > - 服务端搭建教程：[飞书文档](https://ccnwc9xa9692.feishu.cn/wiki/MQCtwMtQaifPuak4zl3cIMCqnLx)
 >
-> 版权、赞赏码与 Star 均归原作者所有。
+> 版权、上游赞赏码与 Star 均归原作者所有；本仓库自己的赞助入口见下方「☕ 赞助支持」。
 
 ---
 
@@ -88,6 +88,18 @@
 - 当前版本见 [plugin.json](plugin.json) 的 `version` 字段
 - 发布包在 [Releases](https://github.com/804260247/siyuan-plugin-share/releases)：`package.zip`（思源插件包）、`php-site-vX.Y.Z.zip`（服务端包）
 - 服务端升级后需重建镜像：`docker compose up -d --build`；前端强缓存，浏览器 `Ctrl+Shift+R`
+
+---
+
+## ☕ 赞助支持
+
+网盘接入、全文索引 / OCR、PC 端 GPU 重建工具这些增强能力，都是维护者在业余时间开发和维护的。如果它帮你省下了时间，可以微信扫码请我喝杯咖啡：
+
+<img src="sponsor-wechat.png" width="240" alt="微信赞助收款码">
+
+- 赞助完全自愿，**不影响任何功能的可用性**，也不承诺专属支持或定制开发
+- 想留名可以在赞助后开一个 [Issue](https://github.com/804260247/siyuan-plugin-share/issues) 说明（金额、时间、想署的名字），我会补到名单里
+- 上游有自己的赞赏渠道，与本仓库无关；仓库里的 [sponsor-list.md](sponsor-list.md) 是从上游原样继承的文件，版权与 Star 仍归原作者
 
 ---
 

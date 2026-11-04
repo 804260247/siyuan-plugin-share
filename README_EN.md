@@ -15,7 +15,7 @@ The plugin is free and open-source. Core sharing features — **share links, acc
 > - Beginner tutorial: [share.b0x.top/s/8c34c022](https://share.b0x.top/s/8c34c022)
 > - Server setup guide: [Feishu doc](https://ccnwc9xa9692.feishu.cn/wiki/MQCtwMtQaifPuak4zl3cIMCqnLx)
 >
-> Copyright, donations and Stars belong to the original author.
+> Copyright, upstream donations and Stars belong to the original author; this fork has its own sponsorship section below.
 
 ---
 
@@ -88,6 +88,18 @@ This plugin is **not listed on the SiYuan marketplace** yet; install manually (o
 - Current version: `version` in [plugin.json](plugin.json)
 - Release artifacts in [Releases](https://github.com/804260247/siyuan-plugin-share/releases): `package.zip` (SiYuan plugin) and `php-site-vX.Y.Z.zip` (server)
 - Rebuild the image after upgrading the server: `docker compose up -d --build`; front-end assets are strongly cached, so hard-refresh with `Ctrl+Shift+R`
+
+---
+
+## ☕ Sponsor
+
+The netdisk integration, full-text index / OCR and the PC-side GPU OCR tool in this fork are built and maintained in the author's spare time. If it saved you time, you can buy me a coffee via WeChat Pay:
+
+<img src="sponsor-wechat.png" width="240" alt="WeChat Pay donation QR code">
+
+- Sponsorship is entirely optional and **unlocks no extra features**; no dedicated support or custom work is promised
+- To be listed, open an [issue](https://github.com/804260247/siyuan-plugin-share/issues) after donating with the amount, date and the name you want shown
+- Upstream has its own donation channel, unrelated to this fork; [sponsor-list.md](sponsor-list.md) is kept as inherited from upstream, and copyright and Stars remain with the original author
 
 ---
 
