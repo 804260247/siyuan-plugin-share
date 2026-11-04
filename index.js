@@ -28,6 +28,12 @@ const STORAGE_INCREMENTAL_CURSOR = "incrementalCursorBySite";
 const STORAGE_DOC_BLOCK_COUNTS = "docBlockCountBySite";
 const STORAGE_EXPORT_RETRY_CACHE_INDEX = "exportRetryCacheIndexBySite";
 const STORAGE_AUTO_UPDATE_RUNTIME = "autoUpdateRuntimeBySite";
+const GITHUB_REPO_SLUG = "804260247/siyuan-plugin-share";
+const GITHUB_UPSTREAM_SLUG = "b8l8u8e8/siyuan-plugin-share";
+const GITHUB_REPO_URL = `https://github.com/${GITHUB_REPO_SLUG}`;
+const GITHUB_UPSTREAM_URL = `https://github.com/${GITHUB_UPSTREAM_SLUG}`;
+const STAR_CACHE_TTL_MS = 10 * 60 * 1000;
+const SPONSOR_IMAGE_NAME = "sponsor-wechat.png";
 const DOCK_TYPE = "siyuan-plugin-share-dock";
 const MB = 1024 * 1024;
 const UPLOAD_CHUNK_MIN_SIZE = 256 * 1024;
@@ -2044,6 +2050,10 @@ class SiYuanSharePlugin extends Plugin {
       envHint: null,
     };
     this.settingLayoutObserver = null;
+    this.aboutWrap = null;
+    this.starCache = null;
+    this.starLoading = false;
+    this.starFailedAt = 0;
     this.isUnloading = false;
   }
 
@@ -4636,11 +4646,190 @@ class SiYuanSharePlugin extends Plugin {
     return true;
   }
 
+  getSponsorImagePath() {
+    const name = String(this.name || "siyuan-plugin-share").trim() || "siyuan-plugin-share";
+    return `/plugins/${name}/${SPONSOR_IMAGE_NAME}`;
+  }
+
+  getSponsorImageFallback() {
+    return `https://raw.githubusercontent.com/${GITHUB_REPO_SLUG}/main/${SPONSOR_IMAGE_NAME}`;
+  }
+
+  formatStarCount(count) {
+    const n = Number(count);
+    if (!Number.isFinite(n) || n < 0) return "";
+    if (n < 1000) return String(n);
+    const k = n / 1000;
+    return `${k >= 10 ? Math.round(k) : Math.round(k * 10) / 10}k`;
+  }
+
+  getStarLabel() {
+    const cache = this.starCache;
+    if (!cache || !Number.isFinite(Number(cache.stars))) {
+      return this.t("siyuanShare.about.starUnknown");
+    }
+    return this.t("siyuanShare.about.starCount", {count: this.formatStarCount(cache.stars)});
+  }
+
+  renderAbout() {
+    const wrap = this.settingEls?.aboutWrap;
+    if (!wrap) return;
+    const t = this.t.bind(this);
+    const starLabel = this.getStarLabel();
+    const loading = this.starLoading && !this.isStarCacheFresh() ? " sps-about__star--loading" : "";
+    wrap.innerHTML = `<div class="siyuan-plugin-share__section sps-about">
+  <div class="sps-about__row">
+    <button class="b3-button b3-button--outline sps-about__btn" data-action="about-star">⭐ ${escapeHtml(
+      starLabel,
+    )}</button>
+    <button class="b3-button b3-button--outline sps-about__btn" data-action="about-sponsor">☕ ${escapeHtml(
+      t("siyuanShare.about.sponsor"),
+    )}</button>
+    <button class="b3-button b3-button--text sps-about__btn${loading}" data-action="about-refresh-star">${escapeHtml(
+      t("siyuanShare.about.refreshStar"),
+    )}</button>
+  </div>
+  <div class="siyuan-plugin-share__muted sps-about__links">
+    <a href="${escapeAttr(GITHUB_REPO_URL)}" target="_blank" rel="noopener noreferrer">${escapeHtml(
+      t("siyuanShare.about.thisRepo"),
+    )}</a>
+    <span class="sps-about__sep">·</span>
+    <a href="${escapeAttr(GITHUB_UPSTREAM_URL)}" target="_blank" rel="noopener noreferrer">${escapeHtml(
+      t("siyuanShare.about.upstreamRepo"),
+    )}</a>
+  </div>
+  <div class="siyuan-plugin-share__muted sps-about__note">${escapeHtml(
+    t("siyuanShare.about.upstreamNote"),
+  )}</div>
+</div>`;
+  }
+
+  maybeLoadStarCount() {
+    const wrap = this.settingEls?.aboutWrap;
+    if (!wrap || !wrap.isConnected) return;
+    if (this.starLoading || this.isStarCacheFresh()) return;
+    if (this.starFailedAt && Date.now() - this.starFailedAt < 60 * 1000) return;
+    void this.refreshStarCount(false);
+  }
+
+  isStarCacheFresh() {
+    const cache = this.starCache;
+    if (!cache || !cache.fetchedAt) return false;
+    return Date.now() - Number(cache.fetchedAt) < STAR_CACHE_TTL_MS;
+  }
+
+  async refreshStarCount(force = false) {
+    if (!force && this.isStarCacheFresh()) {
+      this.renderAbout();
+      return;
+    }
+    if (this.starLoading) return;
+    this.starLoading = true;
+    this.renderAbout();
+    try {
+      const resp = await fetch(`https://api.github.com/repos/${GITHUB_REPO_SLUG}`, {
+        method: "GET",
+        headers: {Accept: "application/vnd.github+json"},
+      });
+      if (!resp.ok) throw new Error(`status ${resp.status}`);
+      const data = await resp.json();
+      const stars = Number(data?.stargazers_count);
+      if (!Number.isFinite(stars)) throw new Error("invalid payload");
+      this.starCache = {stars, fetchedAt: Date.now()};
+      this.starFailedAt = 0;
+    } catch (err) {
+      // 静默降级：网络不通/被限流时保留旧值，不打扰用户
+      this.starFailedAt = Date.now();
+      if (force) this.notify(this.t("siyuanShare.about.starFailed"));
+      console.warn("[siyuan-share] fetch star count failed", err);
+    } finally {
+      this.starLoading = false;
+      this.renderAbout();
+    }
+  }
+
+  openSponsorDialog() {
+    const t = this.t.bind(this);
+    const content = `<div class="b3-dialog__content sps-sponsor-dialog">
+  <div class="sps-sponsor__intro">${escapeHtml(t("siyuanShare.about.sponsorIntro"))}</div>
+  <div class="sps-sponsor__qr">
+    <img src="${escapeAttr(
+      this.getSponsorImagePath(),
+    )}" data-fallback="${escapeAttr(this.getSponsorImageFallback())}" alt="${escapeAttr(
+      t("siyuanShare.about.sponsorQrAlt"),
+    )}" />
+  </div>
+  <ul class="sps-sponsor__notes">
+    <li>${escapeHtml(t("siyuanShare.about.sponsorNote1"))}</li>
+    <li>${escapeHtml(t("siyuanShare.about.sponsorNote2"))}</li>
+    <li>${escapeHtml(t("siyuanShare.about.sponsorNote3"))}</li>
+  </ul>
+</div>
+<div class="b3-dialog__action">
+  <div class="fn__space"></div>
+  <button class="b3-button b3-button--text" data-action="close">${escapeHtml(
+    t("siyuanShare.action.close"),
+  )}</button>
+</div>`;
+    let dlg = null;
+    dlg = new Dialog({
+      title: t("siyuanShare.about.sponsorTitle"),
+      content,
+      width: "min(460px, 92vw)",
+    });
+    dlg.element?.classList?.add("sps-sponsor-dialog-shell");
+    const qrImg = dlg.element?.querySelector?.(".sps-sponsor__qr img");
+    if (qrImg) {
+      // 旧版本插件包里没有这张图时，回退到仓库 raw 地址
+      qrImg.addEventListener("error", () => {
+        const fallback = qrImg.getAttribute("data-fallback") || "";
+        if (!fallback || qrImg.dataset.fallbackTried === "1") return;
+        qrImg.dataset.fallbackTried = "1";
+        qrImg.src = fallback;
+      });
+    }
+    dlg.element?.addEventListener?.("click", (event) => {
+      if (event.target.closest("[data-action='close']")) dlg?.destroy();
+    });
+  }
+
+  onSettingAboutClick = (event) => {
+    const btn = event.target.closest("[data-action]");
+    if (!btn) return;
+    const action = btn.getAttribute("data-action");
+    if (action === "about-star") {
+      const url = this.starCache?.html_url || GITHUB_REPO_URL;
+      this.openExternalUrl(url);
+      return;
+    }
+    if (action === "about-sponsor") {
+      this.openSponsorDialog();
+      return;
+    }
+    if (action === "about-refresh-star") {
+      void this.refreshStarCount(true);
+    }
+  };
+
+  openExternalUrl(url) {
+    try {
+      if (typeof window !== "undefined" && window?.open) {
+        window.open(url, "_blank", "noopener,noreferrer");
+        return;
+      }
+    } catch {
+      // ignore
+    }
+    this.notify(url);
+  }
+
   applySettingWideLayout() {
-    const {currentWrap, sharesWrap, siteInput, apiKeyInput} = this.settingEls || {};
+    const {currentWrap, sharesWrap, aboutWrap, siteInput, apiKeyInput} = this.settingEls || {};
     this.makeSettingRowFullWidth(currentWrap);
     this.makeSettingRowFullWidth(sharesWrap);
-    const anyEl = siteInput || apiKeyInput || currentWrap || sharesWrap;
+    this.makeSettingRowFullWidth(aboutWrap);
+    this.maybeLoadStarCount();
+    const anyEl = siteInput || apiKeyInput || currentWrap || sharesWrap || aboutWrap;
     if (anyEl?.isConnected) {
       const dialogBody = anyEl.closest(".b3-dialog__body");
       if (dialogBody && !dialogBody.classList.contains("sps-settings-body")) {
@@ -5900,6 +6089,10 @@ class SiYuanSharePlugin extends Plugin {
     const envHint = document.createElement("div");
     envHint.className = "siyuan-plugin-share__muted sps-setting-hint";
 
+    const aboutWrap = document.createElement("div");
+    aboutWrap.className = "siyuan-plugin-share sps-about-wrap";
+    aboutWrap.addEventListener("click", this.onSettingAboutClick);
+
     this.settingEls = {
       siteInput,
       apiKeyInput,
@@ -5912,6 +6105,7 @@ class SiYuanSharePlugin extends Plugin {
       currentWrap,
       sharesWrap,
       envHint,
+      aboutWrap,
     };
 
     this.setting = new Setting({
@@ -5999,6 +6193,14 @@ class SiYuanSharePlugin extends Plugin {
       createActionElement: () => sharesWrap,
     });
 
+    this.setting.addItem({
+      title: t("siyuanShare.label.about"),
+      description: t("siyuanShare.hint.about"),
+      direction: "column",
+      createActionElement: () => aboutWrap,
+    });
+
+    this.renderAbout();
     this.syncSettingInputs();
     this.renderSettingCurrent();
     this.renderSettingShares();

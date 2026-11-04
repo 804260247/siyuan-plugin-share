@@ -242,5 +242,21 @@
   "siyuanShare.title.autoUpdateQueue": "队列",
   "siyuanShare.title.autoUpdateQuiet": "静默",
   "siyuanShare.title.autoUpdateRetry": "重试",
-  "siyuanShare.title.autoUpdateHistory": "历史"
+  "siyuanShare.title.autoUpdateHistory": "历史",
+  "siyuanShare.label.about": "关于与赞助",
+  "siyuanShare.hint.about": "给本仓库点星、查看赞助方式与仓库链接。",
+  "siyuanShare.about.starCount": "Star {count}",
+  "siyuanShare.about.starUnknown": "Star",
+  "siyuanShare.about.starFailed": "获取 Star 数失败，请检查网络后重试。",
+  "siyuanShare.about.sponsor": "赞助支持",
+  "siyuanShare.about.refreshStar": "刷新 Star",
+  "siyuanShare.about.sponsorTitle": "赞助支持",
+  "siyuanShare.about.sponsorIntro": "网盘接入、全文索引 / OCR、PC 端 GPU 重建工具都是业余时间开发和维护的。如果它帮你省下了时间，可以微信扫码请我喝杯咖啡：",
+  "siyuanShare.about.sponsorQrAlt": "微信赞助收款码",
+  "siyuanShare.about.sponsorNote1": "赞助完全自愿，不影响任何功能的可用性，也不承诺专属支持或定制开发。",
+  "siyuanShare.about.sponsorNote2": "想留名可以赞助后在 GitHub 开 Issue 说明金额、时间和署名。",
+  "siyuanShare.about.sponsorNote3": "上游有自己的赞赏渠道，与本仓库无关；版权与 Star 仍归原作者。",
+  "siyuanShare.about.thisRepo": "本仓库",
+  "siyuanShare.about.upstreamRepo": "上游原仓库",
+  "siyuanShare.about.upstreamNote": "本插件基于上游 siyuan-plugin-share 增强，基础分享能力来自原作者。"
 }

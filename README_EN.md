@@ -95,11 +95,13 @@ This plugin is **not listed on the SiYuan marketplace** yet; install manually (o
 
 The netdisk integration, full-text index / OCR and the PC-side GPU OCR tool in this fork are built and maintained in the author's spare time. If it saved you time, you can buy me a coffee via WeChat Pay:
 
-<img src="sponsor-wechat.png" width="240" alt="WeChat Pay donation QR code">
+<p align="center">
+  <img src="sponsor-wechat.png" width="240" alt="WeChat Pay donation QR code">
+</p>
 
 - Sponsorship is entirely optional and **unlocks no extra features**; no dedicated support or custom work is promised
 - To be listed, open an [issue](https://github.com/804260247/siyuan-plugin-share/issues) after donating with the amount, date and the name you want shown
-- Upstream has its own donation channel, unrelated to this fork; [sponsor-list.md](sponsor-list.md) is kept as inherited from upstream, and copyright and Stars remain with the original author
+- See [sponsor-list.md](sponsor-list.md) for this fork's own sponsor list (unrelated to the upstream list); upstream has its own donation channel, and copyright and Stars remain with the original author
 
 ---
 

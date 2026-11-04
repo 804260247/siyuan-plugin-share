@@ -242,5 +242,21 @@
   "siyuanShare.title.shareListCount": "Share list ({count})",
   "siyuanShare.title.shareManagement": "Share management",
   "siyuanShare.qr.title": "Share QR Code",
-  "siyuanShare.qr.download": "Download QR Code"
+  "siyuanShare.qr.download": "Download QR Code",
+  "siyuanShare.label.about": "About & Sponsor",
+  "siyuanShare.hint.about": "Star this fork, find the sponsor entry and repository links.",
+  "siyuanShare.about.starCount": "Star {count}",
+  "siyuanShare.about.starUnknown": "Star",
+  "siyuanShare.about.starFailed": "Failed to load the star count. Check your network and retry.",
+  "siyuanShare.about.sponsor": "Sponsor",
+  "siyuanShare.about.refreshStar": "Refresh stars",
+  "siyuanShare.about.sponsorTitle": "Sponsor",
+  "siyuanShare.about.sponsorIntro": "The netdisk integration, full-text index / OCR and the PC-side GPU OCR tool are built in the author's spare time. If it saved you time, you can buy me a coffee via WeChat Pay:",
+  "siyuanShare.about.sponsorQrAlt": "WeChat Pay donation QR code",
+  "siyuanShare.about.sponsorNote1": "Sponsorship is entirely optional, unlocks no extra features, and promises no dedicated support or custom work.",
+  "siyuanShare.about.sponsorNote2": "To be listed, open a GitHub issue after donating with the amount, date and the name you want shown.",
+  "siyuanShare.about.sponsorNote3": "Upstream has its own donation channel unrelated to this fork; copyright and Stars remain with the original author.",
+  "siyuanShare.about.thisRepo": "This repository",
+  "siyuanShare.about.upstreamRepo": "Upstream repository",
+  "siyuanShare.about.upstreamNote": "This plugin enhances upstream siyuan-plugin-share; the base sharing features come from the original author."
 }
