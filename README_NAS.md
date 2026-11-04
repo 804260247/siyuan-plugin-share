@@ -140,6 +140,9 @@ docker-compose -f docker-compose.nas.yml restart
 
 ## OCR 启用（可选，网盘全文索引高精度识别）
 
+> PC 端本地 OCR 与结果回传、重建复用的完整操作指引见 [README_OCR_REBUILD_WIN.md](README_OCR_REBUILD_WIN.md)。
+
+
 网盘全文索引默认使用镜像内置的 `tesseract`（开箱即用，无需额外配置）。如需更高精度的中文 OCR（PaddleX serving），按以下步骤启用：
 
 ### 1. 打开 web 侧开关
