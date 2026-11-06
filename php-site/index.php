@@ -2711,12 +2711,74 @@ function netdisk_root_encode(string $uri): string {
     return $prefix . implode('/', $segs);
 }
 
+// P6b: 解析 /file 响应的分页信息（Cloudreve v4 data.pagination = {page,page_size,total}）。
+// 老版本不返回该字段时返回 null，调用方按「单页即全部」处理——行为与旧实现完全一致。
+function cloudreve_folder_pagination(array $data): ?array {
+    if (!isset($data['pagination']) || !is_array($data['pagination'])) {
+        return null;
+    }
+    $sz = (int)($data['pagination']['page_size'] ?? 0);
+    if ($sz <= 0) {
+        return null;
+    }
+    return [
+        'page' => max(1, (int)($data['pagination']['page'] ?? 1)),
+        'page_size' => $sz,
+        'total' => max(0, (int)($data['pagination']['total'] ?? 0)),
+    ];
+}
+
+// P6b: 还需补取的页码（最多 20 页保护）。单页足够时返回空数组 = 零额外请求。
+function cloudreve_folder_next_pages(array $data, int $maxPages = 20): array {
+    $pg = cloudreve_folder_pagination($data);
+    if ($pg === null) {
+        return [];
+    }
+    $got = isset($data['files']) && is_array($data['files']) ? count($data['files']) : 0;
+    if ($pg['total'] <= $got || $pg['total'] <= $pg['page'] * $pg['page_size']) {
+        return [];
+    }
+    $out = [];
+    $lastPage = (int)ceil($pg['total'] / $pg['page_size']);
+    for ($i = $pg['page'] + 1; $i <= min($lastPage, $maxPages); $i++) {
+        $out[] = $i;
+    }
+    if ($lastPage > $maxPages) {
+        @error_log('[nd-index] folder pagination truncated at ' . $maxPages . ' pages total=' . $pg['total']);
+    }
+    return $out;
+}
+
+// P6b: 取指定页的目录内容（供翻页补取；第 1 页仍走原入口）
+function cloudreve_list_folder_page(array $cfg, string $uri, int $page): ?array {
+    $resp = cloudreve_api($cfg, 'GET', '/file?uri=' . rawurlencode($uri) . '&page_size=1000&page=' . max(1, $page)
+        . '&order_by=name&order_direction=asc');
+    if (!$resp || (int)($resp['code'] ?? 1) !== 0) {
+        return null;
+    }
+    $d = $resp['data'] ?? null;
+    return is_array($d) ? $d : null;
+}
+
 function cloudreve_list_folder(array $cfg, string $uri): ?array {
     $resp = cloudreve_api($cfg, 'GET', '/file?uri=' . rawurlencode($uri) . '&page_size=1000&order_by=name&order_direction=asc');
     if (!$resp || (int)($resp['code'] ?? 1) !== 0) {
         return null;
     }
-    return $resp['data'] ?? null;
+    $data = $resp['data'] ?? null;
+    if (!is_array($data)) {
+        return $data;
+    }
+    // P6b: 条目超过一页时补取后续页——旧实现固定 page_size=1000 且不翻页，超出的文件静默消失。
+    // 单页足够时不发任何额外请求（与旧实现零差异）。
+    foreach (cloudreve_folder_next_pages($data) as $pageNo) {
+        $extra = cloudreve_list_folder_page($cfg, $uri, $pageNo);
+        if (!is_array($extra) || empty($extra['files']) || !is_array($extra['files'])) {
+            break;
+        }
+        $data['files'] = array_merge(isset($data['files']) && is_array($data['files']) ? $data['files'] : [], $extra['files']);
+    }
+    return $data;
 }
 
 // 网盘短期缓存：目录列表 / 搜索结果 / 文件名-uri 解析（SQLite，TTL 由调用方指定）
@@ -2817,6 +2879,16 @@ function cloudreve_list_folder_multi(array $cfg, array $uris, int $ttl = 60): ar
         curl_close($h['ch']);
         $decoded = is_string($raw) ? json_decode($raw, true) : null;
         $data = (is_array($decoded) && (int)($decoded['code'] ?? 1) === 0) ? ($decoded['data'] ?? null) : null;
+        // P6b: 单页不够时顺序补翻页（只对确实超出一页的目录多发请求；单页足够时零额外请求）
+        if (is_array($data)) {
+            foreach (cloudreve_folder_next_pages($data) as $pageNo) {
+                $extra = cloudreve_list_folder_page($conn, (string)$h['uri'], $pageNo);
+                if (!is_array($extra) || empty($extra['files']) || !is_array($extra['files'])) {
+                    break;
+                }
+                $data['files'] = array_merge(isset($data['files']) && is_array($data['files']) ? $data['files'] : [], $extra['files']);
+            }
+        }
         $out[$h['uri']] = is_array($data) ? $data : null;
         if (is_array($data)) {
             netdisk_cache_set($h['key'], json_encode($data, JSON_UNESCAPED_UNICODE), $ttl);
@@ -3069,6 +3141,12 @@ function netdisk_run_cmd_timeout(string $cmd, int $timeoutSec): bool {
     }
     @proc_close($proc);
     return true;
+}
+
+// P9: 目录名是否以「.」开头（隐藏目录，如 PC 侧 .ocr-win-state 工作目录）——只判目录，文件名不受影响
+function netdisk_is_dot_dir_name(string $name): bool {
+    $n = basename(rawurldecode($name));
+    return $n !== '' && $n !== '.' && $n !== '..' && substr($n, 0, 1) === '.';
 }
 
 // OCR 候选扩展名
@@ -3997,8 +4075,11 @@ function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PD
     $texts = 0;
     $errors = 0;
     $lastHb = 0;
+    // P1: 用户取消标记——取消分支必须把事实告诉调用方（旧实现直接 break、返回数组里没有任何取消信号，
+    // 调用方只能靠再查一次 job 状态猜，finalize 阶段就照常跑完了整批）。
+    $poolCancelled = false;
     if (empty($jobs) || $concurrency < 1) {
-        return ['results' => $results, 'done' => 0, 'texts' => 0, 'errors' => 0];
+        return ['results' => $results, 'done' => 0, 'texts' => 0, 'errors' => 0, 'cancelled' => false];
     }
     // sidecar 优先：模型常驻、识别精度高。sidecar 自身串行，无需 PHP 侧并发；
     // PDF 最终由 finalize 用 /ocr/pdf 整本重扫（更准），此处仅同步识别图片与 PDF 前 5 页样本。
@@ -4019,6 +4100,7 @@ function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PD
                 break;
             }
             if ($jobId > 0 && netdisk_index_job_cancelled($jobId, $jobPdo)) {
+                $poolCancelled = true; // P1
                 foreach ($jobs as $jj) {
                     if (isset($jj['tmp']) && is_file($jj['tmp'])) {
                         @unlink($jj['tmp']);
@@ -4059,11 +4141,12 @@ function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PD
                 $errors++;
             }
         }
-        return ['results' => $results, 'done' => $done, 'texts' => $texts, 'errors' => $errors, 'ocr_off' => $poolOff];
+        return ['results' => $results, 'done' => $done, 'texts' => $texts, 'errors' => $errors,
+            'ocr_off' => $poolOff, 'cancelled' => $poolCancelled]; // P1
     }
     $tess = trim((string)shell_exec('command -v tesseract 2>/dev/null'));
     if ($tess === '') {
-        return ['results' => $results, 'done' => count($jobs), 'texts' => 0, 'errors' => count($jobs)];
+        return ['results' => $results, 'done' => count($jobs), 'texts' => 0, 'errors' => count($jobs), 'cancelled' => false];
     }
     $ppm = trim((string)shell_exec('command -v pdftoppm 2>/dev/null'));
     // 自适应 DPI：起点、上限、质量阈值（每次调用读取配置，默认 100/600/0.3）。
@@ -4250,6 +4333,7 @@ function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PD
             }
             $running = [];
             $activePages = null;
+            $poolCancelled = true; // P1
             break;
         }
         foreach ($running as $i => $r) {
@@ -4300,7 +4384,8 @@ function netdisk_ocr_run_pool(array $jobs, int $concurrency, int $jobId = 0, ?PD
             $texts++;
         }
     }
-    return ['results' => $results, 'done' => $done, 'texts' => $texts, 'errors' => $errors, 'ocr_off' => $poolOff];
+    return ['results' => $results, 'done' => $done, 'texts' => $texts, 'errors' => $errors,
+        'ocr_off' => $poolOff, 'cancelled' => $poolCancelled]; // P1
 }
 
 // 判断 OCR 结果是否含"汉字+空格+汉字"模式（旧版 tesseract 未做字间空格归一化，
@@ -4632,8 +4717,42 @@ function netdisk_index_skip_exts(?int $configId = 0): array {
     return $out;
 }
 
+// P7: 强制重建——清空该分享的索引路径行（只删 netdisk_index；netdisk_ocr_files 与 netdisk_ocr_results
+// 一行不动，哈希复用仍走判定顺序②），并置一次性标记让 worker 在 notes 里说明本次是强制重建。
+function netdisk_index_force_rebuild_clear(int $shareId): int {
+    $n = 0;
+    try {
+        $st = db()->prepare('DELETE FROM netdisk_index WHERE share_id = :s');
+        $st->execute([':s' => $shareId]);
+        $n = $st->rowCount();
+    } catch (Throwable $e) {
+        return 0;
+    }
+    try {
+        set_setting('netdisk_force_rebuild_' . $shareId, '1');
+    } catch (Throwable $e) {
+        // 标记写不进不影响清空事实
+    }
+    return $n;
+}
+
+// P7: 强制重建标记的一次性取出（setting 键，无需改表结构；worker 侧零改动）
+function netdisk_index_force_rebuild_take(int $shareId): bool {
+    $key = 'netdisk_force_rebuild_' . $shareId;
+    try {
+        if ((string)get_setting($key, '0') !== '1') {
+            return false;
+        }
+        set_setting($key, '0');
+        return true;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
 // 创建/追加一个后台重建 job。若该分享已有 running 或 pending 任务则复用返回其 id。
-function netdisk_index_job_create(int $shareId, bool $forceOcr = false, ?bool &$reusedRunning = null): int {
+// P7: $forceRebuild=1 时先清空该分享的 netdisk_index 行，令「未变化已跳过」自然失效（哈希复用不受影响）。
+function netdisk_index_job_create(int $shareId, bool $forceOcr = false, ?bool &$reusedRunning = null, bool $forceRebuild = false): int {
     $pdo = db();
     // 0030: $reusedRunning 通过引用回传「本次复用的是已经在跑的 running 行」——
     // 旧实现无条件返回既有 job id，调用方无从区分「新建」与「复用 running」，
@@ -4653,12 +4772,19 @@ function netdisk_index_job_create(int $shareId, bool $forceOcr = false, ?bool &$
         //       worker 的「pending 超 6 小时判死」即「触发后 6 小时仍未被拾取」。旧实现不刷新，
         //       隔日重触发会复用昨天的 created_at，worker 一进回收循环就误判「队列等待超时」。
         //       running 行有心跳、语义是已开跑，不得刷新（仅 status="pending" 的行会被本 UPDATE 命中）。
+        // P7: 复用的是 pending 行（尚未开跑）→ 本轮仍可安全清空索引；running 行正持有现有快照，不动
+        if ($forceRebuild && !$reusedRunning) {
+            netdisk_index_force_rebuild_clear($shareId);
+        }
         if ($forceOcr) {
             $pdo->prepare('UPDATE netdisk_index_jobs SET created_at=:t, force_ocr=1 WHERE id=:id AND status="pending"')->execute([':t' => time(), ':id' => $existing]);
         } else {
             $pdo->prepare('UPDATE netdisk_index_jobs SET created_at=:t WHERE id=:id AND status="pending"')->execute([':t' => time(), ':id' => $existing]);
         }
         return $existing;
+    }
+    if ($forceRebuild) {
+        netdisk_index_force_rebuild_clear($shareId);
     }
     $pdo->prepare('INSERT INTO netdisk_index_jobs (share_id, status, created_at, force_ocr) VALUES (:s, "pending", :t, :f)')
         ->execute([':s' => $shareId, ':t' => time(), ':f' => $forceOcr ? 1 : 0]);
@@ -5157,6 +5283,58 @@ function netdisk_ocr_file_hash_bytes(string $raw, string $uri): string {
     return $h;
 }
 
+// P8: 统计某个 content_hash 当前被多少个索引行引用（引用度守卫依据；查询异常返回 0 = 不拦）
+function netdisk_ocr_hash_uri_count(string $hash, PDO $pdo): int {
+    if ($hash === '') {
+        return 0;
+    }
+    try {
+        $st = $pdo->prepare('SELECT COUNT(*) FROM netdisk_index WHERE content_hash = :h');
+        $st->execute([':h' => $hash]);
+        $n = (int)$st->fetchColumn();
+        $st->closeCursor();
+        return $n;
+    } catch (Throwable $e) {
+        return 0;
+    }
+}
+
+// P8: 单哈希最大引用度（setting netdisk_ocr_hash_uri_max，默认 20，至少 1）
+function netdisk_index_ocr_hash_uri_max(): int {
+    return max(1, (int)get_setting('netdisk_ocr_hash_uri_max', '20'));
+}
+
+// P6a: 索引遍历深度上限（setting netdisk_index_walk_max_depth，默认 5 = 原硬编码 $depth<=5，共 6 层）。
+function netdisk_index_walk_max_depth(): int {
+    return max(1, (int)get_setting('netdisk_index_walk_max_depth', '5'));
+}
+
+// P6a: 索引遍历目录上限（setting netdisk_index_walk_max_dirs，默认 300 = 原硬编码值）。
+function netdisk_index_walk_max_dirs(): int {
+    return max(1, (int)get_setting('netdisk_index_walk_max_dirs', '300'));
+}
+
+// P8b: 写入 netdisk_index.content_hash 前的统一校验（队列回写与索引构建同口径）。
+// 返回 true=允许写入；false=拒写（引用度已达上限且不是本行既有值）。
+function netdisk_ocr_hash_write_allowed(string $hash, int $shareId, string $uri, PDO $pdo, int $max): bool {
+    if ($hash === '') {
+        return false;
+    }
+    $prev = '';
+    try {
+        $st = $pdo->prepare('SELECT content_hash FROM netdisk_index WHERE share_id=:s AND uri=:u');
+        $st->execute([':s' => $shareId, ':u' => $uri]);
+        $prev = (string)$st->fetchColumn();
+        $st->closeCursor();
+    } catch (Throwable $e) {
+        return true; // 查询异常不拦，保持既有行为
+    }
+    if ($prev === $hash) {
+        return true; // 本行已是该值：幂等写，不构成新的污染扩散
+    }
+    return netdisk_ocr_hash_uri_count($hash, $pdo) < $max;
+}
+
 // 重建/刷新某分享的网盘本地全文索引（增量：按 Cloudreve updated_at 跳过未变化文件，不重复下载）
 // 返回 ['files'=>int, 'folders'=>int, 'texts'=>int, 'errors'=>int, 'skipped'=>int, 'notes'=>string,
 //        'ocr_done'=>int, 'ocr_queued'=>int, 'ocr_oversize'=>int]
@@ -5171,9 +5349,15 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
     $folders = 0;
     $texts = 0;
     $errors = 0;
-    $skipped = 0;       // 未变化、未重复下载的文件数
+    $skipped = 0;       // 本轮跳过的文件总数（含增量未变化 + 内容哈希复用命中；返回值/job.skipped 口径不变）
+    $skippedInc = 0;    // P12: 其中「真正未变化、按增量跳过」的条数（只有它进 notes；复用命中不再冒充增量跳过）
     $skippedByExt = 0;  // 黑名单扩展名跳过的文件数
+    $dotDirSkipped = 0; // P9: 以「.」开头的隐藏目录被排除的数量（本轮不写行、不入队列）
     $notes = [];
+    // P7: 强制重建一次性标记（重建入口创建 job 时已清空该分享索引行，这里只负责把事实写进 notes）
+    if (netdisk_index_force_rebuild_take($shareId)) {
+        $notes[] = '强制重建：已清空该分享索引行（OCR 结果表与复用表保留）';
+    }
     $visited = 0;
     $currentLevel = [$root];
     $seenDirs = [$root => true];
@@ -5182,6 +5366,19 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
     // 0024: 本轮内容寻址参数指纹（单一来源函数 netdisk_ocr_params_key）；results 表查询/写入均用此 key
     $caParamsKey = netdisk_ocr_params_key($configId);
     $ocrReuseHit = 0;     // 0024: 内容寻址命中复用（未重新 OCR）的文件数
+    $caHashGuard = 0;     // P8: 因 content_hash 引用度异常被拒绝写入的文件数
+    $caHashCleared = 0;   // P8b: 其中旧值本身即污染值、本轮置空的行数
+    $caHashUriMax = netdisk_index_ocr_hash_uri_max(); // P8: 引用度阈值（本轮读一次，避免每文件查 settings）
+    $caHashBlocked = [];  // P8: 本轮被引用度守卫拒写的 uri —— OCR 收尾也不得再把这个哈希补回去
+    $tmpWriteFail = 0;    // P4: 临时文件落盘失败的个数（不进 OCR 池、不计 attempts）
+    // P6a: 遍历上限可配置 + 截断标记（P10 据此判断能否安全清理状态行：截断时不可清理）
+    $walkMaxDepth = netdisk_index_walk_max_depth();
+    $walkMaxDirs = netdisk_index_walk_max_dirs();
+    $walkTruncated = false;
+    $walkDirLimitHit = false;
+    $walkDepthLimitHit = false;
+    // P10: 遍历中途被取消（P1/P3 复用同一标记；取消轮的 uri 集合不完整，禁止做状态行清理）
+    $ocrCancelMid = false;
     $lastHb = 0; // 心跳节流：距上次上报至少 1s
 
     // 预扫描总量（目录缓存 300s，正式遍历直接命中，不增加 API 请求）
@@ -5221,13 +5418,15 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
 
     // 载入现有索引（增量依据：uri => [updated_at, text, is_folder]）
     $existing = [];
-    $sel = $pdo->prepare('SELECT uri, updated_at, text, is_folder, content_hash FROM netdisk_index WHERE share_id = :s');
+    // P7: 增量判定必须同时比对 size——只比 updated_at 会把「同名同时间但内容已换」的文件当未变化跳过
+    $sel = $pdo->prepare('SELECT uri, updated_at, text, is_folder, content_hash, size FROM netdisk_index WHERE share_id = :s');
     $sel->execute([':s' => $shareId]);
     foreach ($sel->fetchAll(PDO::FETCH_ASSOC) as $row) {
         $existing[(string)$row['uri']] = [
             'updated_at' => (string)$row['updated_at'],
             'text' => (string)$row['text'],
             'is_folder' => (int)$row['is_folder'],
+            'size' => (int)($row['size'] ?? 0), // P7: 增量判定依据
             // 0024: fast-path 复用轮不重算哈希，写回时保留既有 content_hash（不被空串覆盖）
             'content_hash' => (string)($row['content_hash'] ?? ''),
         ];
@@ -5277,13 +5476,21 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
         VALUES (:sid, :uri, :name, :isf, :ext, :size, :parent, :text, :t, :u, :ch)
         ON CONFLICT(share_id, uri) DO UPDATE SET name=:name2, is_folder=:isf2, ext=:ext2, size=:size2, parent_path=:parent2, text=:text2, indexed_at=:t2, updated_at=:u2, content_hash=:ch2');
     $updText = $pdo->prepare('UPDATE netdisk_index SET text=:text WHERE share_id=:sid AND uri=:uri');
-    for ($depth = 0; $depth <= 5; $depth++) {
-        if (empty($currentLevel) || $visited >= 300) {
+    for ($depth = 0; $depth <= $walkMaxDepth; $depth++) {
+        if (empty($currentLevel)) {
+            break;
+        }
+        if ($visited >= $walkMaxDirs) {
+            // P6a: 目录上限截断——本轮索引不完整，必须落 note 且禁止后续状态行清理
+            $walkTruncated = true;
+            $walkDirLimitHit = true;
             break;
         }
         $batch = [];
         foreach ($currentLevel as $dirUri) {
-            if ($visited >= 300) {
+            if ($visited >= $walkMaxDirs) {
+                $walkTruncated = true;
+                $walkDirLimitHit = true;
                 break;
             }
             $visited++;
@@ -5307,6 +5514,12 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
                 if ($navigateUri === '') {
                     continue;
                 }
+                // P9: 隐藏目录（.ocr-win-state 等工作目录）整棵不进索引——不写索引行、不累加 files/folders、
+                // 也不下探；因不进 $seenUris，旧版本已索引的行会在收尾清理时被删掉。
+                if ($isFolder && netdisk_is_dot_dir_name($name)) {
+                    $dotDirSkipped++;
+                    continue;
+                }
                 $ext = $isFolder ? '' : netdisk_file_ext($name);
                 $size = (int)($f['size'] ?? 0);
                 $cloudUpdatedAt = (string)($f['updated_at'] ?? '');
@@ -5314,6 +5527,12 @@ function netdisk_build_index_share(array $share, array $cfg, string $root, bool 
                 // 0024: 内容寻址哈希惰性求值——快速路径（判定顺序①）命中时保持 ''，哈希函数零调用；
                 // 未命中才在 F 分支（metadata 探测）或下载分支（字节顺带算）里赋值。
                 $caHash = '';
+                // P8: 哈希来源可信标志——只有「Cloudreve 元数据给的 sha256」与「下载成功、字节非空再实算」两条路可以写库；
+                // 失败/跳过分支（下载失败、黑名单跳过、超限未下载）一律不写新哈希——job25 的 cc4e6096 事故就是把
+                // 统一错误响应体当文件内容算了 sha256。
+                $caHashTrusted = false;
+                $caHashMeta = '';          // P8: metadata 探测结果（判定顺序②未命中时仍可作本轮哈希，且属可信来源）
+                $caDownloadFailed = false; // P8: 本轮该文件下载失败 → 不写新哈希
 
 $text = '';
                 $skipExts = netdisk_index_skip_exts($configId);
@@ -5364,6 +5583,7 @@ $text = '';
                 $isUnchanged = !$isFolder && $prev !== null
                     && $prev['updated_at'] !== '' && $prev['updated_at'] === $cloudUpdatedAt
                     && (int)$prev['is_folder'] === 0
+                    && (int)($prev['size'] ?? 0) === $size // P7: 体积也须一致，updated_at 相同的换内容不再被误跳过
                     && (netdisk_is_ocr_candidate($ext)
                         ? (!$forceOcr && $ocrSkipAny)
                         : $prev['text'] !== '');
@@ -5373,6 +5593,7 @@ $text = '';
                 } elseif ($isUnchanged) {
                     $text = $prev['text'];
                     $skipped++;
+                    $skippedInc++;
                     if ($isOcrCandFile) {
                         // 0018: OCR 候选被增量跳过 → 分类计数；回填场景补写状态行（下次直接命中）
                         if ($ocrSkipGaveUp) {
@@ -5400,8 +5621,11 @@ $text = '';
                     // 黑名单扩展名：跳过下载正文/OCR，仅索引文件名
                     $skippedByExt++;
                 } elseif ($isOcrCandFile && !$forceOcr
-                    && ($caHash = netdisk_ocr_file_hash_meta($f, $navigateUri)) !== ''
-                    && ($caRow = netdisk_ocr_result_lookup($caHash, $caParamsKey, $pdo)) !== null) {
+                    && ($caHashMeta = netdisk_ocr_file_hash_meta($f, $navigateUri)) !== ''
+                    && ($caRow = netdisk_ocr_result_lookup($caHashMeta, $caParamsKey, $pdo)) !== null) {
+                    // P8: metadata 给出的 sha256 为可信来源
+                    $caHash = $caHashMeta;
+                    $caHashTrusted = true;
                     // 0024 判定顺序②：metadata 已带 sha256 且结果表命中达标 → 直接复用正文，不下载、不进 OCR 队列。
                     // 改名/移动/重命名父目录后内容不变即走此路（uri 变、updated_at 可能变，但哈希不变）。
                     $text = (string)$caRow['text'];
@@ -5429,10 +5653,12 @@ $text = '';
                     $raw = netdisk_fetch_raw_bytes($contCfg, $navigateUri);
                     if ($raw === null) {
                         $errors++;
+                        $caDownloadFailed = true;
                     } else {
                         // 0024: 已下载字节顺带算哈希（OCR 候选才算；不为算哈希单独多下一次文件）
                         if ($caHash === '' && $isOcr) {
                             $caHash = netdisk_ocr_file_hash_bytes($raw, $navigateUri);
+                            $caHashTrusted = true; // P8: 下载成功且字节非空，实算哈希可信
                         }
                         $text = netdisk_extract_text_from_bytes($ext, $raw, false);
                         // 0024 判定顺序②：文本层为空需 OCR 时，先查内容寻址结果表；命中达标即复用，不进池/队
@@ -5462,8 +5688,14 @@ $text = '';
                             if ($size <= $ocrMaxBytes) {
                                 $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
                                 if ($tmp !== false) {
-                                    @file_put_contents($tmp, $raw);
-                                    $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId, 'updated_at' => $cloudUpdatedAt, 'size' => $size, 'content_hash' => $caHash];
+                                    // P4: 写盘返回值必须校验——磁盘满/配额/权限异常时旧实现仍把空文件塞进 OCR 池，
+                                    // tesseract 对空文件报错占坑，还白占一次 attempts。写失败就当这个文件没 OCR。
+                                    if (@file_put_contents($tmp, $raw) === false) {
+                                        @unlink($tmp);
+                                        $tmpWriteFail++;
+                                    } else {
+                                        $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId, 'updated_at' => $cloudUpdatedAt, 'size' => $size, 'content_hash' => $caHash];
+                                    }
                                 } else {
                                     $errors++;
                                 }
@@ -5520,10 +5752,12 @@ $text = '';
                         $raw = netdisk_fetch_raw_bytes($contCfg, $navigateUri);
                         if ($raw === null) {
                             $errors++;
+                            $caDownloadFailed = true;
                         } else {
                             // 0024: 已下载字节顺带算哈希
                             if ($caHash === '') {
                                 $caHash = netdisk_ocr_file_hash_bytes($raw, $navigateUri);
+                                $caHashTrusted = true; // P8: 下载成功且字节非空，实算哈希可信
                             }
                             $caHitH = (!$forceOcr) ? netdisk_ocr_result_lookup($caHash, $caParamsKey, $pdo) : null;
                             if ($caHitH !== null) {
@@ -5550,8 +5784,14 @@ $text = '';
                             } else {
                                 $tmp = tempnam(sys_get_temp_dir(), 'ndo_');
                                 if ($tmp !== false) {
-                                    @file_put_contents($tmp, $raw);
-                                    $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId, 'updated_at' => $cloudUpdatedAt, 'size' => $size, 'content_hash' => $caHash];
+                                    // P4: 写盘返回值必须校验——磁盘满/配额/权限异常时旧实现仍把空文件塞进 OCR 池，
+                                    // tesseract 对空文件报错占坑，还白占一次 attempts。写失败就当这个文件没 OCR。
+                                    if (@file_put_contents($tmp, $raw) === false) {
+                                        @unlink($tmp);
+                                        $tmpWriteFail++;
+                                    } else {
+                                        $ocrTasks[] = ['uri' => $navigateUri, 'tmp' => $tmp, 'ext' => $ext, 'name' => $name, 'config_id' => $configId, 'updated_at' => $cloudUpdatedAt, 'size' => $size, 'content_hash' => $caHash];
+                                    }
                                 } else {
                                     $errors++;
                                 }
@@ -5594,9 +5834,36 @@ $text = '';
                         }
                     }
                 }
+                // P8: metadata 探测到的 sha256 属可信来源——判定顺序②未命中复用（结果表无此哈希/不达标）时仍作为
+                // 本轮哈希写回索引，避免每轮重复探测；下载失败的轮次一律不写（$caDownloadFailed）。
+                if (!$caHashTrusted && $caHashMeta !== '' && !$caDownloadFailed
+                    && ($caHash === '' || $caHash === $caHashMeta)) {
+                    $caHash = $caHashMeta;
+                    $caHashTrusted = true;
+                }
                 $now = time();
                 // 0024: content_hash 写回——本轮算出/命中即用新值；快速路径等未算哈希的轮次保留既有值（不被空串覆盖）
-                $caHashW = $caHash !== '' ? $caHash : (string)($prev['content_hash'] ?? '');
+                // P8: 只有可信来源（metadata / 下载成功后的字节实算）才允许写新值；失败/跳过分支保留旧值。
+                $caHashPrev = (string)($prev['content_hash'] ?? '');
+                $caHashW = ($caHash !== '' && $caHashTrusted) ? $caHash : $caHashPrev;
+                // P8: 引用度守卫——同一 content_hash 已被超过 N 个 uri 引用时拒绝再为新 uri 写入
+                // （疑似统一错误响应体被当正文；正常改名/移动/多分享共享也会造成多 uri 同哈希，故阈值默认 20 留足余量）。
+                if ($caHashW !== '') {
+                    $caRefN = netdisk_ocr_hash_uri_count($caHashW, $pdo);
+                    if ($caRefN >= $caHashUriMax) {
+                        if ($caHashW !== $caHashPrev) {
+                            // 新算出的哈希引用度异常：拒写本次新值，保留旧值
+                            $caHashW = $caHashPrev;
+                        } else {
+                            // P8b: 旧值本身就是污染值（引用度同样超限）——置空，不再原样带下去
+                            $caHashW = '';
+                            $caHashCleared++;
+                        }
+                        $caHashBlocked[$navigateUri] = true;
+                        $errors++;
+                        $caHashGuard++;
+                    }
+                }
                 netdisk_exec_retry(fn() => $ins->execute([
                     ':sid' => $shareId, ':uri' => $navigateUri, ':name' => $name, ':isf' => $isFolder ? 1 : 0,
                     ':ext' => $ext, ':size' => $size, ':parent' => $parent, ':text' => $text, ':t' => $now, ':u' => $cloudUpdatedAt, ':ch' => $caHashW,
@@ -5642,11 +5909,17 @@ $text = '';
             // 终止响应：用户请求取消 → 中断遍历（跳过 OCR 池）
             if ($jobId > 0 && netdisk_index_job_cancelled($jobId, $pdo)) {
                 // 清理已入队的低优任务与临时文件由外层统一处理；此处直接跳出遍历
+                $ocrCancelMid = true; // P10/P3: 取消轮不得清理状态行、不得 finalize
                 unset($currentLevel);
                 break 2;
             }
         }
         $currentLevel = $nextLevel;
+    }
+    // P6a: 深度截断判定——循环正常退出后仍有待下探目录，说明还有更深的层没走到（取消/目录截断不算）
+    if (isset($currentLevel) && !empty($currentLevel) && !$walkDirLimitHit) {
+        $walkTruncated = true;
+        $walkDepthLimitHit = true;
     }
     // 0030: $allowOcr 是开跑时的快照（worker 一轮只读一次），用户中途关掉 OCR 后旧实现会一路跑到底。
     // 这里穿透进程内配置缓存重读一次；已关则本轮剩余候选整批不收（删临时文件、不写状态行、不计数）。
@@ -5667,6 +5940,30 @@ $text = '';
             netdisk_index_job_update($jobId, ['ocr_files_total' => 0, 'ocr_files_done' => 0], $pdo);
         }
     }
+    // P5: 池启动前磁盘预检——临时文件与栅格化页 PNG 都落在 sys_get_temp_dir()；
+    // 空间不足时旧实现会一路跑到写满盘（写盘失败静默、后续文件全丢），宁可本轮不做 OCR。
+    if (!empty($ocrTasks) && $allowOcr) {
+        $poolBytes = 0;
+        foreach ($ocrTasks as $tk) {
+            $poolBytes += (int)($tk['size'] ?? 0);
+        }
+        $freeBytes = @disk_free_space(sys_get_temp_dir());
+        $needBytes = max(200 * 1048576, (int)ceil($poolBytes * 0.5));
+        if (is_numeric($freeBytes) && (float)$freeBytes < $needBytes) {
+            $ocrDiskShort = count($ocrTasks);
+            foreach ($ocrTasks as $tk) {
+                if (isset($tk['tmp']) && is_file((string)$tk['tmp'])) {
+                    @unlink((string)$tk['tmp']);
+                }
+            }
+            $ocrTasks = [];
+            $notes[] = '临时目录空间不足（可用 ' . round((float)$freeBytes / 1048576, 1) . 'MB < 需要 '
+                . round($needBytes / 1048576, 1) . 'MB），本轮跳过 OCR：' . $ocrDiskShort . ' 个候选未识别（仅按文件名索引）';
+            if ($jobId > 0) {
+                netdisk_index_job_update($jobId, ['ocr_files_total' => 0, 'ocr_files_done' => 0], $pdo);
+            }
+        }
+    }
     // 高优先级 OCR 并发池：遍历结束后统一执行（同时 ≤concurrency 个 tesseract）
     if (!empty($ocrTasks) && $allowOcr) {
         // 记录本次高优 OCR 文件总数（供前端 OCR 文件级进度条）
@@ -5674,8 +5971,18 @@ $text = '';
             netdisk_index_job_update($jobId, ['ocr_files_total' => count($ocrTasks), 'ocr_files_done' => 0], $pdo);
         }
         $poolRes = netdisk_ocr_run_pool($ocrTasks, netdisk_index_ocr_concurrency($configId), $jobId, $pdo);
+        // P2: 池内失败（临时文件丢失 / 识别返回空 / 服务端报错）此前计入 $poolRes['errors'] 后就被丢掉，
+        // job.errors 只剩遍历阶段的错误数，界面显示「0 错误」与日志对不上。累加进本轮 errors 并落 note；
+        // 不进 job.error——那是「整轮致命失败」位，池内个别文件失败不该让整个 job 判失败。
+        $poolErrN = (int)($poolRes['errors'] ?? 0);
+        if ($poolErrN > 0) {
+            $errors += $poolErrN;
+            $notes[] = 'OCR 池内失败 ' . $poolErrN . ' 个文件';
+        }
         // 0030: 池内逐文件重读开关后可能中途停手——剩余候选不 finalize、不写状态行
         $ocrOffMid = $ocrOffMid || !empty($poolRes['ocr_off']);
+        // P3: 池报告用户取消 → finalize 阶段剩余候选一律不处理（与「运行中关掉 OCR」并列但语义不同）
+        $ocrCancelMid = $ocrCancelMid || !empty($poolRes['cancelled']);
         if ($ocrOffMid && $jobId > 0) {
             netdisk_index_job_update($jobId, ['ocr_files_total' => 0, 'ocr_files_done' => 0], $pdo);
         }
@@ -5690,9 +5997,19 @@ $text = '';
         $finTotal = count($ocrTasks);
         $finIdx = 0;
         $ocrAbortedOff = 0; // 0030: 因运行中关闭 OCR 而未识别的候选数
+        $ocrCancelSkipped = 0; // P3: 因用户取消而未处理（未 finalize、未写状态行）的候选数
         foreach ($ocrTasks as $task) {
             $uri = $task['uri'];
             $finIdx++;
+            // P3: 用户取消 → 剩余候选不 finalize、不写状态行、不 attempts++，只删 tmp；
+            // 旧实现取消后照样把整批 finalize 跑完（每本整本重扫），点「取消」要等很久才停。
+            if ($ocrCancelMid) {
+                if (isset($task['tmp']) && is_file((string)$task['tmp'])) {
+                    @unlink((string)$task['tmp']);
+                }
+                $ocrCancelSkipped++;
+                continue;
+            }
             // 0030: 运行中关闭 OCR → 池里已出结果的照常 finalize，其余整批丢弃（删 tmp、不写状态行）
             if ($ocrOffMid && !isset($poolRes['results'][$uri])) {
                 if (isset($task['tmp']) && is_file($task['tmp'])) {
@@ -5725,7 +6042,8 @@ $text = '';
                 $texts++;
                 $ocrDone++;
                 // 0024 判定顺序③：OCR 成功后额外写一份进内容寻址结果表（source='nas'），供改名/移动/多分享复用
-                $caTaskHash = (string)($task['content_hash'] ?? '');
+                // P8: 被引用度守卫拒写的 uri 不得在收尾阶段把同一个哈希补写回索引/结果表（否则守卫等于没做）
+                $caTaskHash = isset($caHashBlocked[$uri]) ? '' : (string)($task['content_hash'] ?? '');
                 if ($caTaskHash !== '') {
                     netdisk_ocr_result_save($caTaskHash, $caParamsKey, (int)($task['size'] ?? 0), $stPages, $txt, $stEngine, 'nas', $pdo);
                     netdisk_exec_retry(fn() => $pdo->prepare('UPDATE netdisk_index SET content_hash=:h WHERE share_id=:s AND uri=:u')
@@ -5797,46 +6115,91 @@ $text = '';
             @unlink($task['tmp']);
         }
     }
-    // 清理索引中已不存在的条目（删除的文件）
-    // 0024: 此处只删路径行（netdisk_index 与 netdisk_ocr_files）；netdisk_ocr_results 结果行一行都不跟着删——
-    // 路径行删除后对应结果行变孤儿，交收尾 GC 按 last_hit_at + TTL/容量淘汰
-    // （PC 先扫后传的结果在 NAS 遍历到该文件之前就是孤儿，绝不能被当垃圾清掉）。
-    $allUris = netdisk_exec_retry(fn() => $pdo->query("SELECT uri FROM netdisk_index WHERE share_id=$shareId")->fetchAll(PDO::FETCH_COLUMN)) ?: [];
-    $toDelete = array_values(array_diff($allUris, array_keys($seenUris)));
-    if (!empty($toDelete)) {
-        $del = $pdo->prepare('DELETE FROM netdisk_index WHERE share_id=:s AND uri=:u');
-        $delOcrF = $pdo->prepare('DELETE FROM netdisk_ocr_files WHERE share_id=:s AND uri=:u');
-        foreach ($toDelete as $uri) {
-            netdisk_exec_retry(fn() => $del->execute([':s' => $shareId, ':u' => $uri]));
-            netdisk_exec_retry(fn() => $delOcrF->execute([':s' => $shareId, ':u' => $uri]));
-        }
+    // P10: 收尾清理（索引行 / OCR 状态行 / 队列行）共用一套前置条件——本轮 uri 集合不完整时，
+    // 按差集删行会把仍在树里的文件当成「已删除」清掉。四个阻断条件：遍历被截断 / 本轮被取消 /
+    // 错误率过高（>5% 文件数，至少 1）/ 一条都没遍历到。
+    $pruneErrorLimit = max(1, (int)floor(max(1, $files) * 0.05));
+    $pruneBlocked = '';
+    if ($walkTruncated) {
+        $pruneBlocked = '本轮遍历不完整（达到深度/目录上限），跳过收尾清理（索引行/状态行/队列行）';
+    } elseif ($ocrCancelMid) {
+        $pruneBlocked = '本轮已被取消（遍历未完成），跳过收尾清理（索引行/状态行/队列行）';
+    } elseif ($errors > $pruneErrorLimit) {
+        $pruneBlocked = '本轮错误过多（' . $errors . ' > ' . $pruneErrorLimit . '），跳过收尾清理（索引行/状态行/队列行）';
+    } elseif (empty($seenUris)) {
+        $pruneBlocked = '本轮未遍历到任何条目，跳过收尾清理（索引行/状态行/队列行）';
     }
-    // 0018: 替代原"重建开头整表清空"——仅删除本轮遍历中已消失（云端删除/移出 root）的队列行，
-    // pending/failed 任务保留续跑；与 netdisk_index 的清理同处执行。
-    try {
-        $qSel = $pdo->prepare('SELECT id, uri FROM netdisk_ocr_queue WHERE share_id = :s');
-        $qSel->execute([':s' => $shareId]);
-        $qRows = $qSel->fetchAll(PDO::FETCH_ASSOC);
-        $qSel->closeCursor();
-        $delQ = $pdo->prepare('DELETE FROM netdisk_ocr_queue WHERE id = :id');
-        foreach ($qRows as $qr) {
-            if (!isset($seenUris[(string)$qr['uri']])) {
-                netdisk_exec_retry(fn() => $delQ->execute([':id' => (int)$qr['id']]));
+    $ocrStatePruned = 0;
+    if ($pruneBlocked !== '') {
+        $notes[] = $pruneBlocked;
+    } else {
+        // 清理索引中已不存在的条目（删除的文件）
+        // 0024: 此处只删路径行（netdisk_index 与 netdisk_ocr_files）；netdisk_ocr_results 结果行一行都不跟着删——
+        // 路径行删除后对应结果行变孤儿，交收尾 GC 按 last_hit_at + TTL/容量淘汰
+        // （PC 先扫后传的结果在 NAS 遍历到该文件之前就是孤儿，绝不能被当垃圾清掉）。
+        $allUris = netdisk_exec_retry(fn() => $pdo->query("SELECT uri FROM netdisk_index WHERE share_id=$shareId")->fetchAll(PDO::FETCH_COLUMN)) ?: [];
+        $toDelete = array_values(array_diff($allUris, array_keys($seenUris)));
+        if (!empty($toDelete)) {
+            $del = $pdo->prepare('DELETE FROM netdisk_index WHERE share_id=:s AND uri=:u');
+            $delOcrF = $pdo->prepare('DELETE FROM netdisk_ocr_files WHERE share_id=:s AND uri=:u');
+            foreach ($toDelete as $uri) {
+                netdisk_exec_retry(fn() => $del->execute([':s' => $shareId, ':u' => $uri]));
+                netdisk_exec_retry(fn() => $delOcrF->execute([':s' => $shareId, ':u' => $uri]));
             }
         }
-    } catch (Throwable $ign) {
-        // 队列清理失败不影响本轮索引结果
+        // P10: 清理本分享下「本轮遍历中完全不存在」的 OCR 状态行（旧索引根遗留的孤儿快照）。
+        // 只删孤儿行，绝不清空整表——清空会连带丢掉本轮赖以复用的增量状态，令所有文件重跑 OCR。
+        try {
+            $pfSel = $pdo->prepare('SELECT uri FROM netdisk_ocr_files WHERE share_id = :s');
+            $pfSel->execute([':s' => $shareId]);
+            $pfUris = $pfSel->fetchAll(PDO::FETCH_COLUMN) ?: [];
+            $pfSel->closeCursor();
+            $pfOrphan = array_values(array_diff($pfUris, array_keys($seenUris)));
+            if (!empty($pfOrphan)) {
+                $delPf = $pdo->prepare('DELETE FROM netdisk_ocr_files WHERE share_id=:s AND uri=:u');
+                foreach ($pfOrphan as $pfUri) {
+                    netdisk_exec_retry(fn() => $delPf->execute([':s' => $shareId, ':u' => $pfUri]));
+                    $ocrStatePruned++;
+                }
+            }
+        } catch (Throwable $ign) {
+            // 状态行清理失败不影响本轮索引结果
+        }
+        if ($ocrStatePruned > 0) {
+            $notes[] = '已清理 ' . $ocrStatePruned . ' 条失效 OCR 状态行';
+        }
+        // 0018: 替代原"重建开头整表清空"——仅删除本轮遍历中已消失（云端删除/移出 root）的队列行，
+        // pending/failed 任务保留续跑；与 netdisk_index 的清理同处执行。
+        try {
+            $qSel = $pdo->prepare('SELECT id, uri FROM netdisk_ocr_queue WHERE share_id = :s');
+            $qSel->execute([':s' => $shareId]);
+            $qRows = $qSel->fetchAll(PDO::FETCH_ASSOC);
+            $qSel->closeCursor();
+            $delQ = $pdo->prepare('DELETE FROM netdisk_ocr_queue WHERE id = :id');
+            foreach ($qRows as $qr) {
+                if (!isset($seenUris[(string)$qr['uri']])) {
+                    netdisk_exec_retry(fn() => $delQ->execute([':id' => (int)$qr['id']]));
+                }
+            }
+        } catch (Throwable $ign) {
+            // 队列清理失败不影响本轮索引结果
+        }
     }
     // 0024: 重建收尾跑一次结果表 GC（孤儿按 last_hit_at + TTL/容量淘汰；被引用行永不删）
     netdisk_ocr_results_gc($pdo);
-    if ($visited >= 300) {
-        $notes[] = '达到目录上限(300)，大目录可能未完整索引';
+    if ($walkTruncated) {
+        // P6a: 截断必须落 note（旧实现只在「恰好撞到 300」时提示，深度截断完全静默）
+        $notes[] = '遍历达到上限（深度 ' . $walkMaxDepth . ' / 目录 ' . $walkMaxDirs . '），本轮索引可能不完整'
+            . ($walkDepthLimitHit ? '（深度截断）' : '') . ($walkDirLimitHit ? '（目录数截断）' : '');
     }
-    if ($skipped > 0) {
-        $notes[] = $skipped . ' 个文件未变化已跳过（增量）';
+    if ($skippedInc > 0) {
+        $notes[] = $skippedInc . ' 个文件未变化已跳过（增量）';
     }
     if ($skippedByExt > 0) {
         $notes[] = $skippedByExt . ' 个黑名单扩展名文件跳过正文（仅文件名索引）';
+    }
+    if ($dotDirSkipped > 0) {
+        $notes[] = '已排除 ' . $dotDirSkipped . ' 个隐藏目录（点开头）';
     }
     if ($ocrDone > 0) {
         $notes[] = 'OCR 完成 ' . $ocrDone . ' 个文件（并发 ' . netdisk_index_ocr_concurrency() . '）';
@@ -5856,6 +6219,14 @@ $text = '';
         // 0030: 运行中关闭 OCR 的收尾提示（与「跳过阈值MB=0」是两种不同情形，各自一条）
         $notes[] = 'OCR 已在运行中被关闭：' . $ocrAbortedOff . ' 个候选未识别，临时文件已清理';
     }
+    if ($tmpWriteFail > 0) {
+        // P4: 落盘失败必须可见（否则表现为「这些文件永远没有正文」，排查时毫无线索）
+        $notes[] = $tmpWriteFail . ' 个文件临时落盘失败，本轮未送 OCR（磁盘空间/权限异常？）';
+    }
+    if (!empty($ocrCancelSkipped)) {
+        // P3: 用户取消导致的未处理候选（与「关闭 OCR」是不同原因，各记一条，避免归因混乱）
+        $notes[] = '已取消：' . $ocrCancelSkipped . ' 个候选未识别，临时文件已清理';
+    }
     if ($allowOcr && $ocrLowBytes === 0) {
         // 0028: 跳过阈值MB=0 → 本轮完全不做 OCR；旧实现会输出「n 个超大文件（>0MB）跳过 OCR」这种误导文案
         $notes[] = '跳过阈值MB=0：本轮只建索引、不做 OCR' . ($ocrZeroSkipped > 0 ? '，' . $ocrZeroSkipped . ' 个 OCR 候选已跳过' : '');
@@ -5864,6 +6235,12 @@ $text = '';
     }
     if ($ocrReuseHit > 0) {
         $notes[] = $ocrReuseHit . ' 个 OCR 文件按内容哈希命中复用（改名/移动/多分享共享，未重新识别）';
+    }
+    if ($caHashGuard > 0) {
+        $notes[] = $caHashGuard . ' 个文件因 content_hash 引用度异常被拒绝写入（疑似错误响应体被当正文）';
+    }
+    if ($caHashCleared > 0) {
+        $notes[] = $caHashCleared . ' 个文件的历史 content_hash 本身即污染值，已置空待重算';
     }
     if ($ocrSkipInc > 0) {
         $notes[] = $ocrSkipInc . ' 个 OCR 文件已跳过（增量：结果达标未重扫' . ($ocrBackfilled > 0 ? '，含 ' . $ocrBackfilled . ' 个旧索引回填' : '') . '）';
@@ -5931,6 +6308,9 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
         ->execute([':now' => time(), ':cut' => time() - 600]);
 
     $qYielded = false; // 0018: 是否因 pending 重建 job 让位（让位时把仍 pending 的队列项标记 starved）
+    // P8b: 队列回写同样受 content_hash 引用度守卫约束（本函数返回值是 int、无 notes 通道，拒写事实落 worker 日志）
+    $qHashUriMax = netdisk_index_ocr_hash_uri_max();
+    $qHashGuard = 0;
     while (time() - $start < $maxSeconds) {
         $rows = netdisk_exec_retry(function () use ($pdo): array {
             $stmt = $pdo->query('SELECT id, share_id, config_id, uri, ext, size FROM netdisk_ocr_queue WHERE status="pending" ORDER BY id ASC LIMIT 1');
@@ -5987,6 +6367,12 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
             }
             // 0024: 已下载字节顺带算哈希；内容寻址命中达标则直接复用正文、标记队列完成，不进 OCR 池
             $caHashQ = netdisk_ocr_file_hash_bytes($raw, $uri);
+            // P8b: 引用度守卫——队列路径同样不得把可疑哈希写进索引/结果表/状态表
+            if ($caHashQ !== '' && !netdisk_ocr_hash_write_allowed($caHashQ, $shareId, $uri, $pdo, $qHashUriMax)) {
+                $qHashGuard++;
+                @error_log('[nd-index] queue hash guard reject uri=' . netdisk_ocr_log_oneline($uri, 200) . ' hash=' . substr($caHashQ, 0, 12));
+                $caHashQ = '';
+            }
             $caParamsKeyQ = netdisk_ocr_params_key($rowCfgId);
             $caHitQ = netdisk_ocr_result_lookup($caHashQ, $caParamsKeyQ, $pdo);
             if ($caHitQ !== null) {
@@ -6016,7 +6402,12 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
                 netdisk_exec_retry(fn() => $markFailed->execute([':e' => '临时文件失败', ':t' => time(), ':id' => $qid]));
                 continue;
             }
-            @file_put_contents($tmp, $raw);
+            // P4: 队列路径同样校验写盘结果，失败则标记该队列项失败（不把空文件送进池）
+            if (@file_put_contents($tmp, $raw) === false) {
+                @unlink($tmp);
+                netdisk_exec_retry(fn() => $markFailed->execute([':e' => '临时文件写入失败', ':t' => time(), ':id' => $qid]));
+                continue;
+            }
             $jobs[] = ['uri' => $uri, 'tmp' => $tmp, 'ext' => (string)($row['ext'] ?? ''), 'name' => (string)($row['name'] ?? ''), 'config_id' => $rowCfgId];
             $meta[$uri] = ['qid' => $qid, 'share_id' => $shareId, 'tmp' => $tmp, 'content_hash' => $caHashQ, 'params_key' => $caParamsKeyQ, 'size' => $size];
         }
@@ -6054,6 +6445,11 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
             $qSelSt->closeCursor();
         }
         $res = netdisk_ocr_run_pool($jobs, $concurrency, 0, $pdo);
+        // P2: 队列路径同样不得吞掉池内失败（本函数返回值是 int、无 notes 通道，落 worker 日志）
+        $resErrN = (int)($res['errors'] ?? 0);
+        if ($resErrN > 0) {
+            @error_log('[nd-index] queue ocr pool errors=' . $resErrN . '（本批 ' . count($jobs) . ' 个文件）');
+        }
         // 统一后处理：规范化 + 自适应 DPI 重试 + 清理 tmp
         $finalResults = netdisk_ocr_finalize_results($jobs, $res['results']);
         foreach ($jobs as $j) {
@@ -6148,6 +6544,9 @@ function netdisk_process_ocr_queue_batch(int $maxSeconds = 120): int {
         } catch (Throwable $ign) {
             // starved 标记失败不影响队列处理结果
         }
+    }
+    if ($qHashGuard > 0) {
+        @error_log('[nd-index] queue hash guard: ' . $qHashGuard . ' 个文件的 content_hash 因引用度异常被拒写（疑似错误响应体被当正文）');
     }
     return $totalDone;
 }
@@ -19589,6 +19988,8 @@ if ($path === '/admin/netdisk/reindex' && $_SERVER['REQUEST_METHOD'] === 'POST')
     $scopeConfigId = (int)($_POST['config_id'] ?? 0);
     // 0018: 强制重跑 OCR——忽略 netdisk_ocr_files 状态表的全部跳过判定（前端勾选框传入）
     $forceOcr = !empty($_POST['force_ocr']) || !empty($_GET['force_ocr']);
+    // P7: 传 force_rebuild=1 时先清空该分享索引行再整棵重扫；与 force_ocr（强制重跑 OCR）语义互不替代。
+    $forceRebuild = !empty($_POST['force_rebuild']) || !empty($_GET['force_rebuild']);
     set_setting('netdisk_index_ocr', !empty($_POST['index_ocr']) ? '1' : '0');
     set_setting('netdisk_index_ocr_concurrency', (string)max(1, (int)($_POST['ocr_concurrency'] ?? 4)));
     set_setting('netdisk_index_ocr_max_mb', (string)max(0, (int)($_POST['ocr_max_mb'] ?? 10)));
@@ -19634,7 +20035,7 @@ if ($path === '/admin/netdisk/reindex' && $_SERVER['REQUEST_METHOD'] === 'POST')
             continue;
         }
         $reusedRunning = false;
-        $jobId = netdisk_index_job_create((int)$s['id'], $forceOcr, $reusedRunning);
+        $jobId = netdisk_index_job_create((int)$s['id'], $forceOcr, $reusedRunning, $forceRebuild);
         if ($jobId > 0) {
             $queued++;
         }

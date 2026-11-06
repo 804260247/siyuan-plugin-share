@@ -5,11 +5,38 @@
 
 ---
 
-## 未发布：关于页赞助入口与 Star
+## v0.5.8 2026-11-06：索引复用与清理安全加固 + 关于页赞助入口与 Star
 
-> 随 `main` 累积，版本号未变；下次发布时并入对应版本条目。
+> 网盘索引部分全部改动位于 `php-site/index.php`，以 `0026` 批次在 `main` 上落地。
+> 背景：NAS 侧索引复用 PC 侧 OCR 结果（复用键 `content_hash`）验收时暴露出一批正确性与清理安全问题，本版集中修复；另并入此前随 `main` 累积的关于页改动。
 
-### 插件
+### 索引复用正确性
+
+- [x] **P8** 失败/跳过分支不再写 `content_hash`（新增 `$caHashTrusted` 可信标志，仅「服务端元数据哈希」与「下载成功且字节非空后实算的哈希」置真）；新增哈希引用度守卫，同一哈希被超过阈值个 uri 引用时拒写并计入 `errors`，阈值取 setting `netdisk_ocr_hash_uri_max`（默认 20）
+- [x] **P8b** 低优先级 OCR 队列的回写路径（`netdisk_process_ocr_queue_batch()`）采用同一守卫；历史遗留的污染值（`$caHashPrev` 本身即可疑哈希）在本轮置空，不再原样带下去
+- [x] **P12** 复用命中的文件不再冒充「未变化已跳过」：新增 `$skippedInc` 仅统计真实增量跳过，`skipped` 字段口径保持不变（前端语义不漂移）
+
+### 增量与重建
+
+- [x] **P7** 增量跳过判定追加 `size` 比对（`updated_at` 未变但体积变化时正确重扫）；新增 `force_rebuild=1` 重建入口：只清该分享的 `netdisk_index` 行，`netdisk_ocr_files` 与 `netdisk_ocr_results` 保留，因此强制重扫不会牺牲哈希复用；`force_ocr` 语义完全不变
+- [x] **P6a** 遍历深度与目录数量上限改为可配置（`netdisk_index_walk_max_depth` / `netdisk_index_walk_max_dirs`，默认 5 / 300），且**任何截断都必须落 note**
+- [x] **P9** 索引遍历排除以 `.` 开头的隐藏目录（`.ocr-win-state` 一类不再进索引），点开头的**文件**不受影响
+
+### 清理安全（重点）
+
+- [x] **P10** 重建时只删孤儿 OCR 状态行，**绝不清空** `netdisk_ocr_files`（清表会导致全部文件重跑 OCR，正好毁掉哈希复用）
+- [x] 修复 v0.5.7 收尾清理的严重缺陷：`toDelete` 差集在根目录列表整体失败时 `$seenUris` 为空，会把整张 `netdisk_index` 当作「已删除文件」清空。现改为索引行 / 状态行 / 队列行三类清理**共用四个阻断条件**（遍历截断 / 本轮取消 / 错误数超过文件数 5% / 一条未遍历），任一成立即整段跳过并落 note「跳过收尾清理（索引行/状态行/队列行）」
+
+### 取消与容错
+
+- [x] **P1** OCR 池取消分支返回 `cancelled` 事实（`netdisk_ocr_run_pool()` 既有键不变，向后兼容）
+- [x] **P2** 池内失败累加进 `errors` 并落 note「OCR 池内失败 N 个文件」（不混入 `job.error` 致命错误位）
+- [x] **P3** finalize 中途取消时删除 tmp、不写状态行、不 `attempts++`
+- [x] **P4** 临时文件落盘校验返回值，失败则不入池并落 note（避免空文件占坑）
+- [x] **P5** OCR 池启动前磁盘空间预检，空间不足则跳过 OCR 并落 note
+- [x] **P6b** 目录列表按 `pagination` 翻页（单页足够时零额外请求，上限 20 页）
+
+### 插件（关于页赞助入口与 Star）
 
 - [x] 设置面板新增「关于与赞助」行：赞助入口（弹窗内置收款码）、实时 Star 数、本仓库与上游仓库链接
 - [x] Star 数走 GitHub 公开 API，10 分钟内存缓存，懒加载（面板可见且未缓存时才请求），失败静默降级为「Star」并 60 秒内不重试；手动「刷新 Star」失败会提示
@@ -20,7 +47,12 @@
 - [x] README 收款码改用 `<p align="center">` 包裹，居中渲染
 - [x] `github-release.yml` 打包清单加入 `sponsor-wechat.png`，插件包内置收款码
 
----
+### 已知取舍（留 v0.5.9）
+
+- `netdisk_ocr_results` 本版一行不删；孤儿结果行 GC（按 `last_hit_at` + 索引引用度）留 v0.5.9
+- `netdisk_process_ocr_queue_batch()` 返回值仍为 `int`，队列侧守卫/池错误只能落 `error_log`；需加出参或改返回结构以在界面呈现
+- 目录列表 20 页截断、遍历上限之外的截断上报同样只落日志
+- `netdisk_extract_office_text` 与 tmpPdf 两处 `@file_put_contents` 未加校验（失败后果自限，不进 OCR 池）
 
 ## v0.5.7 2026-11-03：Cloudreve 网盘扩展
 
